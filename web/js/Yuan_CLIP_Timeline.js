@@ -185,6 +185,10 @@ class TimelineEditor {
       "+ 添加",
       "添加新段落。若时间轴已满，将从末尾段落借用空间。",
     );
+    this.updateBtn = this.makeButton(
+      "更新",
+      "无视锁定状态，从 text_input 重新读取段落提示词并自动更新 max_frames。",
+    );
     this.distributeBtn = this.makeButton(
       "均分",
       "将所有段落设为相同长度，使总和恰好填满最大帧数。",
@@ -194,6 +198,7 @@ class TimelineEditor {
       "删除当前选中的段落。仅剩一个段落时禁用。",
     );
     row.appendChild(this.addBtn);
+    row.appendChild(this.updateBtn);
     row.appendChild(this.distributeBtn);
     row.appendChild(this.deleteBtn);
 
@@ -283,6 +288,7 @@ class TimelineEditor {
     });
 
     this.addBtn.addEventListener("click", () => { if (!this.promptLocked) this.addSegment(); });
+    this.updateBtn.addEventListener("click", () => { this.syncFromTextInput(); });
     this.distributeBtn.addEventListener("click", () => { if (!this.promptLocked) this.distributeEvenly(); });
     this.deleteBtn.addEventListener("click", () => { if (!this.promptLocked) this.deleteSelected(); });
 
