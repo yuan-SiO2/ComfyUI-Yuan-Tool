@@ -611,9 +611,11 @@ class YuanCLIPTimeline:
 
                 # 从时间段中读取最大结束时间，自动计算 max_frames
                 max_end_sec = max(p["end_sec"] for p in parsed_time_lines)
-                max_frames = int(max_end_sec * fps) + 1
-                log.info("[Yuan CLIP Timeline] 最大结束时间 %.1f秒, fps %.1f, 自动计算 max_frames=%d",
-                         max_end_sec, fps, max_frames)
+                raw_max = int(max_end_sec * fps) + 1
+                # 对齐 LTXV 时间步长 (8): 实际输出帧 = (max_frames//8)*8+1，确保 max_frames 与此一致
+                max_frames = ((raw_max - 2) // 8 + 1) * 8 + 1
+                log.info("[Yuan CLIP Timeline] 最大结束时间 %.1f秒, fps %.1f, 自动计算 max_frames=%d (原始值%d, 对齐 LTXV stride 8)",
+                         max_end_sec, fps, max_frames, raw_max)
 
                 # 将秒数转换为帧数
                 frame_allocations = []
@@ -694,7 +696,8 @@ class YuanCLIPTimeline:
                         pass
 
         # --- 自动生成 LTXV 潜空间（如果未连接 latent 输入） ---
-        ltxv_length = max_frames + 1  # LTXV 约定: 像素帧 = 潜空间帧 * 8 + 1
+        # max_frames 已在动态分配时对齐 LTXV stride 8，ltxv_length 直接使用 max_frames
+        ltxv_length = max_frames
         if latent is None:
             latent = _auto_generate_latent(width, height, ltxv_length)
 
