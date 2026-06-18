@@ -1,7 +1,10 @@
+import logging
 import cv2
 import numpy as np
 import torch
 from PIL import Image
+
+log = logging.getLogger(__name__)
 
 
 class YuanTool:
@@ -130,8 +133,13 @@ class GetImage:
         }
 
     def indexedimagesfrombatch(self, images, indexes):
+        batch_size = images.shape[0]
         index_list = [int(index.strip()) for index in indexes.split(',')]
-        indices_tensor = torch.tensor(index_list, dtype=torch.long)
+        valid_indices = [i for i in index_list if 0 <= i < batch_size]
+        if not valid_indices:
+            valid_indices = [0]
+        log.info("[GetImage] 请求索引 %s，批次大小 %d，有效索引 %s", index_list, batch_size, valid_indices)
+        indices_tensor = torch.tensor(valid_indices, dtype=torch.long)
         chosen_images = images[indices_tensor]
         return (chosen_images,)
 
