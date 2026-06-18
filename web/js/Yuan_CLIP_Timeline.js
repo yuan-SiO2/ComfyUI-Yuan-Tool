@@ -660,6 +660,16 @@ class TimelineEditor {
     if (parsed.length > 0 && parsed.length === lines.length) {
       // --- 动态时长分布：按时间格式分配帧数 ---
       const fps = this.getFps();
+
+      // 从时间段中读取最大结束时间，自动计算 max_frames
+      const maxEndSec = Math.max(...parsed.map(p => p.endSec));
+      const max = Math.floor(maxEndSec * fps) + 1;
+
+      // 同步 max_frames 到 UI 数值显示
+      if (this.maxFramesWidget) {
+        this.maxFramesWidget.value = max;
+      }
+
       const frameAllocations = parsed.map(p =>
         Math.max(MIN_SEGMENT_LENGTH, Math.round(p.durationSec * fps)),
       );
