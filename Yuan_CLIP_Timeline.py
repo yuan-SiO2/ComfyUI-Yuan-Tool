@@ -609,6 +609,12 @@ class YuanCLIPTimeline:
                 local_prompts = " | ".join(lines_prompts)
                 log.info("[Yuan CLIP Timeline] text_input 提供 %d 行带时间格式的文本，按动态时长分配", len(parsed_time_lines))
 
+                # 从时间段中读取最大结束时间，自动计算 max_frames
+                max_end_sec = max(p["end_sec"] for p in parsed_time_lines)
+                max_frames = int(max_end_sec * fps) + 1
+                log.info("[Yuan CLIP Timeline] 最大结束时间 %.1f秒, fps %.1f, 自动计算 max_frames=%d",
+                         max_end_sec, fps, max_frames)
+
                 # 将秒数转换为帧数
                 frame_allocations = []
                 for p in parsed_time_lines:
