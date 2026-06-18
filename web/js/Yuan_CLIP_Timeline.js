@@ -663,7 +663,9 @@ class TimelineEditor {
 
       // 从时间段中读取最大结束时间，自动计算 max_frames
       const maxEndSec = Math.max(...parsed.map(p => p.endSec));
-      const max = Math.floor(maxEndSec * fps) + 1;
+      const rawMax = Math.floor(maxEndSec * fps) + 1;
+      // 对齐 LTXV 时间步长 (8): 实际输出帧 = (max//8)*8+1，确保 max 与此一致
+      const max = (Math.floor((rawMax - 2) / 8) + 1) * 8 + 1;
 
       // 同步 max_frames 到 UI 数值显示
       if (this.maxFramesWidget) {
