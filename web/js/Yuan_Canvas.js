@@ -117,10 +117,7 @@ function getUpstreamImageUrls(node, inputName) {
     let linkId = null;
     const preferred = inputs.find((i) => String(i?.name || "") === String(inputName));
     if (preferred?.link != null) linkId = preferred.link;
-    if (linkId == null) {
-        const anyImg = inputs.find((i) => String(i?.type || "").toUpperCase() === "IMAGE" && i?.link != null);
-        if (anyImg?.link != null) linkId = anyImg.link;
-    }
+    
     if (linkId == null) return [];
 
     const link = node?.graph?.links?.[linkId] || app?.graph?.links?.[linkId];
@@ -130,7 +127,48 @@ function getUpstreamImageUrls(node, inputName) {
 
     const urls = [];
 
-    // 1) 上游节点的 nodeOutputs（上游为 OUTPUT_NODE 时含 batch 多张图像）
+    // 1) 上游节点如果是加载类节点，优先从 widget 获取（避免切换工作流被缓存污染）
+    const originNode = app?.graph?.getNodeById?.(originId);
+    if (originNode) {
+        const imageWidget = originNode?.widgets?.find?.((w) => String(w?.name || "").toLowerCase() === "image");
+        const isLoader = originNode.type === "LoadImage" || originNode.comfyClass === "LoadImage" || String(originNode.type || "").toLowerCase().includes("load");
+
+        if (isLoader && imageWidget && typeof imageWidget.value === "string") {
+            const imageName = String(imageWidget.value).trim();
+            if (imageName) {
+                // 加载类节点的 widget 图像必定在 input 目录下（哪怕它的文件名叫 ComfyUI_temp_xxx）
+                let type = "input";
+                let file = imageName;
+                let subfolder = "";
+                let slashIdx = file.lastIndexOf("/");
+                if (slashIdx > -1) {
+                    subfolder = file.substring(0, slashIdx);
+                    file = file.substring(slashIdx + 1);
+                } else {
+                    slashIdx = file.lastIndexOf("\\");
+                    if (slashIdx > -1) {
+                        subfolder = file.substring(0, slashIdx);
+                        file = file.substring(slashIdx + 1);
+                    }
+                }
+                const url = apiUrl(`/view?filename=${encodeURIComponent(file)}&type=${type}&subfolder=${encodeURIComponent(subfolder)}`);
+                if (url) urls.push(url);
+                return urls;
+            }
+        }
+    }
+
+    // 2) 上游节点的 imgs 数组（反映当前 UI 状态，可能包含 batch 多张图像）
+    if (originNode) {
+        const imgs = Array.isArray(originNode?.imgs) ? originNode.imgs : [];
+        for (const c of imgs) {
+            const s = imageSourceFromCandidate(c);
+            if (s) urls.push(s);
+        }
+    }
+    if (urls.length > 0) return urls;
+
+    // 3) 上游节点的 nodeOutputs（上游为 OUTPUT_NODE 时含 batch 多张图像，但最易被缓存污染）
     const originOutputs = lookupNodeOutputEntry(originId);
     const candidateGroups = [
         originOutputs?.images,
@@ -144,18 +182,6 @@ function getUpstreamImageUrls(node, inputName) {
         }
         if (urls.length > 0) return urls;
     }
-
-    // 2) 上游节点的 imgs 数组（可能包含 batch 多张图像）
-    //    优先检查 imgs，因为 getNodeImageUrls 可能只返回单张
-    const originNode = app?.graph?.getNodeById?.(originId);
-    if (originNode) {
-        const imgs = Array.isArray(originNode?.imgs) ? originNode.imgs : [];
-        for (const c of imgs) {
-            const s = imageSourceFromCandidate(c);
-            if (s) urls.push(s);
-        }
-    }
-    if (urls.length > 0) return urls;
 
     // 3) ComfyUI 内置缩略图（fallback）
     let nodeUrls = [];
@@ -441,13 +467,25 @@ app.registerExtension({
                 instance.clearInputImages();
             }
 
-            // 从上游节点直接获取图像 URL（不缓存，参考全景预览节点的 ERP_image 端口实现）
-            const bgUrls = getUpstreamImageUrls(node, "bg_image");
-            const bgUrl = bgUrls.length > 0 ? bgUrls[0] : null;
-            if (bgUrl) {
-                fabric.Image.fromURL(bgUrl, function (oImg) {
-                    node.compositorInstance.setBgImage(oImg);
-                }, { crossOrigin: "anonymous" });
+            // 从后端 UI 输出获取 bg_image，fallback 到上游节点获取
+            let bgEntries = Array.isArray(e.bg_entries) ? e.bg_entries : [];
+            bgEntries = bgEntries.filter((entry) => entry && entry.sig && imageSourceFromCandidate(entry));
+            
+            if (bgEntries.length > 0) {
+                const bgUrl = imageSourceFromCandidate(bgEntries[0]);
+                if (bgUrl) {
+                    fabric.Image.fromURL(bgUrl, function (oImg) {
+                        node.compositorInstance.setBgImage(oImg);
+                    }, { crossOrigin: "anonymous" });
+                }
+            } else {
+                const bgUrls = getUpstreamImageUrls(node, "bg_image");
+                const bgUrl = bgUrls.length > 0 ? bgUrls[0] : null;
+                if (bgUrl) {
+                    fabric.Image.fromURL(bgUrl, function (oImg) {
+                        node.compositorInstance.setBgImage(oImg);
+                    }, { crossOrigin: "anonymous" });
+                }
             }
 
             // 参考 ERP_image 端口：优先从后端 UI 输出（images_entries）获取图像（含 sig），

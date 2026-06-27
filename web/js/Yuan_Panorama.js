@@ -151,7 +151,103 @@
     function getLinkedImageUrl(node, imageInputName) {
         imageInputName = imageInputName || "ERP_image";
 
-        // 1) 自身预览图
+        const inputs = Array.isArray(node?.inputs) ? node.inputs : [];
+        let linkId = null;
+        const preferred = inputs.find((i) => String(i?.name || "") === String(imageInputName));
+        if (preferred?.link != null) linkId = preferred.link;
+        if (linkId == null) {
+            const anyImg = inputs.find((i) => String(i?.type || "").toUpperCase() === "IMAGE" && i?.link != null);
+            if (anyImg?.link != null) linkId = anyImg.link;
+        }
+
+        let originId = null;
+        if (linkId != null) {
+            const link = node?.graph?.links?.[linkId] || app?.graph?.links?.[linkId];
+            if (link) {
+                const oid = Number(link.origin_id);
+                if (Number.isFinite(oid)) {
+                    originId = oid;
+                    const originNode = app?.graph?.getNodeById?.(originId);
+
+                    // 1) 优先检查当前图中的实际节点（避免跨工作流 ID 冲突导致的 nodeOutputs 污染）
+                    if (originNode) {
+                        const imageWidget = originNode?.widgets?.find?.((w) => String(w?.name || "").toLowerCase() === "image");
+                        const isLoader = originNode.type === "LoadImage" || originNode.comfyClass === "LoadImage" || String(originNode.type || "").toLowerCase().includes("load");
+
+                        const extractWidgetUrl = (widget) => {
+                            const imageName = String(widget?.value || "").trim();
+                            if (!imageName) return "";
+                            // 加载类节点的 widget 图像必定在 input 目录下（哪怕它的文件名叫 ComfyUI_temp_xxx）
+                            let type = "input";
+                            let file = imageName;
+                            let subfolder = "";
+                            let slashIdx = file.lastIndexOf("/");
+                            if (slashIdx > -1) {
+                                subfolder = file.substring(0, slashIdx);
+                                file = file.substring(slashIdx + 1);
+                            } else {
+                                slashIdx = file.lastIndexOf("\\");
+                                if (slashIdx > -1) {
+                                    subfolder = file.substring(0, slashIdx);
+                                    file = file.substring(slashIdx + 1);
+                                }
+                            }
+                            return apiUrl(`/view?filename=${encodeURIComponent(file)}&type=${type}&subfolder=${encodeURIComponent(subfolder)}`);
+                        };
+
+                        // 1.1) 对于图像加载类节点，优先通过 widget 提取。
+                        // 因为加载节点未执行时，其 imgs 可能会被上一个工作流同 ID 节点的缓存污染，而 widget 始终保存着用户当前选择的图片。
+                        if (isLoader && imageWidget && typeof imageWidget.value === "string") {
+                            const url = extractWidgetUrl(imageWidget);
+                            if (url) return url;
+                        }
+
+                        // 1.2) 其次使用节点自己显示的缩略图（反映当前节点执行后的 UI 状态）
+                        const imgs = Array.isArray(originNode?.imgs) ? originNode.imgs : [];
+                        for (const c of imgs) {
+                            const s = imageSourceFromCandidate(c);
+                            if (s) return s;
+                        }
+
+                        // 1.3) 对于非加载节点，但拥有 image widget 的情况（后备降级）
+                        if (!isLoader && imageWidget && typeof imageWidget.value === "string") {
+                            const url = extractWidgetUrl(imageWidget);
+                            if (url) return url;
+                        }
+
+                        // 1.4) 最后才尝试 getNodeImageUrls（因为它会读取 nodeOutputs，可能被跨工作流的同 ID 节点污染）
+                        let urls = [];
+                        try {
+                            urls = typeof app?.getNodeImageUrls === "function" ? (app.getNodeImageUrls(originNode) || []) : [];
+                        } catch (_) { urls = []; }
+                        for (const c of urls) {
+                            const s = imageSourceFromCandidate(c);
+                            if (s) return s;
+                        }
+                    }
+
+                    // 2) 检查 originOutputs（可能是当前图执行结果，也可能是被污染的缓存）
+                    const originOutputs = lookupNodeOutputEntry(oid);
+                    if (originOutputs) {
+                        const candidateGroups = [
+                            originOutputs?.images,
+                            originOutputs?.ui?.images,
+                            originOutputs?.ui?.pano_input_images,
+                            originOutputs?.pano_input_images,
+                        ];
+                        for (const g of candidateGroups) {
+                            if (!Array.isArray(g)) continue;
+                            for (const c of g) {
+                                const s = imageSourceFromCandidate(c);
+                                if (s) return s;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3) 自身预览图（后备：仅在无上游输出时使用）
         const selfOutput = lookupNodeOutputEntry(node?.id);
         const selfGroups = [
             selfOutput?.ui?.pano_input_images,
@@ -165,59 +261,6 @@
             }
         }
 
-        // 2) 上游连接节点的输出图像
-        const inputs = Array.isArray(node?.inputs) ? node.inputs : [];
-        let linkId = null;
-        const preferred = inputs.find((i) => String(i?.name || "") === String(imageInputName));
-        if (preferred?.link != null) linkId = preferred.link;
-        if (linkId == null) {
-            const anyImg = inputs.find((i) => String(i?.type || "").toUpperCase() === "IMAGE" && i?.link != null);
-            if (anyImg?.link != null) linkId = anyImg.link;
-        }
-        if (linkId == null) return "";
-
-        const link = node?.graph?.links?.[linkId] || app?.graph?.links?.[linkId];
-        if (!link) return "";
-        const originId = Number(link.origin_id);
-        if (!Number.isFinite(originId)) return "";
-
-        const originOutputs = lookupNodeOutputEntry(originId);
-        const candidateGroups = [
-            originOutputs?.images,
-            originOutputs?.ui?.images,
-            originOutputs?.ui?.pano_input_images,
-            originOutputs?.pano_input_images,
-        ];
-        for (const g of candidateGroups) {
-            if (!Array.isArray(g)) continue;
-            for (const c of g) {
-                const s = imageSourceFromCandidate(c);
-                if (s) return s;
-            }
-        }
-
-        // 3) ComfyUI 内置缩略图
-        const originNode = app?.graph?.getNodeById?.(originId);
-        let urls = [];
-        try {
-            urls = typeof app?.getNodeImageUrls === "function" ? (app.getNodeImageUrls(originNode) || []) : [];
-        } catch (_) { urls = []; }
-        for (const c of urls) {
-            const s = imageSourceFromCandidate(c);
-            if (s) return s;
-        }
-        if (originNode) {
-            const imgs = Array.isArray(originNode?.imgs) ? originNode.imgs : [];
-            for (const c of imgs) {
-                const s = imageSourceFromCandidate(c);
-                if (s) return s;
-            }
-            const imageWidget = originNode?.widgets?.find?.((w) => String(w?.name || "").toLowerCase() === "image");
-            const imageName = String(imageWidget?.value || "").trim();
-            if (imageName) {
-                return apiUrl(`/view?filename=${encodeURIComponent(imageName)}&type=input&subfolder=`);
-            }
-        }
         return "";
     }
 
@@ -636,6 +679,11 @@
             }
             // 裁剪模式：截取当前 3D 裁剪画面
             const dataUrl = this.screenshotDataUrl();
+            if (!dataUrl) {
+                // 如果当前无法截图（例如媒体尚未加载、或切换工作流时暂无图像），
+                // 不要清空已有的 current_view_data，以免丢失先前保存的裁剪画面
+                return;
+            }
             dataWidget.value = dataUrl;
             if (Array.isArray(this.node.widgets_values) && idx >= 0) this.node.widgets_values[idx] = dataUrl;
         }
@@ -848,6 +896,9 @@
                     if (this.renderer) this.renderer.upload(video);
                     if (!this.videoPaused) void video.play().catch(() => {});
                     this.requestDraw();
+                    // 图像就绪后同步裁剪视图数据，避免切换工作流回来后
+                    // current_view_data 为空导致后端输出原图
+                    this.scheduleViewSync();
                 };
                 const onTick = () => this.requestDraw();
                 video.addEventListener("loadedmetadata", onReady);
@@ -889,6 +940,9 @@
                 this.img = image;
                 if (this.renderer) this.renderer.upload(image);
                 this.requestDraw();
+                // 图像就绪后同步裁剪视图数据，避免切换工作流回来后
+                // current_view_data 为空导致后端输出原图
+                this.scheduleViewSync();
             };
             image.onerror = () => {
                 if (this.imgSrc !== nextSrc) return;
