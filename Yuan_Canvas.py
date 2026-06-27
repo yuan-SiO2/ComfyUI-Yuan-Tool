@@ -168,6 +168,7 @@ class Yuan_Canvas:
         #   - configChanged=false 且画布为空：从 images_entries 重新加载
         #   - configChanged=true：clearInputImages 后重新加载
         images_entries = _save_images_batch_with_sig(images_tensor)
+        bg_entries = _save_images_batch_with_sig(bg_image)
 
         ui = {
             "test": ("value",),
@@ -180,6 +181,7 @@ class Yuan_Canvas:
             "awaited": [self.result],
             "configChanged": [configChanged],
             "images_entries": images_entries,
+            "bg_entries": bg_entries,
         }
 
         # 通知前端，相当于"已执行"
