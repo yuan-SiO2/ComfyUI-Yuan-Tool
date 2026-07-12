@@ -1,8 +1,12 @@
 import logging
-import cv2
 import numpy as np
 import torch
-from PIL import Image
+import torch.nn.functional as F
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 log = logging.getLogger(__name__)
 
@@ -15,7 +19,7 @@ class YuanTool:
                 "background": ("IMAGE",),
                 "width": ("INT", {"default": 736, "min": 32, "max": 8192, "step": 32}),
                 "height": ("INT", {"default": 1280, "min": 32, "max": 8192, "step": 32}),
-                "frame_multiplier": ([8, 10, 12, 16], {"default": 8}),
+                "frame_multiplier": ([8, 16, 24, 32], {"default": 16}),
                 "list_mode": ("BOOLEAN", {"default": False, "label_on": "true", "label_off": "false"}),
             },
             "optional": {
@@ -36,33 +40,29 @@ class YuanTool:
         if background is None:
             raise ValueError("Background image is required and cannot be empty.")
 
-        images = []
+        subjects = []
         if list_mode:
             image_list = kwargs.get("image_list")
             if image_list is not None:
                 if isinstance(image_list, torch.Tensor):
-                    # ComfyUI images are [B, H, W, C]
                     batch = image_list.shape[0] if image_list.ndim == 4 else 1
-                    # Limit to first 4 images as per design
                     batch = min(batch, 4)
                     for i in range(batch):
                         img = image_list[i] if image_list.ndim == 4 else image_list
-                        images.append(self._prepare_image(img, (width, height)))
+                        subjects.append(self._prepare_image(img, (width, height), preserve_full=True))
                 elif isinstance(image_list, list):
                     for img in image_list[:4]:
-                        images.append(self._prepare_image(img, (width, height)))
+                        subjects.append(self._prepare_image(img, (width, height), preserve_full=True))
         else:
             for name in ("1", "2", "3", "4"):
                 image = kwargs.get(name)
                 if image is not None:
-                    images.append(self._prepare_image(image, (width, height)))
+                    subjects.append(self._prepare_image(image, (width, height), preserve_full=True))
 
-        # Add background last
-        images.append(self._prepare_image(background, (width, height)))
+        background_image = self._prepare_image(background, (width, height), preserve_full=False)
 
-        frame_count = len(images) * frame_multiplier + 1
-        frames = self._expand_frames(images, frame_count)
-        # Convert list of numpy arrays [H, W, C] to torch tensor [B, H, W, C]
+        frame_count = len(subjects) * frame_multiplier + 1 + 8
+        frames = self._expand_frames(subjects, background_image, frame_multiplier, frame_count)
         output = torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0)
         return (output,)
 
@@ -88,31 +88,71 @@ class YuanTool:
         return np.ascontiguousarray(image)
 
     @staticmethod
-    def _prepare_image(image, target_size):
+    def _prepare_image(image, target_size, preserve_full=False):
         image_array = YuanTool._tensor_to_rgb_array(image)
-        # Resize to target width/height
-        # Note: target_size is (width, height) for cv2.resize
-        if image_array.shape[1] != target_size[0] or image_array.shape[0] != target_size[1]:
-            image_array = cv2.resize(image_array, target_size, interpolation=cv2.INTER_LANCZOS4)
-        return np.ascontiguousarray(image_array)
+        source_height, source_width = image_array.shape[:2]
+        target_width, target_height = target_size
+
+        if source_width == target_width and source_height == target_height:
+            return np.ascontiguousarray(image_array)
+
+        if preserve_full:
+            scale = min(target_width / source_width, target_height / source_height)
+            resized_width = max(1, min(target_width, round(source_width * scale)))
+            resized_height = max(1, min(target_height, round(source_height * scale)))
+            resized = YuanTool._resize(image_array, resized_width, resized_height)
+            canvas = np.full((target_height, target_width, 3), 255, dtype=np.uint8)
+            left = (target_width - resized_width) // 2
+            top = (target_height - resized_height) // 2
+            canvas[top:top + resized_height, left:left + resized_width] = resized
+            return np.ascontiguousarray(canvas)
+
+        scale = max(target_width / source_width, target_height / source_height)
+        resized_width = max(target_width, round(source_width * scale))
+        resized_height = max(target_height, round(source_height * scale))
+        resized = YuanTool._resize(image_array, resized_width, resized_height)
+        left = (resized_width - target_width) // 2
+        top = (resized_height - target_height) // 2
+        return np.ascontiguousarray(
+            resized[top:top + target_height, left:left + target_width]
+        )
 
     @staticmethod
-    def _expand_frames(images, frame_count):
-        if not images:
-            return []
-        base_count = frame_count // len(images)
-        remainder = frame_count % len(images)
+    def _resize(image_array, width, height):
+        if cv2 is not None:
+            interpolation = (
+                cv2.INTER_AREA
+                if width < image_array.shape[1] or height < image_array.shape[0]
+                else cv2.INTER_LANCZOS4
+            )
+            return cv2.resize(image_array, (width, height), interpolation=interpolation)
+
+        chw = torch.from_numpy(image_array).permute(2, 0, 1).unsqueeze(0).float()
+        resized = F.interpolate(
+            chw,
+            size=(height, width),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+        return np.ascontiguousarray(
+            resized.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().numpy()
+        )
+
+    @staticmethod
+    def _expand_frames(subjects, background, frame_multiplier, frame_count):
         frames = []
-        for index, image in enumerate(images):
-            repeats = base_count + (1 if index < remainder else 0)
+        for index, image in enumerate(subjects):
+            repeats = frame_multiplier + (1 if index == 0 else 0)
             frames.extend([image] * repeats)
-        
-        # Ensure exactly frame_count frames
+        frames.extend([background] * 8)
+
         if len(frames) > frame_count:
             frames = frames[:frame_count]
         elif len(frames) < frame_count:
             while len(frames) < frame_count:
-                frames.append(images[-1])
+                frames.append(background)
+
         return frames
 
 

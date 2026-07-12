@@ -13,14 +13,24 @@ ComfyUI 自定义节点工具集，提供图像处理、全景预览、画布合
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `1` ~ `4` | IMAGE (可选) | 主体图像（按 1 → 2 → 3 → 4 顺序排列） |
-| `background` | IMAGE (必填) | 背景图像，始终排在最后一帧 |
+| `background` | IMAGE (必填) | 背景图像，固定 8 帧，排在最后 |
 | `width` | INT | 输出视频宽度 (默认 736，步长 32) |
 | `height` | INT | 输出视频高度 (默认 1280，步长 32) |
-| `frame_multiplier` | 选项 | 帧数倍率：8 / 10 / 12 / 16。总帧数 = `图像数 × 倍率 + 1` |
+| `frame_multiplier` | 选项 | 帧数倍率：8 / 16 / 24 / 32 |
 | `list_mode` | BOOL | 开启后使用 `image_list` 输入替代 1~4 独立端口 |
 | `image_list` | IMAGE (可选) | 批量图像输入（前 4 张有效） |
 
 - **输出**: `output` (IMAGE) — 合成后的视频帧序列张量
+
+#### 帧数计算公式
+```
+总帧数 = 主体图像数量 × frame_multiplier + 1（首图额外） + 8（背景）
+```
+
+#### 图像预处理
+- **主体图像**：等比例缩放，保持完整，居中放在白色画布上（不变形、不裁剪）
+- **背景图像**：等比例缩放覆盖整个画布，居中裁剪（填满目标尺寸）
+- **智能插值**：缩小用 INTER_AREA，放大用 INTER_LANCZOS4，无 OpenCV 时降级为 torch bicubic
 
 ---
 
@@ -246,3 +256,12 @@ pip install -r ComfyUI-Yuan-Tool/requirements.txt
 ```bash
 pip install av
 ```
+
+---
+
+## 鸣谢
+
+本项目部分节点参考/改编自以下开源项目，在此表示感谢：
+
+- [ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay) — Yuan CLIP 时间轴节点的实现基础
+- [ComfyUI-Licon-MSR](https://github.com/liconstudio/ComfyUI-Licon-MSR) — 多帧参考节点的图像预处理与帧分配算法参考
