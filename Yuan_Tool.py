@@ -10,6 +10,42 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
+MSR_INFO_VERSION = 2
+
+
+def _estimate_ref_latent_frames(source_frame_count):
+    if source_frame_count <= 1:
+        return max(1, source_frame_count)
+    return int(round((source_frame_count - 1) / 8.0)) + 1
+
+
+def _latent_to_frame_range(latent_start, latent_end):
+    latent_start = int(latent_start)
+    latent_end = int(latent_end)
+    if latent_start <= 0:
+        frame_start = 0
+    else:
+        frame_start = 1 + (latent_start - 1) * 8
+    if latent_end <= 0:
+        frame_end = 0
+    else:
+        frame_end = latent_end * 8
+    return frame_start, frame_end
+
+
+def _frame_range_to_latent(frame_start, frame_end):
+    frame_start = int(frame_start)
+    frame_end = int(frame_end)
+    if frame_start <= 0:
+        latent_start = 0
+    else:
+        latent_start = (frame_start + 7) // 8
+    if frame_end <= 0:
+        latent_end = 0
+    else:
+        latent_end = (frame_end + 7) // 8
+    return latent_start, latent_end
+
 
 class YuanTool:
     @classmethod
@@ -31,8 +67,8 @@ class YuanTool:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("output",)
+    RETURN_TYPES = ("IMAGE", "MSR_INFO")
+    RETURN_NAMES = ("output", "msr_info")
     FUNCTION = "create_video"
     CATEGORY = "Yuan Tool/图像"
 
@@ -41,6 +77,7 @@ class YuanTool:
             raise ValueError("Background image is required and cannot be empty.")
 
         subjects = []
+        subject_slots = []
         if list_mode:
             image_list = kwargs.get("image_list")
             if image_list is not None:
@@ -50,21 +87,70 @@ class YuanTool:
                     for i in range(batch):
                         img = image_list[i] if image_list.ndim == 4 else image_list
                         subjects.append(self._prepare_image(img, (width, height), preserve_full=True))
+                        subject_slots.append(str(i + 1))
                 elif isinstance(image_list, list):
-                    for img in image_list[:4]:
+                    for idx, img in enumerate(image_list[:4]):
                         subjects.append(self._prepare_image(img, (width, height), preserve_full=True))
+                        subject_slots.append(str(idx + 1))
         else:
             for name in ("1", "2", "3", "4"):
                 image = kwargs.get(name)
                 if image is not None:
                     subjects.append(self._prepare_image(image, (width, height), preserve_full=True))
+                    subject_slots.append(name)
 
         background_image = self._prepare_image(background, (width, height), preserve_full=False)
 
         frame_count = len(subjects) * frame_multiplier + 1 + 8
-        frames = self._expand_frames(subjects, background_image, frame_multiplier, frame_count)
+        frames, subject_frame_ranges, background_frame_range = self._expand_frames_with_info(
+            subjects, background_image, frame_multiplier, frame_count
+        )
         output = torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0)
-        return (output,)
+
+        latent_count = _estimate_ref_latent_frames(frame_count)
+
+        subjects_info = []
+        for idx, (slot, (start, end)) in enumerate(zip(subject_slots, subject_frame_ranges)):
+            latent_start, latent_end = _frame_range_to_latent(start, end)
+            item = {
+                "slot": slot,
+                "role": "subject",
+                "frame_start": start,
+                "frame_end": end,
+                "frame_count": end - start + 1,
+                "latent_aligned": True,
+                "latent_start": latent_start,
+                "latent_end": latent_end,
+                "latent_count": latent_end - latent_start + 1,
+            }
+            subjects_info.append(item)
+
+        bg_start, bg_end = background_frame_range
+        bg_latent_start, bg_latent_end = _frame_range_to_latent(bg_start, bg_end)
+        background_info = {
+            "slot": "background",
+            "role": "background",
+            "frame_start": bg_start,
+            "frame_end": bg_end,
+            "frame_count": bg_end - bg_start + 1,
+            "latent_aligned": True,
+            "latent_start": bg_latent_start,
+            "latent_end": bg_latent_end,
+            "latent_count": bg_latent_end - bg_latent_start + 1,
+        }
+
+        msr_info = {
+            "version": MSR_INFO_VERSION,
+            "token_order": "target_then_reference",
+            "reference_frame_count": frame_count,
+            "reference_latent_count": latent_count,
+            "width": width,
+            "height": height,
+            "subjects": subjects_info,
+            "background": background_info,
+        }
+
+        return (output, msr_info)
 
     @staticmethod
     def _tensor_to_rgb_array(image):
@@ -140,20 +226,39 @@ class YuanTool:
         )
 
     @staticmethod
-    def _expand_frames(subjects, background, frame_multiplier, frame_count):
+    def _expand_frames_with_info(subjects, background, frame_multiplier, frame_count):
         frames = []
+        subject_frame_ranges = []
+        cursor = 0
+
         for index, image in enumerate(subjects):
             repeats = frame_multiplier + (1 if index == 0 else 0)
+            start = cursor
+            end = cursor + repeats - 1
+            subject_frame_ranges.append((start, end))
             frames.extend([image] * repeats)
+            cursor = end + 1
+
+        bg_start = cursor
+        bg_end = cursor + 7
         frames.extend([background] * 8)
+        cursor = bg_end + 1
 
         if len(frames) > frame_count:
             frames = frames[:frame_count]
+            subject_frame_ranges = [
+                (s, min(e, frame_count - 1))
+                for s, e in subject_frame_ranges
+                if s < frame_count
+            ]
+            bg_end = min(bg_end, frame_count - 1)
         elif len(frames) < frame_count:
             while len(frames) < frame_count:
                 frames.append(background)
+            bg_end = frame_count - 1
 
-        return frames
+        background_frame_range = (bg_start, bg_end)
+        return frames, subject_frame_ranges, background_frame_range
 
 
 class GetImage:

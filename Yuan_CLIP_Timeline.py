@@ -11,6 +11,7 @@ import re
 import types
 
 import torch
+import torch.nn.functional as F
 import comfy.ldm.modules.attention
 import comfy.model_management
 
@@ -95,30 +96,9 @@ def create_mask_fn(q_token_idx, fallback_tokens_per_frame, latent_frames):
     return mask_fn
 
 
-def build_segments(token_ranges, segment_lengths, epsilon=1e-3, relay_options=None):
+def build_segments(token_ranges, segment_lengths, epsilon=1e-3):
     """为时间惩罚构建每段元数据。"""
     sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
-
-    opts = relay_options or {}
-    v_strength = opts.get("video_strength", 1.0)
-    v_window_scale = opts.get("video_window_scale", 1.0)
-    a_epsilon = opts.get("audio_epsilon")
-    a_strength = opts.get("audio_strength", 1.0)
-    a_window_scale = opts.get("audio_window_scale", 1.0)
-
-    if a_epsilon is not None and 0 < a_epsilon < 1:
-        sigma_audio = 1.0 / math.log(1.0 / a_epsilon)
-    else:
-        sigma_audio = sigma
-
-    if relay_options:
-        log.info(
-            "[Yuan CLIP Timeline] 高级选项 - 视频: strength=%.3f window_scale=%.3f | "
-            "音频: epsilon=%s strength=%.3f window_scale=%.3f",
-            v_strength, v_window_scale,
-            f"{a_epsilon:.4f}" if a_epsilon is not None else "继承",
-            a_strength, a_window_scale,
-        )
 
     q_token_idx = []
     frame_cursor = 0
@@ -132,12 +112,12 @@ def build_segments(token_ranges, segment_lengths, epsilon=1e-3, relay_options=No
         q_token_idx.append({
             "local_token_idx": torch.arange(tok_start, tok_end),
             "midpoint": midpoint,
-            "window": max(base_window * v_window_scale, 0.0),
+            "window": max(base_window, 0.0),
             "sigma": sigma,
-            "strength": v_strength,
-            "window_audio": max(base_window * a_window_scale, 0.0),
-            "sigma_audio": sigma_audio,
-            "strength_audio": a_strength,
+            "strength": 1.0,
+            "window_audio": max(base_window, 0.0),
+            "sigma_audio": sigma,
+            "strength_audio": 1.0,
         })
         frame_cursor += L
 
@@ -205,59 +185,6 @@ def distribute_segment_lengths(num_segments, latent_frames, specified_lengths=No
 # patches.py 模型补丁函数
 # ==============================================================================
 
-def _masked_attention(q, k, v, heads, mask, transformer_options={}, **kwargs):
-    """绕过 wrap_attn，直接调用 attention_pytorch 以保留掩码。"""
-    return comfy.ldm.modules.attention.attention_pytorch(
-        q, k, v, heads, mask=mask,
-        _inside_attn_wrapper=True,
-        transformer_options=transformer_options,
-        **kwargs,
-    )
-
-
-def _wan_t2v_forward(self, mask_fn, x, context, transformer_options={}, **kwargs):
-    q = self.norm_q(self.q(x))
-    k = self.norm_k(self.k(context))
-    v = self.v(context)
-
-    mask = mask_fn(q.shape[1], k.shape[1], q.dtype, q.device, transformer_options)
-    if mask is not None:
-        x = _masked_attention(q, k, v, heads=self.num_heads, mask=mask,
-                              transformer_options=transformer_options)
-    else:
-        x = comfy.ldm.modules.attention.optimized_attention(
-            q, k, v, heads=self.num_heads, transformer_options=transformer_options,
-        )
-    return self.o(x)
-
-
-def _wan_i2v_forward(self, mask_fn, x, context, context_img_len, transformer_options={}, **kwargs):
-    context_img = context[:, :context_img_len]
-    context_text = context[:, context_img_len:]
-
-    q = self.norm_q(self.q(x))
-
-    k_img = self.norm_k_img(self.k_img(context_img))
-    v_img = self.v_img(context_img)
-    img_x = comfy.ldm.modules.attention.optimized_attention(
-        q, k_img, v_img, heads=self.num_heads, transformer_options=transformer_options,
-    )
-
-    k = self.norm_k(self.k(context_text))
-    v = self.v(context_text)
-
-    mask = mask_fn(q.shape[1], k.shape[1], q.dtype, q.device, transformer_options)
-    if mask is not None:
-        x = _masked_attention(q, k, v, heads=self.num_heads, mask=mask,
-                              transformer_options=transformer_options)
-    else:
-        x = comfy.ldm.modules.attention.optimized_attention(
-            q, k, v, heads=self.num_heads, transformer_options=transformer_options,
-        )
-
-    return self.o(x + img_x)
-
-
 def _make_masked_override(prev_override):
     """transformer_options 覆盖，将带掩码的注意力调用路由到 attention_pytorch。"""
     def override(func, *args, **kwargs):
@@ -293,75 +220,41 @@ def _make_ltx_mask_wrapper(underlying, mask_fn):
     return wrapped
 
 
-class _CrossAttnPatch:
-    """描述符，将 (impl, mask_fn) 绑定为 Wan 交叉注意力模块的方法。"""
-
-    def __init__(self, impl, mask_fn):
-        self.impl = impl
-        self.mask_fn = mask_fn
-
-    def __get__(self, obj, objtype=None):
-        impl, mask_fn = self.impl, self.mask_fn
-
-        def wrapped(self_module, *args, **kwargs):
-            return impl(self_module, mask_fn, *args, **kwargs)
-
-        return types.MethodType(wrapped, obj)
-
-
 def detect_model_type(model):
-    """返回 (架构, patch_size, temporal_stride) 用于潜空间几何信息。"""
+    """返回 (patch_size, temporal_stride) 用于 LTX 潜空间几何信息。"""
     diff_model = model.model.diffusion_model
 
-    if hasattr(diff_model, "patch_size") and not hasattr(diff_model, "patchifier"):
-        return "wan", tuple(diff_model.patch_size), 4
-
     if hasattr(diff_model, "patchifier"):
-        return "ltx", (1, 1, 1), int(diff_model.vae_scale_factors[0])
+        return (1, 1, 1), int(diff_model.vae_scale_factors[0])
 
     raise ValueError(
         f"不支持的模型类型: {type(diff_model).__name__}。"
-        f"目前支持 Wan 和 LTX 模型。"
+        f"Yuan CLIP Timeline 仅支持 LTX 模型。"
     )
 
 
-def _check_unpatched(model_clone, key):
-    if key in getattr(model_clone, "object_patches", {}):
-        raise RuntimeError(
-            f"Yuan CLIP Timeline: '{key}' 处的交叉注意力已被其他节点补丁。"
-            "此架构不支持叠加 — 请移除冲突节点。"
-        )
-
-
-def apply_patches(model_clone, arch, mask_fn):
+def apply_patches(model_clone, mask_fn, pointer_config=None):
     diffusion_model = model_clone.get_model_object("diffusion_model")
 
-    if arch == "wan":
-        from comfy.ldm.wan.model import WanI2VCrossAttention
-        for idx, block in enumerate(diffusion_model.blocks):
-            key = f"diffusion_model.blocks.{idx}.cross_attn.forward"
-            _check_unpatched(model_clone, key)
-            cross_attn = block.cross_attn
-            impl = _wan_i2v_forward if isinstance(cross_attn, WanI2VCrossAttention) else _wan_t2v_forward
-            model_clone.add_object_patch(key, _CrossAttnPatch(impl, mask_fn).__get__(cross_attn, cross_attn.__class__))
-        return
+    to = model_clone.model_options["transformer_options"]
+    to["promptrelay_mask_fn"] = mask_fn
 
-    if arch == "ltx":
-        to = model_clone.model_options["transformer_options"]
-        to["promptrelay_mask_fn"] = mask_fn
+    if pointer_config is not None:
+        to["licon_msr_v3_relay_mask_fn"] = mask_fn
+        to["licon_msr_v3_marker_token_indices"] = pointer_config["marker_token_indices"]
 
-        for idx, block in enumerate(diffusion_model.transformer_blocks):
-            for attr in ("attn2", "audio_attn2"):
-                module = getattr(block, attr, None)
-                if module is None:
-                    continue
-                key = f"diffusion_model.transformer_blocks.{idx}.{attr}.forward"
-                underlying = model_clone.get_model_object(key)
+    for idx, block in enumerate(diffusion_model.transformer_blocks):
+        for attr in ("attn2", "audio_attn2"):
+            module = getattr(block, attr, None)
+            if module is None:
+                continue
+            key = f"diffusion_model.transformer_blocks.{idx}.{attr}.forward"
+            underlying = model_clone.get_model_object(key)
+            if attr == "attn2" and pointer_config is not None:
+                wrapper = _make_ltx_marker_relay_wrapper(underlying, mask_fn, pointer_config, idx)
+            else:
                 wrapper = _make_ltx_mask_wrapper(underlying, mask_fn)
-                model_clone.add_object_patch(key, types.MethodType(wrapper, module))
-        return
-
-    raise ValueError(f"未知模型架构: {arch}")
+            model_clone.add_object_patch(key, types.MethodType(wrapper, module))
 
 
 # ==============================================================================
@@ -397,6 +290,465 @@ def _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames):
                 result[i] = 1
 
     return result
+
+
+# ==============================================================================
+# MSR Info / Marker Relay 辅助函数 (来自 Licon MSR V3)
+# ==============================================================================
+
+def _flatten_token_ids(raw):
+    if isinstance(raw, dict):
+        raw = raw.get("input_ids", [])
+    if isinstance(raw, torch.Tensor):
+        raw = raw.detach().cpu().tolist()
+    if raw and isinstance(raw[0], (list, tuple)):
+        raw = raw[0]
+    return list(raw or [])
+
+
+def _token_count(raw_tokenizer, text):
+    ids = _flatten_token_ids(raw_tokenizer(text))
+    eos_adj = 1 if getattr(raw_tokenizer, "add_eos", False) else 0
+    return max(0, len(ids) - eos_adj)
+
+
+def _find_marker_phrase_token_indices(
+    raw_tokenizer,
+    prompt_text,
+    markers,
+    stop_markers=None,
+    phrase_extend_tokens=12,
+    stop_at_punctuation=True,
+    stop_at_other_marker=True,
+):
+    if raw_tokenizer is None or not prompt_text:
+        return []
+
+    all_markers = [m for m in (stop_markers or markers) if m]
+    prompt_folded = prompt_text.casefold()
+    stop_chars = set(",，。.!！?？;；:：\n\r|")
+    indices = []
+
+    for marker in markers:
+        marker_folded = marker.casefold()
+        start = 0
+        while True:
+            char_start = prompt_folded.find(marker_folded, start)
+            if char_start < 0:
+                break
+
+            char_stop = char_start + len(marker)
+            scan = char_stop
+            while scan < len(prompt_text):
+                if stop_at_punctuation and prompt_text[scan] in stop_chars:
+                    break
+                if stop_at_other_marker:
+                    tail = prompt_folded[scan:]
+                    if any(tail.startswith(other.casefold()) for other in all_markers if other != marker):
+                        break
+                scan += 1
+
+            char_stop = max(char_stop, scan)
+            tok_start = _token_count(raw_tokenizer, prompt_text[:char_start])
+            marker_tok_end = _token_count(raw_tokenizer, prompt_text[:char_start + len(marker)])
+            phrase_tok_end = _token_count(raw_tokenizer, prompt_text[:char_stop])
+            tok_end = max(marker_tok_end, phrase_tok_end)
+            if phrase_extend_tokens > 0:
+                tok_end = min(tok_end, tok_start + int(phrase_extend_tokens))
+            if tok_end <= tok_start:
+                tok_end = tok_start + 1
+            indices.extend(range(tok_start, tok_end))
+            start = char_start + len(marker)
+
+    return sorted(set(i for i in indices if i >= 0))
+
+
+def _map_subject_to_ref_latent_indices(subject, source_frame_count, latent_frame_count):
+    if source_frame_count <= 0 or latent_frame_count <= 0:
+        return []
+
+    if "latent_start" in subject and "latent_end" in subject:
+        ls = int(subject.get("latent_start", 0))
+        le = int(subject.get("latent_end", ls))
+        ls = max(0, min(latent_frame_count - 1, ls))
+        le = max(ls, min(latent_frame_count - 1, le))
+        return list(range(ls, le + 1))
+
+    fs = int(subject.get("frame_start", 0))
+    fe = int(subject.get("frame_end", -1))
+    fs = max(0, min(source_frame_count - 1, fs))
+    fe = max(fs, min(source_frame_count - 1, fe))
+
+    if latent_frame_count == source_frame_count:
+        return list(range(fs, fe + 1))
+    if latent_frame_count == 1:
+        return [0]
+
+    stride = (source_frame_count - 1) / float(latent_frame_count - 1)
+    indices = []
+    for latent_idx in range(latent_frame_count):
+        source_anchor = int(round(latent_idx * stride))
+        if fs <= source_anchor <= fe:
+            indices.append(latent_idx)
+
+    if indices:
+        return indices
+
+    center = (fs + fe) * 0.5
+    nearest = int(round(center / stride))
+    return [max(0, min(latent_frame_count - 1, nearest))]
+
+
+def _parse_block_filter(text, n_blocks):
+    if not text or not text.strip():
+        return None
+    out = set()
+    for raw in text.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-", 1)
+                lo, hi = sorted((int(a.strip()), int(b.strip())))
+                out.update(range(max(0, lo), min(n_blocks - 1, hi) + 1))
+            except Exception:
+                continue
+        else:
+            try:
+                idx = int(part)
+                if 0 <= idx < n_blocks:
+                    out.add(idx)
+            except Exception:
+                continue
+    return frozenset(out) if out else None
+
+
+def _build_slot_ref_indices_from_target_latent(
+    msr_info,
+    slot,
+    seq,
+    device,
+    target_latent_shape,
+    spatial_patch_size=1,
+    temporal_patch_size=1,
+):
+    if not isinstance(msr_info, dict) or target_latent_shape is None:
+        return None
+
+    reference_frame_count = int(msr_info.get("reference_frame_count") or 0)
+    if reference_frame_count <= 0:
+        return None
+
+    subjects = list(msr_info.get("subjects") or [])
+    background = msr_info.get("background")
+    if isinstance(background, dict):
+        subjects.append(dict(background))
+
+    subject = None
+    for item in subjects:
+        if isinstance(item, dict) and str(item.get("slot")) == str(slot):
+            subject = item
+            break
+    if subject is None:
+        return None
+
+    _, _, target_frames, h_lat, w_lat = target_latent_shape
+    tokens_per_frame = (
+        max(1, h_lat // max(1, spatial_patch_size))
+        * max(1, w_lat // max(1, spatial_patch_size))
+    )
+    if tokens_per_frame <= 0:
+        return None
+
+    target_count = (
+        max(1, target_frames // max(1, temporal_patch_size))
+        * tokens_per_frame
+    )
+    if target_count <= 0 or target_count >= seq:
+        return None
+
+    ref_count = seq - target_count
+    if ref_count <= 0 or ref_count % tokens_per_frame != 0:
+        log.warning(
+            "[Yuan CLIP Timeline/MSR] slot=%s ref_count=%d 不合法 (seq=%d, target_count=%d, tpf=%d, ref%%tpf=%d)",
+            slot, ref_count, seq, target_count, tokens_per_frame, ref_count % tokens_per_frame,
+        )
+        return None
+
+    ref_latent_frames = ref_count // tokens_per_frame
+    latent_indices = _map_subject_to_ref_latent_indices(
+        subject,
+        source_frame_count=reference_frame_count,
+        latent_frame_count=ref_latent_frames,
+    )
+    ranges = []
+    for latent_idx in latent_indices:
+        start = target_count + latent_idx * tokens_per_frame
+        stop = start + tokens_per_frame
+        if target_count <= start < stop <= seq:
+            ranges.append(torch.arange(start, stop, device=device, dtype=torch.long))
+
+    if not ranges:
+        return None
+    return torch.cat(ranges, dim=0) if len(ranges) > 1 else ranges[0]
+
+
+def _positive_batch_mask(transformer_options, batch_size, device):
+    cond_or_uncond = transformer_options.get("cond_or_uncond")
+    if not cond_or_uncond or batch_size <= 0:
+        return None
+
+    cond_or_uncond = list(cond_or_uncond)
+    group_count = len(cond_or_uncond)
+    if group_count <= 0 or batch_size % group_count != 0:
+        return None
+
+    group_size = batch_size // group_count
+    mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+    for group_idx, value in enumerate(cond_or_uncond):
+        if value == 0:
+            start = group_idx * group_size
+            mask[start:start + group_size] = True
+    return mask
+
+
+def _is_negative_only_call(transformer_options):
+    cond_or_uncond = transformer_options.get("cond_or_uncond")
+    return bool(cond_or_uncond) and all(value != 0 for value in cond_or_uncond)
+
+
+def _relay_mask_for_positive_rows(relay_mask, transformer_options, batch_size, device, dtype):
+    positive_mask = _positive_batch_mask(transformer_options, batch_size, device)
+    if positive_mask is None:
+        return relay_mask
+    if not positive_mask.any():
+        return None
+
+    if relay_mask.dim() == 2:
+        out = torch.zeros(
+            batch_size,
+            1,
+            relay_mask.shape[-2],
+            relay_mask.shape[-1],
+            device=device,
+            dtype=dtype,
+        )
+        out[positive_mask, 0, :, :] = relay_mask.to(device=device, dtype=dtype)
+        return out
+
+    view_shape = [batch_size] + [1] * (relay_mask.dim() - 1)
+    return relay_mask * positive_mask.view(*view_shape).to(device=relay_mask.device, dtype=relay_mask.dtype)
+
+
+def _make_ltx_marker_relay_wrapper(
+    underlying,
+    mask_fn,
+    pointer_config,
+    block_idx,
+):
+    def wrapped(_self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
+        direct_supported = all(hasattr(_self, name) for name in ("to_q", "to_k", "to_v", "q_norm", "k_norm", "to_out"))
+
+        if _is_negative_only_call(transformer_options):
+            return underlying(
+                x,
+                context=context,
+                mask=mask,
+                pe=pe,
+                k_pe=k_pe,
+                transformer_options=transformer_options,
+            )
+
+        if not direct_supported:
+            if context is not None:
+                relay_mask = mask_fn(x.shape[1], context.shape[1], x.dtype, x.device, transformer_options)
+                if relay_mask is not None:
+                    relay_mask = _relay_mask_for_positive_rows(
+                        relay_mask, transformer_options, x.shape[0], x.device, x.dtype
+                    )
+                if relay_mask is not None:
+                    mask = relay_mask if mask is None else mask + relay_mask
+            return underlying(
+                x,
+                context=context,
+                mask=mask,
+                pe=pe,
+                k_pe=k_pe,
+                transformer_options=transformer_options,
+            )
+
+        context = x if context is None else context
+        q = _self.to_q(x)
+        k = _self.to_k(context)
+        v = _self.to_v(context)
+
+        if context is not None:
+            marker_token_indices = pointer_config["marker_token_indices"]
+            msr_info = pointer_config["msr_info"]
+            latent_shape = pointer_config["latent_shape"]
+            pointer_blocks = pointer_config["pointer_blocks"]
+            spatial_patch_size = pointer_config["spatial_patch_size"]
+            temporal_patch_size = pointer_config["temporal_patch_size"]
+            binding_strength = pointer_config["binding_strength"]
+            preserve_text_strength = pointer_config["preserve_text_strength"]
+            normalize_ref_summary = pointer_config["normalize_ref_summary"]
+            positive_mask = _positive_batch_mask(transformer_options, x.shape[0], x.device)
+            positive_rows = None
+            if positive_mask is not None:
+                positive_rows = torch.where(positive_mask)[0]
+
+            if pointer_blocks is None or block_idx in pointer_blocks:
+                max_context_index = context.shape[1] - 1
+
+                for slot, token_indices in marker_token_indices.items():
+                    usable = [idx for idx in token_indices if idx <= max_context_index]
+                    if not usable:
+                        continue
+
+                    ref_indices = _build_slot_ref_indices_from_target_latent(
+                        msr_info,
+                        slot,
+                        seq=x.shape[1],
+                        device=x.device,
+                        target_latent_shape=latent_shape,
+                        spatial_patch_size=spatial_patch_size,
+                        temporal_patch_size=temporal_patch_size,
+                    )
+                    if ref_indices is None or ref_indices.numel() == 0:
+                        continue
+
+                    ref_summary = x[:, ref_indices, :].mean(dim=1)
+                    marker_tensor = torch.as_tensor(usable, device=k.device, dtype=torch.long)
+
+                    ref_k = _self.to_k(ref_summary[:, None, :]).to(dtype=k.dtype, device=k.device)
+                    ref_v = _self.to_v(ref_summary[:, None, :]).to(dtype=v.dtype, device=v.device)
+                    if normalize_ref_summary:
+                        marker_norm = k[:, marker_tensor, :].norm(dim=-1, keepdim=True).mean(dim=1)
+                        ref_k = F.normalize(ref_k, dim=-1) * marker_norm.clamp_min(1e-6)
+                        ref_v = F.normalize(ref_v, dim=-1) * marker_norm.to(dtype=ref_v.dtype, device=ref_v.device).clamp_min(1e-6)
+
+                    if positive_rows is not None:
+                        if positive_rows.numel() == 0:
+                            continue
+                        k[positive_rows[:, None], marker_tensor[None, :], :] = (
+                            k[positive_rows[:, None], marker_tensor[None, :], :] * float(preserve_text_strength)
+                            + ref_k[positive_rows] * float(binding_strength)
+                        )
+                        v[positive_rows[:, None], marker_tensor[None, :], :] = (
+                            v[positive_rows[:, None], marker_tensor[None, :], :] * float(preserve_text_strength)
+                            + ref_v[positive_rows] * float(binding_strength)
+                        )
+                    else:
+                        k[:, marker_tensor, :] = (
+                            k[:, marker_tensor, :] * float(preserve_text_strength)
+                            + ref_k * float(binding_strength)
+                        )
+                        v[:, marker_tensor, :] = (
+                            v[:, marker_tensor, :] * float(preserve_text_strength)
+                            + ref_v * float(binding_strength)
+                        )
+
+        q = _self.q_norm(q)
+        k = _self.k_norm(k)
+
+        if pe is not None:
+            try:
+                from comfy.ldm.lightricks.model import apply_rotary_emb
+                q = apply_rotary_emb(q, pe)
+                k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
+            except Exception:
+                pass
+
+        if context is not None:
+            relay_mask = mask_fn(x.shape[1], context.shape[1], x.dtype, x.device, transformer_options)
+            if relay_mask is not None:
+                relay_mask = _relay_mask_for_positive_rows(
+                    relay_mask, transformer_options, x.shape[0], x.device, x.dtype
+                )
+            if relay_mask is not None:
+                mask = relay_mask if mask is None else mask + relay_mask
+
+        if mask is None:
+            out = comfy.ldm.modules.attention.optimized_attention(
+                q,
+                k,
+                v,
+                _self.heads,
+                attn_precision=getattr(_self, "attn_precision", None),
+                transformer_options=transformer_options,
+            )
+        else:
+            out = comfy.ldm.modules.attention.optimized_attention_masked(
+                q,
+                k,
+                v,
+                _self.heads,
+                mask,
+                attn_precision=getattr(_self, "attn_precision", None),
+                transformer_options=transformer_options,
+            )
+
+        to_gate_logits = getattr(_self, "to_gate_logits", None)
+        if to_gate_logits is not None:
+            gate_logits = to_gate_logits(x)
+            b, t, _ = out.shape
+            out = out.view(b, t, _self.heads, _self.dim_head)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, _self.heads * _self.dim_head)
+
+        return _self.to_out(out)
+
+    return wrapped
+
+
+def _parse_yuan_map_config(msr_info, config_str):
+    role_order = []
+    role_descriptions = {}
+    background_role = None
+    background_desc = None
+
+    bg_keywords = ("背景", "场景", "bg", "background", "environment", "scene")
+
+    lines = config_str.replace(",", "\n").split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r'@(\S+?)\s*[=:：]\s*(.+)', line)
+        if m:
+            role_name = "@" + m.group(1).strip()
+            desc = m.group(2).strip()
+            role_order.append(role_name)
+            role_descriptions[role_name] = desc
+            role_lower = role_name.lower()
+            if any(kw in role_lower for kw in [kw.lower() for kw in bg_keywords]):
+                background_role = role_name
+                background_desc = desc
+
+    subjects = msr_info.get("subjects") or []
+    subject_slots = []
+    for item in subjects:
+        if isinstance(item, dict) and "slot" in item:
+            subject_slots.append(str(item["slot"]))
+
+    role_slots = {}
+    subject_idx = 0
+    for role_name in role_order:
+        if role_name == background_role:
+            continue
+        if subject_idx < len(subject_slots):
+            role_slots[subject_slots[subject_idx]] = role_name
+            subject_idx += 1
+
+    return role_descriptions, role_slots, background_role, background_desc
+
+
+def _split_local_prompts(local_prompts):
+    if "|" in local_prompts:
+        return [p.strip() for p in local_prompts.split("|") if p.strip()]
+    return [p.strip() for p in local_prompts.splitlines() if p.strip()]
 
 
 # ==============================================================================
@@ -458,7 +810,7 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
     if not locals_list:
         raise ValueError("至少需要一个本地提示词（使用 | 分隔）")
 
-    arch, patch_size, temporal_stride = detect_model_type(model)
+    patch_size, temporal_stride = detect_model_type(model)
 
     samples = latent["samples"]
     latent_frames = samples.shape[2]
@@ -485,11 +837,134 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
         latent_frames, tokens_per_frame, effective_lengths,
     )
 
-    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon, None)
+    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon)
     mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
 
     patched = model.clone()
-    apply_patches(patched, arch, mask_fn)
+    apply_patches(patched, mask_fn)
+
+    return patched, conditioning
+
+
+def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_prompts, segment_lengths, epsilon, binding_strength=0.35):
+    """基于 msr_info 的 @角色 Prompt Relay 编码（与 YuanNode 功能一致）。
+    global_prompt 中使用 @图1=描述、@背景=描述 格式定义角色。"""
+    if not isinstance(msr_info, dict):
+        raise ValueError("Yuan CLIP Timeline: msr_info must be a dict")
+
+    role_descriptions, role_slots, background_role, background_desc = _parse_yuan_map_config(msr_info, global_prompt)
+    if not role_descriptions and not background_role:
+        raise ValueError("Yuan CLIP Timeline: global_prompt 中未找到有效的 @角色 定义")
+
+    # 从 @角色定义构建全局提示词
+    global_prompt_parts = []
+    for role_name, desc in role_descriptions.items():
+        global_prompt_parts.append(f"{role_name}是{desc}")
+    if background_desc:
+        global_prompt_parts.append(background_desc)
+    global_prompt = "。".join(global_prompt_parts) + ("。" if global_prompt_parts else "")
+
+    locals_list = _split_local_prompts(local_prompts.strip())
+    if not locals_list:
+        raise ValueError("Yuan CLIP Timeline: local_prompts 不能为空，使用 | 或换行分隔段落")
+
+    patch_size, temporal_stride = detect_model_type(model)
+
+    samples = latent["samples"]
+    latent_shape = tuple(samples.shape)
+    latent_frames = samples.shape[2]
+    tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
+
+    raw_tokenizer = get_raw_tokenizer(clip)
+
+    # 构建 @角色 标记规格
+    marker_specs = {}
+    for slot, role_name in role_slots.items():
+        marker_name = role_name.lstrip("@")
+        markers = [role_name, marker_name]
+        m = re.match(r'图\s*(\d+)', marker_name)
+        if m:
+            num = m.group(1)
+            markers.extend([f"参考图{num}", f"pic{num}", f"图{num}"])
+        seen = set()
+        marker_specs[slot] = [m for m in markers if not (m in seen or seen.add(m))]
+    if background_role:
+        bg_marker_name = background_role.lstrip("@")
+        markers = [background_role, bg_marker_name, "bg", "background", "背景", "场景"]
+        seen = set()
+        marker_specs["background"] = [m for m in markers if not (m in seen or seen.add(m))]
+
+    full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
+    global_token_count = token_ranges[0][0] if token_ranges else 0
+
+    log.info("[Yuan CLIP Timeline/MSR] 全局: tokens [0:%d] (%d tokens)", global_token_count, global_token_count)
+    for i, (s, e) in enumerate(token_ranges):
+        log.info("[Yuan CLIP Timeline/MSR] 段 %d: tokens [%d:%d] (%d tokens)", i, s, e, e - s)
+
+    conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
+
+    parsed_lengths = None
+    if segment_lengths.strip():
+        pixel_lengths = [int(x.strip()) for x in segment_lengths.split(",") if x.strip()]
+        parsed_lengths = _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames)
+    effective_lengths = distribute_segment_lengths(len(locals_list), latent_frames, parsed_lengths)
+
+    log.info(
+        "[Yuan CLIP Timeline/MSR] 潜空间: %d 帧, %d tokens/帧, 段: %s",
+        latent_frames, tokens_per_frame, effective_lengths,
+    )
+
+    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon)
+    relay_mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
+
+    # 查找标记 token 索引
+    all_markers = [marker for markers in marker_specs.values() for marker in markers]
+    marker_token_indices = {}
+    for slot, markers in marker_specs.items():
+        if markers:
+            indices = _find_marker_phrase_token_indices(
+                raw_tokenizer, full_prompt, markers,
+                stop_markers=all_markers,
+                phrase_extend_tokens=12,
+            )
+            indices = [idx for idx in indices if idx >= global_token_count]
+            if indices:
+                marker_token_indices[slot] = indices
+
+    log.info("[Yuan CLIP Timeline/MSR] 标记绑定: %s", {k: len(v) for k, v in marker_token_indices.items()})
+
+    if msr_info:
+        subjects = msr_info.get("subjects") or []
+        bg = msr_info.get("background") or {}
+        log.info(
+            "[Yuan CLIP Timeline/MSR] msr_info: ref_frames=%s, ref_latents=%s, subjects=%s, bg=%s",
+            msr_info.get("reference_frame_count"),
+            msr_info.get("reference_latent_count"),
+            [(s.get("slot"), s.get("frame_start"), s.get("frame_end"), s.get("latent_start"), s.get("latent_end")) for s in subjects],
+            (bg.get("frame_start"), bg.get("frame_end"), bg.get("latent_start"), bg.get("latent_end")),
+        )
+
+    patched = model.clone()
+
+    pointer_config = None
+    if marker_token_indices:
+        diffusion_model = patched.get_model_object("diffusion_model")
+        n_blocks = len(diffusion_model.transformer_blocks)
+        pointer_blocks = _parse_block_filter("8-47", n_blocks)
+        log.info("[Yuan CLIP Timeline/MSR] 模型 blocks=%d, pointer_blocks=%s", n_blocks, sorted(pointer_blocks)[:5])
+        pointer_config = {
+            "marker_token_indices": marker_token_indices,
+            "msr_info": msr_info,
+            "latent_shape": latent_shape,
+            "pointer_blocks": pointer_blocks,
+            "spatial_patch_size": 1,
+            "temporal_patch_size": 1,
+            "binding_strength": binding_strength,
+            "preserve_text_strength": 1.0,
+            "normalize_ref_summary": True,
+        }
+
+    apply_patches(patched, relay_mask_fn, pointer_config)
 
     return patched, conditioning
 
@@ -510,7 +985,7 @@ class YuanCLIPTimeline:
                 "audio_vae": ("VAE", {"tooltip": "Audio VAE，用于生成音频潜空间。video latent 与 audio latent 使用相同的帧数/帧率，保证对齐。"}),
                 "global_prompt": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "贯穿整个视频的全局提示词。用于锚定持久的角色、物体和场景上下文。"
+                    "tooltip": "贯穿整个视频的全局提示词。用于锚定持久的角色、物体和场景上下文。\n连接 msr_info 时，在此用 @图1=描述、@图2=描述、@背景=描述 定义角色，每行一条，按顺序对应 msr_info 的 subjects。"
                 }),
                 "max_frames": ("INT", {
                     "default": 129, "min": 1, "max": 10000, "step": 1,
@@ -560,6 +1035,13 @@ class YuanCLIPTimeline:
                     "default": True,
                     "tooltip": "开启：预览模式：提示词只读不可编辑。\n关闭：各段落可自由编辑，不受 text_input 影响。"
                 }),
+                "msr_info": ("MSR_INFO", {
+                    "tooltip": "连接多帧参考节点的 msr_info 输出。连接后启用 @角色标记绑定功能：\nglobal_prompt 中用 @图1=描述、@背景=描述 定义角色，\nlocal_prompts/text_input 中用 @图1、@图2 等引用角色，\n模型自动将标记 token 绑定到参考帧。"
+                }),
+                "binding_strength": ("FLOAT", {
+                    "default": 0.35, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "标记绑定强度。控制 @角色 token 与参考帧的绑定程度。\n值越高绑定越强，但过高可能导致伪影。仅在 msr_info 连接时生效。"
+                }),
             },
         }
 
@@ -576,7 +1058,8 @@ class YuanCLIPTimeline:
 
     def encode_timeline(self, model, clip, audio_vae, global_prompt, max_frames, timeline_data,
                         local_prompts, segment_lengths, epsilon, fps=24.0, time_units="frames",
-                        width=768, height=512, latent=None, text_input="", prompt_lock=True):
+                        width=768, height=512, latent=None, text_input="", prompt_lock=True,
+                        msr_info=None, binding_strength=0.35):
         # --- 处理 text_input：仅在锁定模式下按行智能分配到 local_prompts 和 timeline_data ---
         if prompt_lock and text_input and text_input.strip():
             lines_raw = text_input.split("\n")
@@ -701,9 +1184,16 @@ class YuanCLIPTimeline:
         if latent is None:
             latent = _auto_generate_latent(width, height, ltxv_length)
 
-        patched, conditioning = _encode_relay(
-            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
-        )
+        # --- 编码路径选择：msr_info 连接时使用 Marker Relay 编码，否则使用标准 Relay 编码 ---
+        if msr_info is not None:
+            log.info("[Yuan CLIP Timeline] 检测到 msr_info 输入，启用 @角色标记绑定 (Marker Relay)")
+            patched, conditioning = _encode_relay_with_msr(
+                model, clip, latent, msr_info, global_prompt, local_prompts, segment_lengths, epsilon, binding_strength,
+            )
+        else:
+            patched, conditioning = _encode_relay(
+                model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
+            )
 
         # --- 自动生成音频潜空间（原理同 video latent：零张量 + type="audio"，由采样器加噪去噪）---
         audio_latent = _auto_generate_audio_latent(audio_vae, ltxv_length, fps)

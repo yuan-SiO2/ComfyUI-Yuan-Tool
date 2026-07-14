@@ -56,7 +56,7 @@ class YUAN_TXTListNumber:
         results = []
         for i, line in enumerate(lines):
             num = 起始编号 + i
-            numbered = f"{编号前缀}{num}{编号后缀} {line}"
+            numbered = f"{编号前缀}{num}{编号后缀}{line}"
             results.append(numbered)
 
         if 输出模式 == "合并文本":
