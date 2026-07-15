@@ -162,23 +162,67 @@ def map_token_indices(raw_tokenizer, global_prompt, local_prompts):
     return full_prompt, token_ranges
 
 
+def _redistribute_to_total(lengths, target_total):
+    """将长度列表重新分配到精确等于 target_total，使用最大余数法。"""
+    if not lengths:
+        return []
+    total = sum(lengths)
+    if total == target_total:
+        return list(lengths)
+    if total <= 0:
+        return _distribute_evenly(len(lengths), target_total)
+    exact = [L * target_total / total for L in lengths]
+    result = [int(e) for e in exact]
+    diff = target_total - sum(result)
+    if diff > 0:
+        order = sorted(range(len(exact)), key=lambda i: -(exact[i] - int(exact[i])))
+        for k in range(diff):
+            result[order[k % len(order)]] += 1
+    elif diff < 0:
+        order = sorted(range(len(exact)), key=lambda i: exact[i] - int(exact[i]))
+        for k in range(-diff):
+            idx = order[k % len(order)]
+            if result[idx] > 1:
+                result[idx] -= 1
+    return [max(1, L) for L in result]
+
+
+def _distribute_evenly(num_segments, target_total):
+    """最大余数法均分：确保总和精确等于 target_total。"""
+    if num_segments <= 0 or target_total <= 0:
+        return []
+    base = target_total // num_segments
+    remainder = target_total % num_segments
+    return [max(1, base + (1 if i < remainder else 0)) for i in range(num_segments)]
+
+
 def distribute_segment_lengths(num_segments, latent_frames, specified_lengths=None):
-    """验证或自动分布段帧数，限制在 latent_frames 范围内。"""
+    """验证或自动分布段帧数，确保总和精确等于 latent_frames。
+
+    无论 specified_lengths 来自何处（用户手动输入、_convert_to_latent_lengths 转换、
+    时间轴编辑器），最终输出始终规范化到总和 = latent_frames，
+    避免段长度溢出导致惩罚矩阵污染参考帧 tokens 区域。
+    """
+    if num_segments <= 0 or latent_frames <= 0:
+        return []
+
     if specified_lengths:
         if len(specified_lengths) != num_segments:
             raise ValueError(
                 f"segment_lengths 数量 ({len(specified_lengths)}) "
                 f"必须与本地提示词数量 ({num_segments}) 一致"
             )
-        lengths = specified_lengths
-    else:
-        step = -(-latent_frames // num_segments)  # 向上取整除法
-        lengths = [step] * num_segments
+        clipped = [max(1, min(L, latent_frames)) for L in specified_lengths]
+        total = sum(clipped)
+        if total != latent_frames:
+            log.warning(
+                "[Yuan CLIP Timeline] segment_lengths 总和(%d) != latent_frames(%d)，自动重新规范化",
+                total, latent_frames,
+            )
+            return _redistribute_to_total(clipped, latent_frames)
+        return clipped
 
-    effective = []
-    for L in lengths:
-        effective.append(max(1, min(L, latent_frames)))
-    return effective
+    return _distribute_evenly(num_segments, latent_frames)
 
 
 # ==============================================================================
@@ -363,40 +407,64 @@ def _find_marker_phrase_token_indices(
     return sorted(set(i for i in indices if i >= 0))
 
 
-def _map_subject_to_ref_latent_indices(subject, source_frame_count, latent_frame_count):
+def _map_subject_to_ref_latent_indices(
+    subject, source_frame_count, latent_frame_count, reference_latent_count=None,
+    max_ref_frames=None,
+):
+    """将主体映射到参考latent索引。
+
+    当运行时 latent_frame_count 与 msr_info 中的 reference_latent_count 不一致时
+    （例如 LTXV 对参考帧做了额外时间压缩），放弃使用 latent_start/latent_end
+    （它们基于 reference_latent_count 计算，会截断或重叠），
+    改用 frame_start/frame_end 按比例重新映射，避免图4特征丢失或与图3污染。
+
+    max_ref_frames: 每个主体最多使用几个参考 latent 帧（取前 N 个）。
+    避免参考帧过多导致 ref_summary 均值模糊，各主体统一取 2 帧以内保证公平。
+    """
     if source_frame_count <= 0 or latent_frame_count <= 0:
         return []
 
-    if "latent_start" in subject and "latent_end" in subject:
+    # 判断运行时latent帧数是否与msr_info中一致
+    runtime_mismatch = (
+        reference_latent_count is not None
+        and reference_latent_count > 0
+        and latent_frame_count != reference_latent_count
+    )
+
+    if not runtime_mismatch and "latent_start" in subject and "latent_end" in subject:
         ls = int(subject.get("latent_start", 0))
         le = int(subject.get("latent_end", ls))
         ls = max(0, min(latent_frame_count - 1, ls))
         le = max(ls, min(latent_frame_count - 1, le))
-        return list(range(ls, le + 1))
+        indices = list(range(ls, le + 1))
+    else:
+        # 运行时不一致或没有latent_start/latent_end时，使用frame_start/frame_end重新计算
+        fs = int(subject.get("frame_start", 0))
+        fe = int(subject.get("frame_end", -1))
+        fs = max(0, min(source_frame_count - 1, fs))
+        fe = max(fs, min(source_frame_count - 1, fe))
 
-    fs = int(subject.get("frame_start", 0))
-    fe = int(subject.get("frame_end", -1))
-    fs = max(0, min(source_frame_count - 1, fs))
-    fe = max(fs, min(source_frame_count - 1, fe))
+        if latent_frame_count == source_frame_count:
+            indices = list(range(fs, fe + 1))
+        elif latent_frame_count == 1:
+            indices = [0]
+        else:
+            stride = (source_frame_count - 1) / float(latent_frame_count - 1)
+            indices = []
+            for latent_idx in range(latent_frame_count):
+                source_anchor = int(round(latent_idx * stride))
+                if fs <= source_anchor <= fe:
+                    indices.append(latent_idx)
+            if not indices:
+                center = (fs + fe) * 0.5
+                nearest = int(round(center / stride))
+                indices = [max(0, min(latent_frame_count - 1, nearest))]
 
-    if latent_frame_count == source_frame_count:
-        return list(range(fs, fe + 1))
-    if latent_frame_count == 1:
-        return [0]
+    # 每个主体最多取 max_ref_frames 个参考 latent 帧（取前 N 个）
+    if max_ref_frames is not None and len(indices) > max_ref_frames:
+        indices = indices[:max_ref_frames]
 
-    stride = (source_frame_count - 1) / float(latent_frame_count - 1)
-    indices = []
-    for latent_idx in range(latent_frame_count):
-        source_anchor = int(round(latent_idx * stride))
-        if fs <= source_anchor <= fe:
-            indices.append(latent_idx)
-
-    if indices:
-        return indices
-
-    center = (fs + fe) * 0.5
-    nearest = int(round(center / stride))
-    return [max(0, min(latent_frame_count - 1, nearest))]
+    return indices
 
 
 def _parse_block_filter(text, n_blocks):
@@ -432,6 +500,7 @@ def _build_slot_ref_indices_from_target_latent(
     target_latent_shape,
     spatial_patch_size=1,
     temporal_patch_size=1,
+    max_ref_frames=None,
 ):
     if not isinstance(msr_info, dict) or target_latent_shape is None:
         return None
@@ -439,6 +508,8 @@ def _build_slot_ref_indices_from_target_latent(
     reference_frame_count = int(msr_info.get("reference_frame_count") or 0)
     if reference_frame_count <= 0:
         return None
+
+    reference_latent_count = int(msr_info.get("reference_latent_count") or 0)
 
     subjects = list(msr_info.get("subjects") or [])
     background = msr_info.get("background")
@@ -477,10 +548,21 @@ def _build_slot_ref_indices_from_target_latent(
         return None
 
     ref_latent_frames = ref_count // tokens_per_frame
+
+    # 诊断：运行时参考latent帧数与msr_info中的不一致时，记录警告
+    if reference_latent_count > 0 and ref_latent_frames != reference_latent_count:
+        log.warning(
+            "[Yuan CLIP Timeline/MSR] slot=%s 运行时参考latent帧数(%d) != msr_info.reference_latent_count(%d)，"
+            "将使用frame_start/frame_end按比例重新映射（避免latent_start/latent_end截断导致主体缺失或污染）",
+            slot, ref_latent_frames, reference_latent_count,
+        )
+
     latent_indices = _map_subject_to_ref_latent_indices(
         subject,
         source_frame_count=reference_frame_count,
         latent_frame_count=ref_latent_frames,
+        reference_latent_count=reference_latent_count,
+        max_ref_frames=max_ref_frames,
     )
     ranges = []
     for latent_idx in latent_indices:
@@ -490,6 +572,10 @@ def _build_slot_ref_indices_from_target_latent(
             ranges.append(torch.arange(start, stop, device=device, dtype=torch.long))
 
     if not ranges:
+        log.warning(
+            "[Yuan CLIP Timeline/MSR] slot=%s 无法构建ref索引 (ref_latent_frames=%d, latent_indices=%s, seq=%d, target_count=%d)",
+            slot, ref_latent_frames, latent_indices, seq, target_count,
+        )
         return None
     return torch.cat(ranges, dim=0) if len(ranges) > 1 else ranges[0]
 
@@ -593,6 +679,7 @@ def _make_ltx_marker_relay_wrapper(
             binding_strength = pointer_config["binding_strength"]
             preserve_text_strength = pointer_config["preserve_text_strength"]
             normalize_ref_summary = pointer_config["normalize_ref_summary"]
+            max_ref_frames = pointer_config.get("max_ref_frames", 2)
             positive_mask = _positive_batch_mask(transformer_options, x.shape[0], x.device)
             positive_rows = None
             if positive_mask is not None:
@@ -600,10 +687,19 @@ def _make_ltx_marker_relay_wrapper(
 
             if pointer_blocks is None or block_idx in pointer_blocks:
                 max_context_index = context.shape[1] - 1
+                _slots_missing_logged = set()
 
                 for slot, token_indices in marker_token_indices.items():
                     usable = [idx for idx in token_indices if idx <= max_context_index]
                     if not usable:
+                        if slot not in _slots_missing_logged:
+                            _slots_missing_logged.add(slot)
+                            log.warning(
+                                "[Yuan CLIP Timeline/MSR] block=%d slot=%s 所有标记token(%s)超出context范围(max=%d)，"
+                                "该主体无法绑定——可能是full_prompt token数超过CLIP最大长度(%d)导致截断，"
+                                "请缩短global_prompt描述或减少主体数量",
+                                block_idx, slot, token_indices[:5], max_context_index, context.shape[1],
+                            )
                         continue
 
                     ref_indices = _build_slot_ref_indices_from_target_latent(
@@ -614,8 +710,15 @@ def _make_ltx_marker_relay_wrapper(
                         target_latent_shape=latent_shape,
                         spatial_patch_size=spatial_patch_size,
                         temporal_patch_size=temporal_patch_size,
+                        max_ref_frames=max_ref_frames,
                     )
                     if ref_indices is None or ref_indices.numel() == 0:
+                        if slot not in _slots_missing_logged:
+                            _slots_missing_logged.add(slot)
+                            log.warning(
+                                "[Yuan CLIP Timeline/MSR] block=%d slot=%s 无法获取参考帧索引，该主体绑定被跳过",
+                                block_idx, slot,
+                            )
                         continue
 
                     ref_summary = x[:, ref_indices, :].mean(dim=1)
@@ -896,10 +999,15 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
 
     full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
     global_token_count = token_ranges[0][0] if token_ranges else 0
+    total_prompt_tokens = token_ranges[-1][1] if token_ranges else 0
 
     log.info("[Yuan CLIP Timeline/MSR] 全局: tokens [0:%d] (%d tokens)", global_token_count, global_token_count)
     for i, (s, e) in enumerate(token_ranges):
         log.info("[Yuan CLIP Timeline/MSR] 段 %d: tokens [%d:%d] (%d tokens)", i, s, e, e - s)
+    log.info(
+        "[Yuan CLIP Timeline/MSR] full_prompt 总token数=%d (global=%d + local=%d)",
+        total_prompt_tokens, global_token_count, total_prompt_tokens - global_token_count,
+    )
 
     conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
 
@@ -921,15 +1029,43 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
     all_markers = [marker for markers in marker_specs.values() for marker in markers]
     marker_token_indices = {}
     for slot, markers in marker_specs.items():
-        if markers:
-            indices = _find_marker_phrase_token_indices(
+        if not markers:
+            continue
+
+        # 1. 在 global prompt 中搜索标记（窄短语扩展=3，避免绑定到"@图1是描述"的长文字）
+        global_indices = []
+        if global_token_count > 0:
+            global_indices = _find_marker_phrase_token_indices(
                 raw_tokenizer, full_prompt, markers,
                 stop_markers=all_markers,
-                phrase_extend_tokens=12,
+                phrase_extend_tokens=3,
             )
-            indices = [idx for idx in indices if idx >= global_token_count]
-            if indices:
-                marker_token_indices[slot] = indices
+            global_indices = [idx for idx in global_indices if 0 <= idx < global_token_count]
+
+        # 2. 在 local prompt 中搜索标记（宽短语扩展=12，保持局部语义完整）
+        local_indices = _find_marker_phrase_token_indices(
+            raw_tokenizer, full_prompt, markers,
+            stop_markers=all_markers,
+            phrase_extend_tokens=12,
+        )
+        local_indices = [idx for idx in local_indices if idx >= global_token_count]
+
+        # 3. 全局标记优先：global prompt 中的标记不在 q_token_idx 段中，
+        #    不受 Prompt Relay 时间惩罚，提供跨段持续的全局主体绑定
+        if global_indices:
+            marker_token_indices[slot] = global_indices
+            log.info(
+                "[Yuan CLIP Timeline/MSR] slot=%s 使用全局标记绑定 (%d tokens, 无时间惩罚, 全帧可见)",
+                slot, len(global_indices),
+            )
+        elif local_indices:
+            marker_token_indices[slot] = local_indices
+            log.info(
+                "[Yuan CLIP Timeline/MSR] slot=%s 使用局部标记绑定 (%d tokens, 受时间惩罚, 仅对应段可见)",
+                slot, len(local_indices),
+            )
+        else:
+            log.warning("[Yuan CLIP Timeline/MSR] slot=%s 未找到任何标记 token，该主体无法绑定", slot)
 
     log.info("[Yuan CLIP Timeline/MSR] 标记绑定: %s", {k: len(v) for k, v in marker_token_indices.items()})
 
@@ -952,6 +1088,18 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
         n_blocks = len(diffusion_model.transformer_blocks)
         pointer_blocks = _parse_block_filter("8-47", n_blocks)
         log.info("[Yuan CLIP Timeline/MSR] 模型 blocks=%d, pointer_blocks=%s", n_blocks, sorted(pointer_blocks)[:5])
+
+        # 动态计算每个主体最大参考latent帧数
+        # max_ref_frames = 每段最少latent帧 / 被@主体数量（取整）
+        # 例如：5段每段9帧，3个主体 → 9//3=3帧；4段每段12帧，4个主体 → 12//4=3帧
+        num_at_subjects = len(marker_token_indices) - (1 if "background" in marker_token_indices else 0)
+        per_segment_latent = min(effective_lengths) if effective_lengths else latent_frames
+        max_ref_frames = max(1, per_segment_latent // max(1, num_at_subjects))
+        log.info(
+            "[Yuan CLIP Timeline/MSR] 动态max_ref_frames=%d (每段%d latents / %d 主体)",
+            max_ref_frames, per_segment_latent, num_at_subjects,
+        )
+
         pointer_config = {
             "marker_token_indices": marker_token_indices,
             "msr_info": msr_info,
@@ -962,6 +1110,7 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
             "binding_strength": binding_strength,
             "preserve_text_strength": 1.0,
             "normalize_ref_summary": True,
+            "max_ref_frames": max_ref_frames,
         }
 
     apply_patches(patched, relay_mask_fn, pointer_config)
