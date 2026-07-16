@@ -8,7 +8,7 @@ ComfyUI 自定义节点工具集，提供图像处理、全景预览、画布合
 
 ### 1. 多帧参考 (`YuanTool`)
 - **分类**: `Yuan Tool/图像`
-- **功能**: 将多张主体图像与一张背景图合成为固定帧数的参考视频，专为 LTX 2.3 Tool (Multiple-Subject-Reference) LoRA 工作流设计。
+- **功能**: 将多张主体图像与一张背景图合成为固定帧数的参考视频，专为 LTX 2.3 Tool (Multiple-Subject-Reference) LoRA 工作流设计。输出 `msr_info` 供 Yuan CLIP Timeline 节点进行多主体 Marker Relay 绑定。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
@@ -20,7 +20,9 @@ ComfyUI 自定义节点工具集，提供图像处理、全景预览、画布合
 | `list_mode` | BOOL | 开启后使用 `image_list` 输入替代 1~4 独立端口 |
 | `image_list` | IMAGE (可选) | 批量图像输入（前 4 张有效） |
 
-- **输出**: `output` (IMAGE) — 合成后的视频帧序列张量
+- **输出**: 
+  - `output` (IMAGE) — 合成后的视频帧序列张量
+  - `msr_info` (MSR_INFO) — 帧分配元信息，包含各主体的 frame 范围、latent 映射等，供 Yuan CLIP Timeline 节点使用
 
 #### 帧数计算公式
 ```
@@ -189,13 +191,16 @@ ComfyUI 自定义节点工具集，提供图像处理、全景预览、画布合
 
 ### 10. Yuan CLIP 时间轴 (`YuanCLIPTimeline`)
 - **分类**: `Yuan Tool/CLIP`
-- **功能**: 可视化时间轴提示词编码节点，复刻自 ComfyUI-PromptRelay 的 Prompt Relay Encode (Timeline) 节点。为视频扩散模型 (Wan / LTX) 注入时间感知的提示词调度，自动生成视频和音频空潜空间。配套 Web 时间轴编辑器 UI。
+- **功能**: 可视化时间轴提示词编码节点，复刻自 ComfyUI-PromptRelay 的 Prompt Relay Encode (Timeline) 节点。为视频扩散模型 (Wan / LTX) 注入时间感知的提示词调度，支持多主体参考特性绑定（Marker Relay），自动生成视频和音频空潜空间。配套 Web 时间轴编辑器 UI。
 
 #### 核心特性
 - **时间感知注意力惩罚**: 对交叉注意力注入高斯惩罚矩阵，使不同时间段的提示词在对应帧上具有更高的注意力权重
+- **多主体 Marker Relay**: 连接 `msr_info` 端口（来自多帧参考节点）后，`@图X` / `@背景` 标记自动绑定到对应主体的参考帧特征
+- **@角色定义**: 在 `global_prompt` 中输入 `@图1是穿着红衣服的女人`、`@图2是蓝色西装的男人` 等格式，定义主体角色语义，配合 Marker Relay 实现全局主体绑定
 - **自动潜空间生成**: 未连接 latent 输入时，自动生成 LTXV 兼容的视频/音频空潜空间（零张量），由采样器加噪去噪
 - **text_input 智能解析**: 支持时间格式行 `"0-3s 提示词A"` 动态分配帧长，也支持纯文本行自动均分
 - **提示词锁定模式**: prompt_lock 开启时，text_input 自动同步到时间轴各段落
+- **动态参考帧分配**: 自动计算每个 @主体 可用的参考 latent 帧数上限 = `每段最少latent帧 // @主体数量`，避免参考帧过多导致特征模糊/污染
 
 #### 主要参数
 | 参数 | 类型 | 说明 |
@@ -203,7 +208,7 @@ ComfyUI 自定义节点工具集，提供图像处理、全景预览、画布合
 | `model` | MODEL | 要补丁的扩散模型 (Wan / LTX) |
 | `clip` | CLIP | 用于编码提示词的 CLIP 模型 |
 | `audio_vae` | VAE | Audio VAE，用于生成音频潜空间 |
-| `global_prompt` | STRING | 全局提示词，贯穿整个视频 |
+| `global_prompt` | STRING | 全局提示词，贯穿整个视频。支持 `@图X=描述` 格式定义主体角色 |
 | `max_frames` | INT | 像素空间总帧数 (默认 129) |
 | `timeline_data` | STRING | 时间轴编辑器 JSON 状态（自动管理） |
 | `local_prompts` | STRING | 各段提示词，用 `\|` 分隔（自动填充） |
@@ -214,10 +219,33 @@ ComfyUI 自定义节点工具集，提供图像处理、全景预览、画布合
 | `width` | INT | 自动生成潜空间的目标宽度 (默认 768) |
 | `height` | INT | 自动生成潜空间的目标高度 (默认 512) |
 | `latent` | LATENT (可选) | 外部潜空间输入（不连接时自动生成） |
+| `msr_info` | MSR_INFO (可选) | 连接多帧参考节点的 msr_info 输出，启用多主体 Marker Relay 功能 |
 | `text_input` | STRING (可选) | 按行输入的提示词文本（支持时间格式） |
 | `prompt_lock` | BOOL (可选) | 提示词锁定模式 (默认 true) |
+| `binding_strength` | FLOAT (可选) | Marker Relay 绑定强度 (默认 1.0) |
 
 - **输出**: `model` (MODEL) — 补丁后的模型, `positive` (CONDITIONING) — 正向条件, `video_latent` (LATENT) — 视频潜空间, `audio_latent` (LATENT) — 音频潜空间
+
+#### Marker Relay 工作流
+```
+[图1] ─┐
+[图2] ─┤             ┌──────────────────────────┐
+[图3] ─┼─ 多帧参考 ──┤ msr_info ──────────────  │
+[图4] ─┤   节点      └──────────────────────────┤
+[背景] ─┘                                       │
+                                                ▼
+                                        Yuan CLIP Timeline
+                                         global_prompt:
+                                         "@图1是穿红裙的女人
+                                          @图2是蓝色西装的男人
+                                          @图3是白发的老人
+                                          @图4是年轻的女孩
+                                          @背景是城市街道"
+```
+1. 多帧参考节点根据 `frame_multiplier` 生成各主体的参考帧序列，输出 `msr_info`
+2. Timeline 节点读取 `msr_info`，将 `@图X` 标记 token 的 K/V 替换为对应主体的参考帧特征均值
+3. `max_ref_frames` 自动计算：例如 5 段每段 9 latent 帧、4 个主体 → 每主体最多 2 个参考 latent 帧
+4. `@背景` 标记绑定到参考背景帧特征
 
 ---
 
