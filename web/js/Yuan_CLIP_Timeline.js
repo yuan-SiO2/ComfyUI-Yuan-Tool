@@ -1228,12 +1228,53 @@ app.registerExtension({
     }
 
     // ── 构建并显示弹窗 ──
+    // 从连接的源节点读取 global_prompt 文本（外接文本输出时 widget 被 converted，value 为空）
+    function readConnectedGlobalPrompt(node) {
+        if (!node || !node.graph) return null;
+        const inputIdx = node.findInputSlot ? node.findInputSlot("global_prompt") : -1;
+        if (inputIdx < 0) return null;
+        const linkId = node.inputs[inputIdx]?.link;
+        if (linkId == null) return null;
+
+        const link = node.graph.links[linkId];
+        if (!link) return null;
+        const srcNode = node.graph.getNodeById(link.origin_id);
+        if (!srcNode) return null;
+
+        // 从源节点的 widgets 中查找文本内容
+        const candidates = [];
+        for (const w of (srcNode.widgets || [])) {
+            if (w.type === "customtext" || w.name === "string" || (w.name && /^(text|prompt|string|multiline|global_prompt)$/i.test(w.name))) {
+                candidates.push(w);
+            }
+        }
+        if (candidates.length === 0) {
+            for (const w of (srcNode.widgets || [])) {
+                if (!w.hidden && typeof w.value === "string" && w.value.trim()) {
+                    candidates.push(w);
+                }
+            }
+        }
+        if (candidates.length === 0) return null;
+
+        const stringW = candidates.find(w => w.name === "string");
+        if (stringW && stringW.value?.trim()) return stringW.value;
+
+        const combined = candidates.map(w => w.value).filter(v => typeof v === "string" && v.trim()).join("\n");
+        return combined || null;
+    }
+
     function showPopup(textEl, node) {
         const existing = document.querySelector('.timeline-atsign-popup');
         if (existing) existing.remove();
 
         const gpWidget = node.widgets?.find(w => w.name === 'global_prompt');
-        const promptText = gpWidget?.value || '';
+        // 优先读取 widget 值；外接连接时 widget 被隐藏，回退到从连接的源节点读取
+        let promptText = gpWidget?.value || '';
+        if (!promptText.trim()) {
+            const connected = readConnectedGlobalPrompt(node);
+            if (connected) promptText = connected;
+        }
         const markers = parseMarkersFromPrompt(promptText);
 
         if (markers.length === 0) return;
