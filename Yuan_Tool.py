@@ -19,20 +19,6 @@ def _estimate_ref_latent_frames(source_frame_count):
     return int(round((source_frame_count - 1) / 8.0)) + 1
 
 
-def _latent_to_frame_range(latent_start, latent_end):
-    latent_start = int(latent_start)
-    latent_end = int(latent_end)
-    if latent_start <= 0:
-        frame_start = 0
-    else:
-        frame_start = 1 + (latent_start - 1) * 8
-    if latent_end <= 0:
-        frame_end = 0
-    else:
-        frame_end = latent_end * 8
-    return frame_start, frame_end
-
-
 def _frame_range_to_latent(frame_start, frame_end):
     frame_start = int(frame_start)
     frame_end = int(frame_end)
@@ -52,13 +38,13 @@ class YuanTool:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "background": ("IMAGE",),
                 "width": ("INT", {"default": 736, "min": 32, "max": 8192, "step": 32}),
                 "height": ("INT", {"default": 1280, "min": 32, "max": 8192, "step": 32}),
                 "frame_multiplier": ([8, 16, 24, 32], {"default": 16}),
                 "list_mode": ("BOOLEAN", {"default": False, "label_on": "true", "label_off": "false"}),
             },
             "optional": {
+                "background": ("IMAGE",),
                 "1": ("IMAGE",),
                 "2": ("IMAGE",),
                 "3": ("IMAGE",),
@@ -72,9 +58,8 @@ class YuanTool:
     FUNCTION = "create_video"
     CATEGORY = "Yuan Tool/图像"
 
-    def create_video(self, background, width, height, frame_multiplier, list_mode, **kwargs):
-        if background is None:
-            raise ValueError("Background image is required and cannot be empty.")
+    def create_video(self, width, height, frame_multiplier, list_mode, **kwargs):
+        background = kwargs.get("background")
 
         subjects = []
         subject_slots = []
@@ -99,9 +84,11 @@ class YuanTool:
                     subjects.append(self._prepare_image(image, (width, height), preserve_full=True))
                     subject_slots.append(name)
 
-        background_image = self._prepare_image(background, (width, height), preserve_full=False)
+        background_image = self._prepare_image(background, (width, height), preserve_full=False) if background is not None else None
 
-        frame_count = len(subjects) * frame_multiplier + 1 + 8
+        # 背景帧数：有背景图时 +8 帧，无背景时为 0
+        bg_frame_count = 8 if background_image is not None else 0
+        frame_count = len(subjects) * frame_multiplier + 1 + bg_frame_count
         frames, subject_frame_ranges, background_frame_range = self._expand_frames_with_info(
             subjects, background_image, frame_multiplier, frame_count
         )
@@ -110,7 +97,7 @@ class YuanTool:
         latent_count = _estimate_ref_latent_frames(frame_count)
 
         subjects_info = []
-        for idx, (slot, (start, end)) in enumerate(zip(subject_slots, subject_frame_ranges)):
+        for slot, (start, end) in zip(subject_slots, subject_frame_ranges):
             latent_start, latent_end = _frame_range_to_latent(start, end)
             item = {
                 "slot": slot,
@@ -125,20 +112,6 @@ class YuanTool:
             }
             subjects_info.append(item)
 
-        bg_start, bg_end = background_frame_range
-        bg_latent_start, bg_latent_end = _frame_range_to_latent(bg_start, bg_end)
-        background_info = {
-            "slot": "background",
-            "role": "background",
-            "frame_start": bg_start,
-            "frame_end": bg_end,
-            "frame_count": bg_end - bg_start + 1,
-            "latent_aligned": True,
-            "latent_start": bg_latent_start,
-            "latent_end": bg_latent_end,
-            "latent_count": bg_latent_end - bg_latent_start + 1,
-        }
-
         msr_info = {
             "version": MSR_INFO_VERSION,
             "token_order": "target_then_reference",
@@ -147,8 +120,23 @@ class YuanTool:
             "width": width,
             "height": height,
             "subjects": subjects_info,
-            "background": background_info,
         }
+
+        # 仅当提供了背景图时才添加 background 信息
+        if background_image is not None:
+            bg_start, bg_end = background_frame_range
+            bg_latent_start, bg_latent_end = _frame_range_to_latent(bg_start, bg_end)
+            msr_info["background"] = {
+                "slot": "background",
+                "role": "background",
+                "frame_start": bg_start,
+                "frame_end": bg_end,
+                "frame_count": bg_end - bg_start + 1,
+                "latent_aligned": True,
+                "latent_start": bg_latent_start,
+                "latent_end": bg_latent_end,
+                "latent_count": bg_latent_end - bg_latent_start + 1,
+            }
 
         return (output, msr_info)
 
@@ -239,10 +227,14 @@ class YuanTool:
             frames.extend([image] * repeats)
             cursor = end + 1
 
-        bg_start = cursor
-        bg_end = cursor + 7
-        frames.extend([background] * 8)
-        cursor = bg_end + 1
+        background_frame_range = None
+        # 仅当提供了背景图时才添加背景帧
+        if background is not None:
+            bg_start = cursor
+            bg_end = cursor + 7
+            frames.extend([background] * 8)
+            cursor = bg_end + 1
+            background_frame_range = (bg_start, bg_end)
 
         if len(frames) > frame_count:
             frames = frames[:frame_count]
@@ -251,13 +243,19 @@ class YuanTool:
                 for s, e in subject_frame_ranges
                 if s < frame_count
             ]
-            bg_end = min(bg_end, frame_count - 1)
+            if background_frame_range is not None:
+                bg_start, bg_end = background_frame_range
+                background_frame_range = (bg_start, min(bg_end, frame_count - 1))
         elif len(frames) < frame_count:
-            while len(frames) < frame_count:
-                frames.append(background)
-            bg_end = frame_count - 1
+            # 不足帧填充：有背景用背景，无背景用最后一个主体帧（避免空白）
+            filler = background if background is not None else (subjects[-1] if subjects else None)
+            if filler is not None:
+                while len(frames) < frame_count:
+                    frames.append(filler)
+            if background_frame_range is not None:
+                bg_start, bg_end = background_frame_range
+                background_frame_range = (bg_start, frame_count - 1)
 
-        background_frame_range = (bg_start, bg_end)
         return frames, subject_frame_ranges, background_frame_range
 
 

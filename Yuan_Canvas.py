@@ -13,7 +13,6 @@ import numpy as np
 import torch
 from comfy_execution.graph import ExecutionBlocker
 from server import PromptServer
-import aiohttp
 import web
 import nodes as comfy_nodes
 
@@ -88,7 +87,6 @@ class Yuan_Canvas:
     前端合成后的图像会回传后端，作为单个 IMAGE 输出。
     """
 
-    file = "new.png"
     result = None
     configCache = None
 

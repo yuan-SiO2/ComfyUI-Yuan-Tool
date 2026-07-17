@@ -10,7 +10,6 @@
 import base64
 import io
 import logging
-import math
 import uuid
 import tempfile
 from fractions import Fraction
@@ -64,16 +63,6 @@ def _decode_data_url_image(data_url: str):
         return torch.from_numpy(array).unsqueeze(0).contiguous()
     except Exception:
         return None
-
-
-def _finite_float(value, default=0.0):
-    try:
-        f = float(value)
-        if not math.isfinite(f):
-            return float(default)
-        return f
-    except Exception:
-        return float(default)
 
 
 def _audio_has_waveform(audio) -> bool:

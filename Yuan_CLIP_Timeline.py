@@ -696,7 +696,7 @@ def _make_ltx_marker_relay_wrapper(
                             _slots_missing_logged.add(slot)
                             log.warning(
                                 "[Yuan CLIP Timeline/MSR] block=%d slot=%s 所有标记token(%s)超出context范围(max=%d)，"
-                                "该主体无法绑定——可能是full_prompt token数超过CLIP最大长度(%d)导致截断，"
+                                "该主体无法绑定——full_prompt token数超过实际context长度(%d, 由max_frames/段落数动态决定)导致截断，"
                                 "请缩短global_prompt描述或减少主体数量",
                                 block_idx, slot, token_indices[:5], max_context_index, context.shape[1],
                             )
@@ -810,7 +810,6 @@ def _parse_yuan_map_config(msr_info, config_str):
     role_order = []
     role_descriptions = {}
     background_role = None
-    background_desc = None
 
     bg_keywords = ("背景", "场景", "bg", "background", "environment", "scene")
 
@@ -828,7 +827,6 @@ def _parse_yuan_map_config(msr_info, config_str):
             role_lower = role_name.lower()
             if any(kw in role_lower for kw in [kw.lower() for kw in bg_keywords]):
                 background_role = role_name
-                background_desc = desc
 
     subjects = msr_info.get("subjects") or []
     subject_slots = []
@@ -845,7 +843,7 @@ def _parse_yuan_map_config(msr_info, config_str):
             role_slots[subject_slots[subject_idx]] = role_name
             subject_idx += 1
 
-    return role_descriptions, role_slots, background_role, background_desc
+    return role_descriptions, role_slots, background_role
 
 
 def _split_local_prompts(local_prompts):
@@ -955,16 +953,16 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
     if not isinstance(msr_info, dict):
         raise ValueError("Yuan CLIP Timeline: msr_info must be a dict")
 
-    role_descriptions, role_slots, background_role, background_desc = _parse_yuan_map_config(msr_info, global_prompt)
+    role_descriptions, role_slots, background_role = _parse_yuan_map_config(msr_info, global_prompt)
     if not role_descriptions and not background_role:
         raise ValueError("Yuan CLIP Timeline: global_prompt 中未找到有效的 @角色 定义")
 
     # 从 @角色定义构建全局提示词
+    # role_descriptions 已包含 background_role（_parse_yuan_map_config 将 @背景 也加入 role_order），
+    # 无需额外 append 背景描述，否则描述出现两次，浪费 CLIP token
     global_prompt_parts = []
     for role_name, desc in role_descriptions.items():
         global_prompt_parts.append(f"{role_name}是{desc}")
-    if background_desc:
-        global_prompt_parts.append(background_desc)
     global_prompt = "。".join(global_prompt_parts) + ("。" if global_prompt_parts else "")
 
     locals_list = _split_local_prompts(local_prompts.strip())
@@ -1026,6 +1024,9 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
     relay_mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
 
     # 查找标记 token 索引
+    # 注意：CLIP 的 token 上限不是硬性 77，而是运行时 context.shape[1]（编码后的实际 token 数），
+    # 该值由 max_frames / text_input 段落数动态决定（如 385/5=77）。
+    # 实际的有效性过滤在注意力块回调中执行：usable = [idx for idx in token_indices if idx <= max_context_index]
     all_markers = [marker for markers in marker_specs.values() for marker in markers]
     marker_token_indices = {}
     for slot, markers in marker_specs.items():
@@ -1051,7 +1052,9 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
         local_indices = [idx for idx in local_indices if idx >= global_token_count]
 
         # 3. 全局标记优先：global prompt 中的标记不在 q_token_idx 段中，
-        #    不受 Prompt Relay 时间惩罚，提供跨段持续的全局主体绑定
+        #    不受 Prompt Relay 时间惩罚，提供跨段持续的全局主体绑定。
+        #    标记 token 是否在 context 有效范围内，由运行时注意力块回调根据
+        #    context.shape[1] 动态过滤（max_context_index），无需在此预过滤。
         if global_indices:
             marker_token_indices[slot] = global_indices
             log.info(
