@@ -16,14 +16,6 @@ app.registerExtension({
 
             const self = this;
 
-            const ensureBackgroundSolid = () => {
-                const bgInput = self.inputs.find(inp => inp.name === bgName);
-                if (bgInput) {
-                    bgInput.removable = false;
-                    bgInput.optional = false;
-                }
-            };
-
             const removeInputAndWidget = (name) => {
                 const idx = self.inputs.findIndex(inp => inp.name === name);
                 if (idx !== -1) self.removeInput(idx);
@@ -78,15 +70,23 @@ app.registerExtension({
                     }
                 }
 
-                // 第四步：确保背景端口存在且在最后
+                // 第四步：确保背景端口存在且在最后（可选端口，空心圆点）
                 const bgIdx = self.inputs.findIndex(inp => inp.name === bgName);
                 if (bgIdx !== -1) {
                     if (bgIdx !== self.inputs.length - 1) {
                         self.removeInput(bgIdx);
-                        self.addInput(bgName, imageType);
+                        addOptionalImageInput(bgName);
+                    } else {
+                        // 确保已存在的 background 端口是可选的（空心圆点）
+                        const bgInput = self.inputs.find(inp => inp.name === bgName);
+                        if (bgInput) {
+                            bgInput.optional = true;
+                            bgInput.removable = true;
+                            bgInput.shape = 7;
+                        }
                     }
                 } else {
-                    self.addInput(bgName, imageType);
+                    addOptionalImageInput(bgName);
                 }
 
                 // 第五步：恢复所有保存的连接
@@ -103,8 +103,6 @@ app.registerExtension({
                     }
                 }
 
-                ensureBackgroundSolid();
-
                 // 保持当前宽度不变，只更新高度
                 const currentWidth = self.size ? self.size[0] : self.computeSize()[0];
                 self.setSize([currentWidth, self.computeSize()[1]]);
@@ -112,8 +110,6 @@ app.registerExtension({
             };
 
             self._syncPorts = syncPorts;
-
-            ensureBackgroundSolid();
 
             const modeWidget = this.widgets.find(w => w.name === "list_mode");
             if (modeWidget) {
