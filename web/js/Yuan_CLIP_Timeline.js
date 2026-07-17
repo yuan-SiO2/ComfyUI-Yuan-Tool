@@ -794,7 +794,15 @@ class TimelineEditor {
 
   syncFromTextInput() {
     const raw = this._getTextInputValue();
-    if (!raw || !raw.trim()) return;
+    if (!raw || !raw.trim()) {
+      // text_input 为空时重置为默认时间轴（清空编辑器旧内容）
+      this.timeline = defaultTimeline(this.getMaxFrames());
+      this.selectedIndex = 0;
+      this.commit();
+      this.updateUIFromSelection();
+      this.render();
+      return;
+    }
     const lines = raw.split("\n").map(l => l.trim()).filter(l => l.length > 0);
     if (lines.length === 0) return;
 
@@ -1145,3 +1153,274 @@ app.registerExtension({
     };
   },
 });
+
+// ============================================================================
+// @ 标记自动补全扩展（复刻自 ComfyUI-AtSignRef）
+// 在 global_prompt / text_input / 时间轴编辑器中输入 @ 时弹出角色选择菜单
+// ============================================================================
+(function() {
+    const LOG = "[Timeline@]";
+
+    // ── 获取 ComfyApp graph ──
+    function getGraph() {
+        const app = window.comfyAPI?.app?.app;
+        if (app?.graph) return app.graph;
+        if (app?.canvas?.graph) return app.canvas.graph;
+        if (window.app?.graph) return window.app.graph;
+        if (window.canvas?.graph) return window.canvas.graph;
+        return null;
+    }
+
+    // ── 找到所有 YuanCLIPTimeline 节点 ──
+    function findTimelineNodes() {
+        const graph = getGraph();
+        if (!graph?._nodes) return [];
+        const nodes = graph._nodes;
+        if (!Array.isArray(nodes)) return [];
+        return nodes.filter(n => n && n.type === 'YuanCLIPTimeline');
+    }
+
+    // ── 找到与 textarea 关联的 Timeline 节点 ──
+    function findNodeByTextarea(textEl) {
+        try {
+            const nodes = findTimelineNodes();
+            for (const node of nodes) {
+                // 策略1: 匹配 widget 的 inputEl（global_prompt、text_input 等标准 widget）
+                if (node.widgets) {
+                    for (const w of node.widgets) {
+                        if (w.inputEl === textEl || w.element === textEl || w.canvas === textEl) {
+                            return node;
+                        }
+                    }
+                }
+                // 策略2: 匹配时间轴编辑器的自定义 textarea
+                if (node._timelineEditor && node._timelineEditor.textarea === textEl) {
+                    return node;
+                }
+            }
+            // 策略3: 只有一个 Timeline 节点时直接使用
+            if (nodes.length === 1) return nodes[0];
+        } catch (e) {
+            console.error(LOG, "findNodeByTextarea error:", e);
+        }
+        return null;
+    }
+
+    // ── 从 global_prompt 解析 @标记和描述 ──
+    // 与后端 _parse_yuan_map_config 保持一致的格式
+    // 支持：@图1=描述  /  @图1:描述  /  @图1：描述
+    function parseMarkersFromPrompt(promptText) {
+        if (!promptText) return [];
+        const markers = [];
+        const lines = promptText.replace(/,/g, '\n').split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            const m = trimmed.match(/^@(\S+?)\s*[=:：]\s*(.+)/);
+            if (m) {
+                const name = '@' + m[1].trim();
+                const desc = m[2].trim();
+                if (!markers.find(x => x.name === name)) {
+                    markers.push({ name, desc });
+                }
+            }
+        }
+        return markers;
+    }
+
+    // ── 构建并显示弹窗 ──
+    function showPopup(textEl, node) {
+        const existing = document.querySelector('.timeline-atsign-popup');
+        if (existing) existing.remove();
+
+        const gpWidget = node.widgets?.find(w => w.name === 'global_prompt');
+        const promptText = gpWidget?.value || '';
+        const markers = parseMarkersFromPrompt(promptText);
+
+        if (markers.length === 0) return;
+
+        const rect = textEl.getBoundingClientRect();
+        const overlay = document.createElement('div');
+        overlay.className = 'timeline-atsign-popup';
+        overlay.style.cssText = `
+            position: fixed;
+            background: #2a2a2a;
+            border: 1px solid #555;
+            border-radius: 8px;
+            padding: 6px;
+            z-index: 99999;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            max-width: 500px;
+            left: ${Math.max(10, Math.min(rect.left, window.innerWidth - 510))}px;
+            top: ${rect.bottom + 4}px;
+            min-width: 120px;
+        `;
+
+        markers.forEach((marker) => {
+            const item = document.createElement('div');
+            item.style.cssText = `
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                padding: 8px 12px;
+                border-radius: 6px;
+                transition: background 0.15s;
+                background: #1e1e1e;
+                border: 1px solid #444;
+                min-width: 64px;
+                min-height: 40px;
+            `;
+            item.onmouseenter = () => { item.style.background = '#444'; item.style.borderColor = '#777'; };
+            item.onmouseleave = () => { item.style.background = '#1e1e1e'; item.style.borderColor = '#444'; };
+
+            const nameEl = document.createElement('div');
+            nameEl.textContent = marker.name;
+            nameEl.style.cssText = `
+                font-size: 14px;
+                font-weight: bold;
+                color: #e8a850;
+                text-align: center;
+            `;
+            item.appendChild(nameEl);
+
+            if (marker.desc) {
+                const descEl = document.createElement('div');
+                descEl.textContent = marker.desc;
+                descEl.style.cssText = `
+                    font-size: 10px;
+                    color: #999;
+                    margin-top: 2px;
+                    text-align: center;
+                    max-width: 120px;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                `;
+                item.appendChild(descEl);
+            }
+
+            item.onclick = function() {
+                const val = textEl.value;
+                const cursorPos = textEl.selectionStart;
+                let insertText = marker.name + ' ';
+                let start = cursorPos;
+
+                if (cursorPos > 0 && val[cursorPos - 1] === '@') {
+                    start = cursorPos - 1;
+                } else if (cursorPos > 0) {
+                    const beforeText = val.substring(0, cursorPos);
+                    const lastAt = beforeText.lastIndexOf('@');
+                    if (lastAt >= 0) {
+                        const afterAt = beforeText.substring(lastAt + 1);
+                        if (!afterAt.includes(' ') && !afterAt.includes('\n')) {
+                            start = lastAt;
+                        }
+                    }
+                }
+
+                textEl.setRangeText(insertText, start, cursorPos, 'end');
+                textEl.focus();
+                textEl.dispatchEvent(new Event('input', { bubbles: true }));
+                if (overlay.parentNode) overlay.remove();
+            };
+
+            overlay.appendChild(item);
+        });
+
+        document.body.appendChild(overlay);
+
+        const closeHandler = function(e) {
+            if (!overlay.contains(e.target) && e.target !== textEl) {
+                if (overlay.parentNode) overlay.remove();
+                document.removeEventListener('click', closeHandler);
+                document.removeEventListener('focusin', closeHandler);
+            }
+        };
+        setTimeout(() => {
+            document.addEventListener('click', closeHandler);
+            document.addEventListener('focusin', closeHandler);
+        }, 10);
+    }
+
+    // ── 绑定 textarea @事件 ──
+    function bindTextarea(textEl) {
+        if (textEl.dataset.timelineAtInited) return;
+        textEl.dataset.timelineAtInited = '1';
+
+        function handleAt() {
+            const node = findNodeByTextarea(textEl);
+            if (!node) return;
+            showPopup(textEl, node);
+        }
+
+        textEl.addEventListener('input', function() {
+            const val = this.value;
+            const cursorPos = this.selectionStart || 0;
+            if (cursorPos > 0 && val[cursorPos - 1] === '@') handleAt();
+        });
+
+        textEl.addEventListener('click', function() {
+            const val = this.value;
+            const cursorPos = this.selectionStart || 0;
+            if (cursorPos > 0 && val[cursorPos - 1] === '@') handleAt();
+        });
+
+        textEl.addEventListener('keyup', function(e) {
+            if (e.key.startsWith('Arrow')) {
+                const val = this.value;
+                const cursorPos = this.selectionStart || 0;
+                if (cursorPos > 0 && val[cursorPos - 1] === '@') handleAt();
+            }
+        });
+    }
+
+    // ── 扫描并绑定所有 textarea ──
+    function scanTextareas() {
+        const textareas = document.querySelectorAll('textarea');
+        textareas.forEach(bindTextarea);
+    }
+
+    // ── 初始化 ──
+    function init() {
+        console.log(LOG, "Initializing @ mention for Yuan CLIP Timeline...");
+        scanTextareas();
+        setInterval(scanTextareas, 2000);
+
+        if (window.MutationObserver) {
+            const observer = new MutationObserver(() => {
+                const all = document.querySelectorAll('textarea');
+                const inited = document.querySelectorAll('textarea[data-timeline-at-inited]');
+                if (inited.length < all.length) scanTextareas();
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+
+        console.log(LOG, "Ready.");
+    }
+
+    // ── 等待 ComfyUI 就绪 ──
+    function waitForReady(retries) {
+        if (retries <= 0) {
+            console.warn(LOG, "Timeout, init anyway");
+            init();
+            return;
+        }
+        const graph = getGraph();
+        const textareas = document.querySelectorAll('textarea').length;
+        if (graph && graph._nodes && textareas > 0) {
+            init();
+        } else {
+            setTimeout(() => waitForReady(retries - 1), 1000);
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => waitForReady(90));
+    } else {
+        waitForReady(90);
+    }
+})();
