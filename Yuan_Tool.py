@@ -20,16 +20,26 @@ def _estimate_ref_latent_frames(source_frame_count):
 
 
 def _frame_range_to_latent(frame_start, frame_end):
+    """将帧范围映射到latent帧索引。
+
+    LTXV VAE 时间压缩结构: 第一帧独立 → latent 0, 后续每8帧一组。
+    - frame 0       → latent 0 (独立帧)
+    - frames[1,8]   → latent 1
+    - frames[9,16]  → latent 2
+    - frames[17,24] → latent 3
+    - ...
+    公式: frame 0 → latent 0; frame N (N>0) → (N-1)//8 + 1
+    """
     frame_start = int(frame_start)
     frame_end = int(frame_end)
     if frame_start <= 0:
         latent_start = 0
     else:
-        latent_start = (frame_start + 7) // 8
+        latent_start = (frame_start - 1) // 8 + 1
     if frame_end <= 0:
         latent_end = 0
     else:
-        latent_end = (frame_end + 7) // 8
+        latent_end = (frame_end - 1) // 8 + 1
     return latent_start, latent_end
 
 
@@ -219,6 +229,13 @@ class YuanTool:
         subject_frame_ranges = []
         cursor = 0
 
+        # slot1 多1帧: VAE 第一帧 (frame 0) 是独立帧 → latent 0,
+        # 不参与8帧分组。slot1 吸收这个独立帧后, 后续 slot 的帧边界
+        # 才能对齐 VAE 的8帧分组边界, 避免混合帧。
+        # 例: frame_multiplier=16
+        #   slot1: frames[0,16]  → latent 0(frame0) + latent 1(f1-8) + latent 2(f9-16) = 纯img1
+        #   slot2: frames[17,32] → latent 3(f17-24) + latent 4(f25-32) = 纯img2
+        #   slot3: frames[33,48] → latent 5(f33-40) + latent 6(f41-48) = 纯img3
         for index, image in enumerate(subjects):
             repeats = frame_multiplier + (1 if index == 0 else 0)
             start = cursor

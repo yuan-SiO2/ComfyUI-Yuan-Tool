@@ -373,15 +373,23 @@ def _find_marker_phrase_token_indices(
     stop_chars = set(",，。.!！?？;；:：\n\r|")
     indices = []
 
-    for marker in markers:
+    sorted_markers = sorted(set(m for m in markers if m), key=len, reverse=True)
+    covered_char_ranges = []
+
+    for marker in sorted_markers:
         marker_folded = marker.casefold()
+        marker_len = len(marker)
         start = 0
         while True:
             char_start = prompt_folded.find(marker_folded, start)
             if char_start < 0:
                 break
 
-            char_stop = char_start + len(marker)
+            if any(c_start <= char_start < c_end for c_start, c_end in covered_char_ranges):
+                start = char_start + marker_len
+                continue
+
+            char_stop = char_start + marker_len
             scan = char_stop
             while scan < len(prompt_text):
                 if stop_at_punctuation and prompt_text[scan] in stop_chars:
@@ -393,8 +401,10 @@ def _find_marker_phrase_token_indices(
                 scan += 1
 
             char_stop = max(char_stop, scan)
+            covered_char_ranges.append((char_start, char_stop))
+
             tok_start = _token_count(raw_tokenizer, prompt_text[:char_start])
-            marker_tok_end = _token_count(raw_tokenizer, prompt_text[:char_start + len(marker)])
+            marker_tok_end = _token_count(raw_tokenizer, prompt_text[:char_start + marker_len])
             phrase_tok_end = _token_count(raw_tokenizer, prompt_text[:char_stop])
             tok_end = max(marker_tok_end, phrase_tok_end)
             if phrase_extend_tokens > 0:
@@ -402,7 +412,7 @@ def _find_marker_phrase_token_indices(
             if tok_end <= tok_start:
                 tok_end = tok_start + 1
             indices.extend(range(tok_start, tok_end))
-            start = char_start + len(marker)
+            start = char_start + marker_len
 
     return sorted(set(i for i in indices if i >= 0))
 
@@ -541,21 +551,9 @@ def _build_slot_ref_indices_from_target_latent(
 
     ref_count = seq - target_count
     if ref_count <= 0 or ref_count % tokens_per_frame != 0:
-        log.warning(
-            "[Yuan CLIP Timeline/MSR] slot=%s ref_count=%d 不合法 (seq=%d, target_count=%d, tpf=%d, ref%%tpf=%d)",
-            slot, ref_count, seq, target_count, tokens_per_frame, ref_count % tokens_per_frame,
-        )
         return None
 
     ref_latent_frames = ref_count // tokens_per_frame
-
-    # 诊断：运行时参考latent帧数与msr_info中的不一致时，记录警告
-    if reference_latent_count > 0 and ref_latent_frames != reference_latent_count:
-        log.warning(
-            "[Yuan CLIP Timeline/MSR] slot=%s 运行时参考latent帧数(%d) != msr_info.reference_latent_count(%d)，"
-            "将使用frame_start/frame_end按比例重新映射（避免latent_start/latent_end截断导致主体缺失或污染）",
-            slot, ref_latent_frames, reference_latent_count,
-        )
 
     latent_indices = _map_subject_to_ref_latent_indices(
         subject,
@@ -572,10 +570,6 @@ def _build_slot_ref_indices_from_target_latent(
             ranges.append(torch.arange(start, stop, device=device, dtype=torch.long))
 
     if not ranges:
-        log.warning(
-            "[Yuan CLIP Timeline/MSR] slot=%s 无法构建ref索引 (ref_latent_frames=%d, latent_indices=%s, seq=%d, target_count=%d)",
-            slot, ref_latent_frames, latent_indices, seq, target_count,
-        )
         return None
     return torch.cat(ranges, dim=0) if len(ranges) > 1 else ranges[0]
 
@@ -812,6 +806,7 @@ def _parse_yuan_map_config(msr_info, config_str):
     background_role = None
 
     bg_keywords = ("背景", "场景", "bg", "background", "environment", "scene")
+    pic_num_pattern = re.compile(r'^@图\s*(\d+)$', re.IGNORECASE)
 
     lines = config_str.replace(",", "\n").split("\n")
     for line in lines:
@@ -835,14 +830,43 @@ def _parse_yuan_map_config(msr_info, config_str):
             subject_slots.append(str(item["slot"]))
 
     role_slots = {}
-    subject_idx = 0
+    used_slots = set()
+    numeric_roles = []
+    custom_roles = []
+
     for role_name in role_order:
         if role_name == background_role:
             continue
-        if subject_idx < len(subject_slots):
-            role_slots[subject_slots[subject_idx]] = role_name
-            subject_idx += 1
+        pic_match = pic_num_pattern.match(role_name)
+        if pic_match:
+            slot_num = pic_match.group(1)
+            numeric_roles.append((role_name, slot_num))
+        else:
+            custom_roles.append(role_name)
 
+    for role_name, slot_num in numeric_roles:
+        if slot_num in subject_slots and slot_num not in used_slots:
+            role_slots[slot_num] = role_name
+            used_slots.add(slot_num)
+            log.info("[Yuan CLIP Timeline/MSR] @图%s 按数字匹配到 slot=%s", slot_num, slot_num)
+        else:
+            log.warning("[Yuan CLIP Timeline/MSR] @图%s 对应的 slot=%s 不存在或已被占用，将尝试按顺序分配", slot_num, slot_num)
+            custom_roles.append(role_name)
+
+    subject_idx = 0
+    for role_name in custom_roles:
+        while subject_idx < len(subject_slots) and subject_slots[subject_idx] in used_slots:
+            subject_idx += 1
+        if subject_idx < len(subject_slots):
+            slot = subject_slots[subject_idx]
+            role_slots[slot] = role_name
+            used_slots.add(slot)
+            log.info("[Yuan CLIP Timeline/MSR] 自定义角色 %s 按顺序匹配到 slot=%s", role_name, slot)
+            subject_idx += 1
+        else:
+            log.warning("[Yuan CLIP Timeline/MSR] 自定义角色 %s 无可用 slot，绑定被跳过", role_name)
+
+    log.info("[Yuan CLIP Timeline/MSR] 角色-slot映射结果: %s", role_slots)
     return role_descriptions, role_slots, background_role
 
 
@@ -979,21 +1003,34 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
     raw_tokenizer = get_raw_tokenizer(clip)
 
     # 构建 @角色 标记规格
+    # exact_markers: 用于global区域搜索，必须是带@前缀或较长的标记，避免子串误匹配
+    # loose_markers: 用于local区域搜索，额外包含短别名（如"图X"），方便用户在段落中不带@引用
     marker_specs = {}
     for slot, role_name in role_slots.items():
         marker_name = role_name.lstrip("@")
-        markers = [role_name, marker_name]
+        exact_markers = [role_name]
+        loose_markers = [role_name, marker_name]
         m = re.match(r'图\s*(\d+)', marker_name)
         if m:
             num = m.group(1)
-            markers.extend([f"参考图{num}", f"pic{num}", f"图{num}"])
-        seen = set()
-        marker_specs[slot] = [m for m in markers if not (m in seen or seen.add(m))]
+            exact_markers.extend([f"参考图{num}", f"pic{num}"])
+            loose_markers.extend([f"参考图{num}", f"pic{num}", f"图{num}"])
+        seen_exact = set()
+        seen_loose = set()
+        marker_specs[slot] = {
+            "exact": [m for m in exact_markers if not (m in seen_exact or seen_exact.add(m))],
+            "loose": [m for m in loose_markers if not (m in seen_loose or seen_loose.add(m))],
+        }
     if background_role:
         bg_marker_name = background_role.lstrip("@")
-        markers = [background_role, bg_marker_name, "bg", "background", "背景", "场景"]
-        seen = set()
-        marker_specs["background"] = [m for m in markers if not (m in seen or seen.add(m))]
+        bg_exact = [background_role, "bg", "background"]
+        bg_loose = [background_role, bg_marker_name, "bg", "background", "背景", "场景"]
+        seen_exact = set()
+        seen_loose = set()
+        marker_specs["background"] = {
+            "exact": [m for m in bg_exact if not (m in seen_exact or seen_exact.add(m))],
+            "loose": [m for m in bg_loose if not (m in seen_loose or seen_loose.add(m))],
+        }
 
     full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
     global_token_count = token_ranges[0][0] if token_ranges else 0
@@ -1027,29 +1064,40 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
     # 注意：CLIP 的 token 上限不是硬性 77，而是运行时 context.shape[1]（编码后的实际 token 数），
     # 该值由 max_frames / text_input 段落数动态决定（如 385/5=77）。
     # 实际的有效性过滤在注意力块回调中执行：usable = [idx for idx in token_indices if idx <= max_context_index]
-    all_markers = [marker for markers in marker_specs.values() for marker in markers]
+    #
+    # all_markers 包含所有 looses 标记，用于 stop_markers 防止跨标记扩展
+    all_markers = []
+    for spec in marker_specs.values():
+        all_markers.extend(spec["loose"])
+    all_markers = list(set(all_markers))
+
     marker_token_indices = {}
-    for slot, markers in marker_specs.items():
-        if not markers:
+    for slot, spec in marker_specs.items():
+        exact_markers = spec["exact"]
+        loose_markers = spec["loose"]
+        if not exact_markers and not loose_markers:
             continue
 
-        # 1. 在 global prompt 中搜索标记（窄短语扩展=3，避免绑定到"@图1是描述"的长文字）
+        # 1. 在 global prompt 中搜索精确标记（phrase_extend_tokens=8，绑定更多描述token到视觉特征）
+        #    只使用 exact_markers（带@前缀或较长标记），避免短别名如"图X"在描述文本中子串误匹配
         global_indices = []
         if global_token_count > 0:
             global_indices = _find_marker_phrase_token_indices(
-                raw_tokenizer, full_prompt, markers,
+                raw_tokenizer, full_prompt, exact_markers,
                 stop_markers=all_markers,
-                phrase_extend_tokens=3,
+                phrase_extend_tokens=8,
             )
-            global_indices = [idx for idx in global_indices if 0 <= idx < global_token_count]
+            global_indices = sorted(set(idx for idx in global_indices if 0 <= idx < global_token_count))
 
-        # 2. 在 local prompt 中搜索标记（宽短语扩展=12，保持局部语义完整）
-        local_indices = _find_marker_phrase_token_indices(
-            raw_tokenizer, full_prompt, markers,
-            stop_markers=all_markers,
-            phrase_extend_tokens=12,
-        )
-        local_indices = [idx for idx in local_indices if idx >= global_token_count]
+        # 2. 在 local prompt 中搜索（宽松标记，phrase_extend_tokens=12，保持局部语义完整）
+        local_indices = []
+        if loose_markers:
+            local_indices = _find_marker_phrase_token_indices(
+                raw_tokenizer, full_prompt, loose_markers,
+                stop_markers=all_markers,
+                phrase_extend_tokens=12,
+            )
+            local_indices = sorted(set(idx for idx in local_indices if idx >= global_token_count))
 
         # 3. 全局标记优先：global prompt 中的标记不在 q_token_idx 段中，
         #    不受 Prompt Relay 时间惩罚，提供跨段持续的全局主体绑定。
@@ -1058,19 +1106,22 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
         if global_indices:
             marker_token_indices[slot] = global_indices
             log.info(
-                "[Yuan CLIP Timeline/MSR] slot=%s 使用全局标记绑定 (%d tokens, 无时间惩罚, 全帧可见)",
-                slot, len(global_indices),
+                "[Yuan CLIP Timeline/MSR] slot=%s 使用全局标记绑定 (%d tokens, 无时间惩罚, 全帧可见), "
+                "exact=%s",
+                slot, len(global_indices), exact_markers,
             )
         elif local_indices:
             marker_token_indices[slot] = local_indices
             log.info(
-                "[Yuan CLIP Timeline/MSR] slot=%s 使用局部标记绑定 (%d tokens, 受时间惩罚, 仅对应段可见)",
-                slot, len(local_indices),
+                "[Yuan CLIP Timeline/MSR] slot=%s 使用局部标记绑定 (%d tokens, 受时间惩罚, 仅对应段可见), "
+                "loose=%s",
+                slot, len(local_indices), loose_markers,
             )
         else:
-            log.warning("[Yuan CLIP Timeline/MSR] slot=%s 未找到任何标记 token，该主体无法绑定", slot)
+            log.warning("[Yuan CLIP Timeline/MSR] slot=%s 未找到任何标记 token (exact=%s, loose=%s)，该主体无法绑定",
+                        slot, exact_markers, loose_markers)
 
-    log.info("[Yuan CLIP Timeline/MSR] 标记绑定: %s", {k: len(v) for k, v in marker_token_indices.items()})
+    log.info("[Yuan CLIP Timeline/MSR] 标记绑定汇总: %s", {k: len(v) for k, v in marker_token_indices.items()})
 
     if msr_info:
         subjects = msr_info.get("subjects") or []
@@ -1137,7 +1188,7 @@ class YuanCLIPTimeline:
                 "audio_vae": ("VAE", {"tooltip": "Audio VAE，用于生成音频潜空间。video latent 与 audio latent 使用相同的帧数/帧率，保证对齐。"}),
                 "global_prompt": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "贯穿整个视频的全局提示词。用于锚定持久的角色、物体和场景上下文。\n连接 msr_info 时，在此用 @图1=描述、@图2=描述、@背景=描述 定义角色，每行一条，按顺序对应 msr_info 的 subjects。"
+                    "tooltip": "贯穿整个视频的全局提示词。用于锚定持久的角色、物体和场景上下文。\n连接 msr_info 时，在此用 @图1=描述、@图2=描述、@背景=描述 定义角色，每行一条。\n@图X 格式会按数字X自动匹配第X张参考图像（不依赖书写顺序）；也支持自定义名称（如@张三=描述），自定义名称按书写顺序依次匹配未占用的参考图像。"
                 }),
                 "max_frames": ("INT", {
                     "default": 129, "min": 1, "max": 10000, "step": 1,
