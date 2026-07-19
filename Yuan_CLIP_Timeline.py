@@ -34,7 +34,10 @@ def build_temporal_cost(q_token_idx, Lq, Lk, device, dtype, tokens_per_frame):
         local = seg["local_token_idx"].to(device=device)
         d = (query_frames.float()[:, None] - seg["midpoint"]).abs()
         strength = seg.get("strength", 1.0)
-        cost = strength * (torch.relu(d - seg["window"]) ** 2) / (2 * seg["sigma"] ** 2)
+        if seg.get("suppress"):
+            cost = strength * torch.exp(-(d**2) / (2 * seg["sigma"]**2))
+        else:
+            cost = strength * (torch.relu(d - seg["window"]) ** 2) / (2 * seg["sigma"] ** 2)
         offset[:, local] = cost.to(offset.dtype)
 
     return offset
@@ -49,9 +52,12 @@ def build_temporal_cost_scaled(q_token_idx, Lq, Lk, device, dtype, latent_frames
         local = seg["local_token_idx"].to(device=device)
         d = (query_frames[:, None] - seg["midpoint"]).abs()
         sigma_a = seg.get("sigma_audio", seg["sigma"])
-        window_a = seg.get("window_audio", seg["window"])
         strength_a = seg.get("strength_audio", 1.0)
-        cost = strength_a * (torch.relu(d - window_a) ** 2) / (2 * sigma_a ** 2)
+        if seg.get("suppress"):
+            cost = strength_a * torch.exp(-(d**2) / (2 * sigma_a**2))
+        else:
+            window_a = seg.get("window_audio", seg["window"])
+            cost = strength_a * (torch.relu(d - window_a) ** 2) / (2 * sigma_a ** 2)
         offset[:, local] = cost.to(offset.dtype)
 
     return offset
@@ -96,29 +102,107 @@ def create_mask_fn(q_token_idx, fallback_tokens_per_frame, latent_frames):
     return mask_fn
 
 
-def build_segments(token_ranges, segment_lengths, epsilon=1e-3):
-    """为时间惩罚构建每段元数据。"""
+def build_segments(token_ranges, segment_lengths, epsilon=1e-3, marker_token_ranges=None, segment_global_suppressions=None):
+    """为时间惩罚构建每段元数据。
+
+    marker_token_ranges: 所有 @主体在 full_prompt 中的 token 范围列表 [(tok_start, tok_end), ...]。
+        如果提供，段内每个 @主体 marker 会获得独立 midpoint（基于该 marker 在段内的相对位置），
+        段内非 marker 文本仍用段的整体 midpoint。这样段内多个 @主体不会共享同一时间中心。
+    segment_global_suppressions: 每段需抑制的 global marker token 索引列表 [tensor, ...]。
+        长度与 segment_lengths 相同。对于某段没出现的 @主体，其 global marker 被抑制，
+        防止镜头切换时不该出现的主体视觉特征泄露到当前段。
+        抑制使用 suppress 模式：Gaussian 中心惩罚 exp(-d²/2σ²)，段中心最强。
+    """
     sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
 
     q_token_idx = []
     frame_cursor = 0
 
-    for (tok_start, tok_end), L in zip(token_ranges, segment_lengths):
+    for seg_idx, ((tok_start, tok_end), L) in enumerate(zip(token_ranges, segment_lengths)):
         if L <= 0:
             frame_cursor += L
             continue
-        midpoint = (2 * frame_cursor + L) // 2
+        seg_midpoint = (2 * frame_cursor + L) // 2
         base_window = max(L // 2 - 2, 0)
-        q_token_idx.append({
-            "local_token_idx": torch.arange(tok_start, tok_end),
-            "midpoint": midpoint,
-            "window": max(base_window, 0.0),
-            "sigma": sigma,
-            "strength": 1.0,
-            "window_audio": max(base_window, 0.0),
-            "sigma_audio": sigma,
-            "strength_audio": 1.0,
-        })
+
+        # 收集段内的 marker token 范围
+        seg_markers = []
+        if marker_token_ranges:
+            for m_start, m_end in marker_token_ranges:
+                # marker 与段有交集
+                overlap_lo = max(m_start, tok_start)
+                overlap_hi = min(m_end, tok_end)
+                if overlap_lo < overlap_hi:
+                    seg_markers.append((overlap_lo, overlap_hi))
+
+        if seg_markers:
+            # 段内有 marker：为每个 marker 构建独立子段，非 marker 文本用段的整体 midpoint
+            seg_markers.sort(key=lambda r: r[0])
+            marker_tokens = set()
+            seg_len = max(1, tok_end - tok_start)
+
+            for m_start, m_end in seg_markers:
+                # marker 在段内的相对位置 → 独立 midpoint
+                m_center = (m_start + m_end) / 2.0
+                rel_pos = (m_center - tok_start) / seg_len
+                m_midpoint = frame_cursor + rel_pos * L
+                # marker 子段窗口：较小，让时间惩罚更聚焦
+                m_window = max(L // 4 - 1, 0)
+                q_token_idx.append({
+                    "local_token_idx": torch.arange(m_start, m_end),
+                    "midpoint": m_midpoint,
+                    "window": float(m_window),
+                    "sigma": sigma,
+                    "strength": 1.0,
+                    "window_audio": float(m_window),
+                    "sigma_audio": sigma,
+                    "strength_audio": 1.0,
+                })
+                for t in range(m_start, m_end):
+                    marker_tokens.add(t)
+
+            # 非 marker token 用段的整体 midpoint
+            non_marker_tokens = [t for t in range(tok_start, tok_end) if t not in marker_tokens]
+            if non_marker_tokens:
+                q_token_idx.append({
+                    "local_token_idx": torch.tensor(non_marker_tokens, dtype=torch.long),
+                    "midpoint": seg_midpoint,
+                    "window": float(max(base_window, 0)),
+                    "sigma": sigma,
+                    "strength": 1.0,
+                    "window_audio": float(max(base_window, 0)),
+                    "sigma_audio": sigma,
+                    "strength_audio": 1.0,
+                })
+        else:
+            # 段内无 marker：保持原有行为，所有 token 共享段 midpoint
+            q_token_idx.append({
+                "local_token_idx": torch.arange(tok_start, tok_end),
+                "midpoint": seg_midpoint,
+                "window": float(max(base_window, 0)),
+                "sigma": sigma,
+                "strength": 1.0,
+                "window_audio": float(max(base_window, 0)),
+                "sigma_audio": sigma,
+                "strength_audio": 1.0,
+            })
+
+        # 抑制当前段未出现的 global marker（防止镜头切换时串扰）
+        if segment_global_suppressions and seg_idx < len(segment_global_suppressions):
+            supp = segment_global_suppressions[seg_idx]
+            if supp is not None and len(supp) > 0:
+                if isinstance(supp, list):
+                    supp = torch.tensor(supp, dtype=torch.long)
+                q_token_idx.append({
+                    "local_token_idx": supp,
+                    "midpoint": seg_midpoint,
+                    "sigma": sigma,
+                    "strength": 1.0,
+                    "suppress": True,
+                    "sigma_audio": sigma,
+                    "strength_audio": 1.0,
+                })
+
         frame_cursor += L
 
     return q_token_idx
@@ -365,13 +449,40 @@ def _find_marker_phrase_token_indices(
     stop_at_punctuation=True,
     stop_at_other_marker=True,
 ):
+    """返回 marker token 索引列表（离散）。保留向后兼容。"""
+    ranges = _find_marker_phrase_token_ranges(
+        raw_tokenizer, prompt_text, markers,
+        stop_markers=stop_markers,
+        phrase_extend_tokens=phrase_extend_tokens,
+        stop_at_punctuation=stop_at_punctuation,
+        stop_at_other_marker=stop_at_other_marker,
+    )
+    indices = []
+    for tok_start, tok_end in ranges:
+        indices.extend(range(tok_start, tok_end))
+    return sorted(set(i for i in indices if i >= 0))
+
+
+def _find_marker_phrase_token_ranges(
+    raw_tokenizer,
+    prompt_text,
+    markers,
+    stop_markers=None,
+    phrase_extend_tokens=12,
+    stop_at_punctuation=True,
+    stop_at_other_marker=True,
+):
+    """返回 marker token 范围列表 [(tok_start, tok_end), ...]，每个 marker 匹配一个连续范围。
+
+    用于 build_segments 为段内每个 @主体构建独立时间窗口。
+    """
     if raw_tokenizer is None or not prompt_text:
         return []
 
     all_markers = [m for m in (stop_markers or markers) if m]
     prompt_folded = prompt_text.casefold()
     stop_chars = set(",，。.!！?？;；:：\n\r|")
-    indices = []
+    ranges = []
 
     sorted_markers = sorted(set(m for m in markers if m), key=len, reverse=True)
     covered_char_ranges = []
@@ -411,10 +522,10 @@ def _find_marker_phrase_token_indices(
                 tok_end = min(tok_end, tok_start + int(phrase_extend_tokens))
             if tok_end <= tok_start:
                 tok_end = tok_start + 1
-            indices.extend(range(tok_start, tok_end))
+            ranges.append((tok_start, tok_end))
             start = char_start + marker_len
 
-    return sorted(set(i for i in indices if i >= 0))
+    return sorted(ranges, key=lambda r: r[0])
 
 
 def _map_subject_to_ref_latent_indices(
@@ -707,12 +818,6 @@ def _make_ltx_marker_relay_wrapper(
                         max_ref_frames=max_ref_frames,
                     )
                     if ref_indices is None or ref_indices.numel() == 0:
-                        if slot not in _slots_missing_logged:
-                            _slots_missing_logged.add(slot)
-                            log.warning(
-                                "[Yuan CLIP Timeline/MSR] block=%d slot=%s 无法获取参考帧索引，该主体绑定被跳过",
-                                block_idx, slot,
-                            )
                         continue
 
                     ref_summary = x[:, ref_indices, :].mean(dim=1)
@@ -1057,20 +1162,30 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
         latent_frames, tokens_per_frame, effective_lengths,
     )
 
-    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon)
-    relay_mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
-
-    # 查找标记 token 索引
-    # 注意：CLIP 的 token 上限不是硬性 77，而是运行时 context.shape[1]（编码后的实际 token 数），
-    # 该值由 max_frames / text_input 段落数动态决定（如 385/5=77）。
-    # 实际的有效性过滤在注意力块回调中执行：usable = [idx for idx in token_indices if idx <= max_context_index]
-    #
-    # all_markers 包含所有 looses 标记，用于 stop_markers 防止跨标记扩展
+    # all_markers 包含所有 loose 标记，用于 stop_markers 防止跨标记扩展
     all_markers = []
     for spec in marker_specs.values():
         all_markers.extend(spec["loose"])
     all_markers = list(set(all_markers))
 
+    # 收集 local 段内的 @主体 marker token 范围，用于 build_segments 为段内每个 @主体构建独立时间窗口
+    local_marker_ranges = []
+    if global_token_count < total_prompt_tokens:
+        all_loose = []
+        for spec in marker_specs.values():
+            all_loose.extend(spec["loose"])
+        all_loose = sorted(set(all_loose), key=len, reverse=True)
+        if all_loose:
+            all_ranges = _find_marker_phrase_token_ranges(
+                raw_tokenizer, full_prompt, all_loose,
+                stop_markers=all_markers,
+                phrase_extend_tokens=12,
+            )
+            local_marker_ranges = [
+                (s, e) for s, e in all_ranges if e > global_token_count
+            ]
+
+    # 计算 marker_token_indices（在 build_segments 之前，因为需要知道每个 slot 的 global token 索引）
     marker_token_indices = {}
     for slot, spec in marker_specs.items():
         exact_markers = spec["exact"]
@@ -1078,8 +1193,6 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
         if not exact_markers and not loose_markers:
             continue
 
-        # 1. 在 global prompt 中搜索精确标记（phrase_extend_tokens=8，绑定更多描述token到视觉特征）
-        #    只使用 exact_markers（带@前缀或较长标记），避免短别名如"图X"在描述文本中子串误匹配
         global_indices = []
         if global_token_count > 0:
             global_indices = _find_marker_phrase_token_indices(
@@ -1089,7 +1202,6 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
             )
             global_indices = sorted(set(idx for idx in global_indices if 0 <= idx < global_token_count))
 
-        # 2. 在 local prompt 中搜索（宽松标记，phrase_extend_tokens=12，保持局部语义完整）
         local_indices = []
         if loose_markers:
             local_indices = _find_marker_phrase_token_indices(
@@ -1099,10 +1211,6 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
             )
             local_indices = sorted(set(idx for idx in local_indices if idx >= global_token_count))
 
-        # 3. 全局标记优先：global prompt 中的标记不在 q_token_idx 段中，
-        #    不受 Prompt Relay 时间惩罚，提供跨段持续的全局主体绑定。
-        #    标记 token 是否在 context 有效范围内，由运行时注意力块回调根据
-        #    context.shape[1] 动态过滤（max_context_index），无需在此预过滤。
         if global_indices:
             marker_token_indices[slot] = global_indices
             log.info(
@@ -1120,6 +1228,41 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
         else:
             log.warning("[Yuan CLIP Timeline/MSR] slot=%s 未找到任何标记 token (exact=%s, loose=%s)，该主体无法绑定",
                         slot, exact_markers, loose_markers)
+
+    # 构建每段需抑制的 global marker token 索引
+    # 对于某段没出现的 @主体，其 global marker 被抑制，防止镜头切换时不该出现的主体特征泄露
+    segment_global_suppressions = []
+    for seg_idx, local_text in enumerate(locals_list):
+        local_folded = local_text.casefold()
+        # 找到该段出现的 slot
+        appeared_slots = set()
+        for slot, spec in marker_specs.items():
+            if slot == "background":
+                continue  # 背景全段可见，不抑制
+            # 用该 slot 的 exact + loose 标记检查是否出现在段文本中
+            for marker in spec["exact"] + spec["loose"]:
+                if marker.casefold() in local_folded:
+                    appeared_slots.add(slot)
+                    break
+        # 该段需抑制的 global token indices = 所有 slot 的 global indices - 出现在该段的 slot
+        suppressed_indices = []
+        for slot, indices in marker_token_indices.items():
+            if slot == "background":
+                continue
+            if slot not in appeared_slots and indices:
+                suppressed_indices.extend(indices)
+        if suppressed_indices:
+            suppressed_indices = sorted(set(suppressed_indices))
+            segment_global_suppressions.append(suppressed_indices)
+        else:
+            segment_global_suppressions.append(None)
+
+    q_token_idx = build_segments(
+        token_ranges, effective_lengths, epsilon,
+        marker_token_ranges=local_marker_ranges,
+        segment_global_suppressions=segment_global_suppressions,
+    )
+    relay_mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
 
     log.info("[Yuan CLIP Timeline/MSR] 标记绑定汇总: %s", {k: len(v) for k, v in marker_token_indices.items()})
 
