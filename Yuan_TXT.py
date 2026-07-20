@@ -12,9 +12,6 @@ class AnyType(str):
 
 class YUAN_TXTAppearanceOrder:
 
-    def __init__(self):
-        pass
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -76,9 +73,6 @@ class YUAN_TXTAppearanceOrder:
 # ==============================================================================
 
 class YUAN_TXTConvertAny:
-    def __init__(self):
-        pass
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -120,9 +114,6 @@ class YUAN_TXTConvertAny:
 # ==============================================================================
 
 class YUAN_TXTListNumber:
-    def __init__(self):
-        pass
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -194,9 +185,6 @@ class YUAN_TXTListNumber:
 
 class YUAN_TXTReplace:
 
-    def __init__(self):
-        pass
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -246,9 +234,6 @@ class YUAN_TXTReplace:
 # ==============================================================================
 
 class YUAN_TXTParagraphSplitter:
-    def __init__(self):
-        pass
-
     @classmethod
     def INPUT_TYPES(cls):
         return {

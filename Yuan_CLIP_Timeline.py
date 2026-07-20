@@ -91,10 +91,6 @@ def create_mask_fn(q_token_idx, fallback_tokens_per_frame, latent_frames):
                 cost = build_temporal_cost(q_token_idx, Lq, Lk, device, dtype, video_tpf)
             else:
                 cost = build_temporal_cost_scaled(q_token_idx, Lq, Lk, device, dtype, latent_frames)
-            log.info(
-                "[Yuan CLIP Timeline] 构建惩罚矩阵 (%s): Lq=%d, Lk=%d, 非零=%d/%d",
-                mode, Lq, Lk, (cost > 0).sum().item(), cost.numel(),
-            )
             cache[key] = -cost
 
         return cache[key].to(dtype)
@@ -372,6 +368,15 @@ def apply_patches(model_clone, mask_fn, pointer_config=None):
         to["licon_msr_v3_marker_token_indices"] = pointer_config["marker_token_indices"]
 
     for idx, block in enumerate(diffusion_model.transformer_blocks):
+        # 包装 attn1：参考 latent token boost（仅在 pointer_config 存在时）
+        if pointer_config is not None:
+            attn1 = getattr(block, "attn1", None)
+            if attn1 is not None:
+                key = f"diffusion_model.transformer_blocks.{idx}.attn1.forward"
+                underlying = model_clone.get_model_object(key)
+                wrapper = _make_ltx_latent_booster_wrapper(underlying, pointer_config, idx)
+                model_clone.add_object_patch(key, types.MethodType(wrapper, attn1))
+
         for attr in ("attn2", "audio_attn2"):
             module = getattr(block, attr, None)
             if module is None:
@@ -445,7 +450,7 @@ def _find_marker_phrase_token_indices(
     prompt_text,
     markers,
     stop_markers=None,
-    phrase_extend_tokens=12,
+    phrase_extend_tokens=0,
     stop_at_punctuation=True,
     stop_at_other_marker=True,
 ):
@@ -468,7 +473,7 @@ def _find_marker_phrase_token_ranges(
     prompt_text,
     markers,
     stop_markers=None,
-    phrase_extend_tokens=12,
+    phrase_extend_tokens=0,
     stop_at_punctuation=True,
     stop_at_other_marker=True,
 ):
@@ -481,7 +486,10 @@ def _find_marker_phrase_token_ranges(
 
     all_markers = [m for m in (stop_markers or markers) if m]
     prompt_folded = prompt_text.casefold()
-    stop_chars = set(",，。.!！?？;；:：\n\r|")
+    # 仅在逗号或句号（中英文）处停止扫描
+    # 设计理由：用户要求 @ 绑定范围由标点控制，而非固定 token 数量
+    # 逗号/句号代表一个完整描述项的结束，其他标点（如！？;：）不停止扫描
+    stop_chars = set(",，.。")
     ranges = []
 
     sorted_markers = sorted(set(m for m in markers if m), key=len, reverse=True)
@@ -611,6 +619,21 @@ def _parse_block_filter(text, n_blocks):
             except Exception:
                 continue
     return frozenset(out) if out else None
+
+
+def _target_count_from_latent_shape(target_latent_shape, spatial_patch_size=1, temporal_patch_size=1):
+    """从 latent_shape (B, C, T, H, W) 计算目标 token 数和每帧 token 数。
+    返回 (target_count, tokens_per_frame)，失败返回 (None, None)。
+    """
+    if target_latent_shape is None:
+        return None, None
+    _, _, target_frames, h_lat, w_lat = target_latent_shape
+    tokens_per_frame = (
+        max(1, h_lat // max(1, spatial_patch_size))
+        * max(1, w_lat // max(1, spatial_patch_size))
+    )
+    target_count = max(1, target_frames // max(1, temporal_patch_size)) * tokens_per_frame
+    return int(target_count), int(tokens_per_frame)
 
 
 def _build_slot_ref_indices_from_target_latent(
@@ -790,6 +813,7 @@ def _make_ltx_marker_relay_wrapper(
             if positive_mask is not None:
                 positive_rows = torch.where(positive_mask)[0]
 
+            # === K/V 标记注入：把每个 slot 的参考 latent 特征注入到对应 @图X 文本 token 上 ===
             if pointer_blocks is None or block_idx in pointer_blocks:
                 max_context_index = context.shape[1] - 1
                 _slots_missing_logged = set()
@@ -830,25 +854,53 @@ def _make_ltx_marker_relay_wrapper(
                         ref_k = F.normalize(ref_k, dim=-1) * marker_norm.clamp_min(1e-6)
                         ref_v = F.normalize(ref_v, dim=-1) * marker_norm.to(dtype=ref_v.dtype, device=ref_v.device).clamp_min(1e-6)
 
+                    # 统一 binding_strength：global 和 local 用相同强度
+                    # 设计理由：
+                    #   - 用户要求"@ 完全注入"，不应区分 global/local 强度
+                    #   - 段内平衡已通过"每段每主体只保留第一次出现"实现，
+                    #     不再需要通过降低 local 强度来避免 softmax 失衡
+                    #   - global token 全帧可见（无时间惩罚），local token 段内可见（有时间惩罚）
+                    #     可见性由 relay_mask 控制，与 binding_strength 无关
+                    per_token_strength_k = torch.full(
+                        (len(usable),), float(binding_strength),
+                        device=k.device, dtype=k.dtype,
+                    )
+                    per_token_strength_v = torch.full(
+                        (len(usable),), float(binding_strength),
+                        device=v.device, dtype=v.dtype,
+                    )
+
+                    # per-token 扩展到 K/V 维度 [num_markers]
+                    # 注：ref_k/ref_v 形状为 [B, num_markers, C]，per_token_strength 仅在 num_markers 维度广播
+                    per_token_strength_k = per_token_strength_k.view(-1)
+                    per_token_strength_v = per_token_strength_v.view(-1)
+
                     if positive_rows is not None:
                         if positive_rows.numel() == 0:
                             continue
+                        # ref_k[positive_rows] 形状 [num_positive, num_markers, C]
+                        # per_token_strength_k 形状 [num_markers]，需 view(1, -1, 1) 广播
+                        strength_k_pos = per_token_strength_k.view(1, -1, 1)
+                        strength_v_pos = per_token_strength_v.view(1, -1, 1)
                         k[positive_rows[:, None], marker_tensor[None, :], :] = (
                             k[positive_rows[:, None], marker_tensor[None, :], :] * float(preserve_text_strength)
-                            + ref_k[positive_rows] * float(binding_strength)
+                            + ref_k[positive_rows] * strength_k_pos
                         )
                         v[positive_rows[:, None], marker_tensor[None, :], :] = (
                             v[positive_rows[:, None], marker_tensor[None, :], :] * float(preserve_text_strength)
-                            + ref_v[positive_rows] * float(binding_strength)
+                            + ref_v[positive_rows] * strength_v_pos
                         )
                     else:
+                        # ref_k 形状 [B, num_markers, C]
+                        strength_k_full = per_token_strength_k.view(1, -1, 1)
+                        strength_v_full = per_token_strength_v.view(1, -1, 1)
                         k[:, marker_tensor, :] = (
                             k[:, marker_tensor, :] * float(preserve_text_strength)
-                            + ref_k * float(binding_strength)
+                            + ref_k * strength_k_full
                         )
                         v[:, marker_tensor, :] = (
                             v[:, marker_tensor, :] * float(preserve_text_strength)
-                            + ref_v * float(binding_strength)
+                            + ref_v * strength_v_full
                         )
 
         q = _self.q_norm(q)
@@ -905,15 +957,111 @@ def _make_ltx_marker_relay_wrapper(
     return wrapped
 
 
+def _make_ltx_latent_booster_wrapper(underlying, pointer_config, block_idx):
+    """attn1 wrapper：在执行自注意力前，直接缩放参考 latent token 的值。
+
+    参考 licon-MSR-V3 的 LTXMSRReferenceTokenBooster 机制：
+    - 仅收集 background 的参考 latent token 索引（不收集 subjects）
+    - x[:, ref_indices, :] *= (1.0 + boost_strength)
+    - 让目标 token 通过正常自注意力自然获取背景特征
+
+    设计理由：
+    - attn1 是自注意力，所有 target token 与同一组 ref token 交互，无法按段区分
+    - 若 boost 所有 subjects 的 ref latent，会导致跨段污染（@图3 的视觉特征
+      在段1/段3也被 boost，污染 @图4 等其他主体）
+    - subjects 的视觉特征完全由 attn2 (marker_relay) + relay_mask 控制，
+      attn2 有时间惩罚机制能正确区分段
+    - background 全帧可见，attn1 boost background 不会跨段污染
+    - 符合约束：仅 K boost（0.2强度），无 V 注入，无 softmax 归一化
+    """
+    def wrapped(_self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
+        boost_strength = float(pointer_config.get("latent_boost_strength", 0.2))
+
+        # 仅在正向批次、指定 block、boost>0 时执行
+        if (
+            boost_strength > 0.0
+            and not _is_negative_only_call(transformer_options)
+        ):
+            pointer_blocks = pointer_config.get("pointer_blocks")
+            if pointer_blocks is None or block_idx in pointer_blocks:
+                msr_info = pointer_config["msr_info"]
+                latent_shape = pointer_config["latent_shape"]
+                spatial_patch_size = pointer_config["spatial_patch_size"]
+                temporal_patch_size = pointer_config["temporal_patch_size"]
+
+                target_count, tokens_per_frame = _target_count_from_latent_shape(
+                    latent_shape, spatial_patch_size, temporal_patch_size
+                )
+
+                if (
+                    target_count is not None
+                    and 0 < target_count < x.shape[1]
+                    and tokens_per_frame > 0
+                ):
+                    ref_count = x.shape[1] - target_count
+                    if ref_count > 0 and ref_count % tokens_per_frame == 0:
+                        ref_latent_frames = ref_count // tokens_per_frame
+
+                        # 仅收集 background 的 ref latent 索引（不收集 subjects）
+                        # subjects 的视觉特征由 attn2 (marker_relay) + relay_mask 控制，
+                        # attn1 全帧 boost subjects 会导致跨段污染
+                        # 复用 _build_slot_ref_indices_from_target_latent 避免索引计算重复
+                        all_ref_indices = []
+                        if pointer_config.get("include_background", True):
+                            ref_indices = _build_slot_ref_indices_from_target_latent(
+                                msr_info,
+                                "background",
+                                seq=x.shape[1],
+                                device=x.device,
+                                target_latent_shape=latent_shape,
+                                spatial_patch_size=spatial_patch_size,
+                                temporal_patch_size=temporal_patch_size,
+                                max_ref_frames=pointer_config.get("max_ref_frames", 2),
+                            )
+                            if ref_indices is not None and ref_indices.numel() > 0:
+                                all_ref_indices = ref_indices.tolist()
+
+                        if all_ref_indices:
+                            ref_tensor = torch.as_tensor(
+                                sorted(set(all_ref_indices)),
+                                device=x.device, dtype=torch.long,
+                            )
+                            positive_mask = _positive_batch_mask(
+                                transformer_options, x.shape[0], x.device
+                            )
+                            x = x.clone()
+                            # 构建 per-batch boost factor：正向批次应用 boost，负向批次不变。
+                            # 相比 V3 的全批次统一 boost，此处适配本项目更高的
+                            # boost_strength(0.2 vs V3 默认 0.05)，避免削弱 CFG 区分度。
+                            # 显式赋值而非 *=，避免混合布尔+整数高级索引的原地修改歧义。
+                            if positive_mask is not None:
+                                factor = torch.ones(
+                                    x.shape[0], 1, 1, device=x.device, dtype=x.dtype,
+                                )
+                                factor[positive_mask] = 1.0 + boost_strength
+                                x[:, ref_tensor, :] = x[:, ref_tensor, :] * factor
+                            else:
+                                x[:, ref_tensor, :] = x[:, ref_tensor, :] * (1.0 + boost_strength)
+
+        return underlying(
+            x, context=context, mask=mask, pe=pe, k_pe=k_pe,
+            transformer_options=transformer_options,
+        )
+
+    return wrapped
+
+
 def _parse_yuan_map_config(msr_info, config_str):
     role_order = []
     role_descriptions = {}
     background_role = None
+    other_lines = []
 
     bg_keywords = ("背景", "场景", "bg", "background", "environment", "scene")
     pic_num_pattern = re.compile(r'^@图\s*(\d+)$', re.IGNORECASE)
 
-    lines = config_str.replace(",", "\n").split("\n")
+    # 按角色边界分割：逗号+@ 或换行，不破坏描述内的逗号
+    lines = re.split(r'[，,]\s*(?=@)|\n', config_str)
     for line in lines:
         line = line.strip()
         if not line:
@@ -927,6 +1075,8 @@ def _parse_yuan_map_config(msr_info, config_str):
             role_lower = role_name.lower()
             if any(kw in role_lower for kw in [kw.lower() for kw in bg_keywords]):
                 background_role = role_name
+        else:
+            other_lines.append(line)
 
     subjects = msr_info.get("subjects") or []
     subject_slots = []
@@ -972,7 +1122,7 @@ def _parse_yuan_map_config(msr_info, config_str):
             log.warning("[Yuan CLIP Timeline/MSR] 自定义角色 %s 无可用 slot，绑定被跳过", role_name)
 
     log.info("[Yuan CLIP Timeline/MSR] 角色-slot映射结果: %s", role_slots)
-    return role_descriptions, role_slots, background_role
+    return role_descriptions, role_slots, background_role, other_lines
 
 
 def _split_local_prompts(local_prompts):
@@ -1082,7 +1232,7 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
     if not isinstance(msr_info, dict):
         raise ValueError("Yuan CLIP Timeline: msr_info must be a dict")
 
-    role_descriptions, role_slots, background_role = _parse_yuan_map_config(msr_info, global_prompt)
+    role_descriptions, role_slots, background_role, other_lines = _parse_yuan_map_config(msr_info, global_prompt)
     if not role_descriptions and not background_role:
         raise ValueError("Yuan CLIP Timeline: global_prompt 中未找到有效的 @角色 定义")
 
@@ -1093,6 +1243,10 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
     for role_name, desc in role_descriptions.items():
         global_prompt_parts.append(f"{role_name}是{desc}")
     global_prompt = "。".join(global_prompt_parts) + ("。" if global_prompt_parts else "")
+
+    # 追加非角色行（风格、环境音效等描述）
+    if other_lines:
+        global_prompt += "。" + "。".join(other_lines)
 
     locals_list = _split_local_prompts(local_prompts.strip())
     if not locals_list:
@@ -1137,6 +1291,33 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
             "loose": [m for m in bg_loose if not (m in seen_loose or seen_loose.add(m))],
         }
 
+    # 补充 msr_info.subjects 中存在、但 global_prompt 未定义 @图X=描述 的 slot
+    # 这些 slot 仍可能在 local_prompts 中以 @图X 形式出现，需要为其构建 marker_specs
+    # 否则 local 中的 @图3 等标记无法被识别，导致该主体视觉特征完全不注入
+    subjects_in_msr = msr_info.get("subjects") or []
+    for item in subjects_in_msr:
+        if not isinstance(item, dict):
+            continue
+        slot = str(item.get("slot", ""))
+        if not slot or slot in marker_specs:
+            continue
+        # 用户未在 global_prompt 中定义此 slot，用默认名称 @图{slot} 构建
+        default_role = f"@图{slot}"
+        default_name = default_role.lstrip("@")
+        default_exact = [default_role, f"参考图{slot}", f"pic{slot}"]
+        default_loose = [default_role, default_name, f"参考图{slot}", f"pic{slot}", f"图{slot}"]
+        seen_exact = set()
+        seen_loose = set()
+        marker_specs[slot] = {
+            "exact": [m for m in default_exact if not (m in seen_exact or seen_exact.add(m))],
+            "loose": [m for m in default_loose if not (m in seen_loose or seen_loose.add(m))],
+        }
+        log.info(
+            "[Yuan CLIP Timeline/MSR] slot=%s 未在 global_prompt 中定义，使用默认标记 %s "
+            "（仅 local 绑定，受时间惩罚）",
+            slot, default_role,
+        )
+
     full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
     global_token_count = token_ranges[0][0] if token_ranges else 0
     total_prompt_tokens = token_ranges[-1][1] if token_ranges else 0
@@ -1162,31 +1343,32 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
         latent_frames, tokens_per_frame, effective_lengths,
     )
 
-    # all_markers 包含所有 loose 标记，用于 stop_markers 防止跨标记扩展
+    # all_markers: 所有 loose 标记的合并去重列表
+    # 用途1: stop_markers 防止跨标记扩展
+    # 用途2: 扫描 local 段内 marker token 范围（用于 build_segments 段内独立 midpoint）
     all_markers = []
     for spec in marker_specs.values():
         all_markers.extend(spec["loose"])
-    all_markers = list(set(all_markers))
+    all_markers = sorted(set(all_markers), key=len, reverse=True)
 
     # 收集 local 段内的 @主体 marker token 范围，用于 build_segments 为段内每个 @主体构建独立时间窗口
     local_marker_ranges = []
-    if global_token_count < total_prompt_tokens:
-        all_loose = []
-        for spec in marker_specs.values():
-            all_loose.extend(spec["loose"])
-        all_loose = sorted(set(all_loose), key=len, reverse=True)
-        if all_loose:
-            all_ranges = _find_marker_phrase_token_ranges(
-                raw_tokenizer, full_prompt, all_loose,
-                stop_markers=all_markers,
-                phrase_extend_tokens=12,
-            )
-            local_marker_ranges = [
-                (s, e) for s, e in all_ranges if e > global_token_count
-            ]
+    if global_token_count < total_prompt_tokens and all_markers:
+        all_ranges = _find_marker_phrase_token_ranges(
+            raw_tokenizer, full_prompt, all_markers,
+            stop_markers=all_markers,
+            phrase_extend_tokens=0,  # 不限制 token 数量，由逗号/句号标点控制停止
+            stop_at_punctuation=True,
+        )
+        local_marker_ranges = [
+            (s, e) for s, e in all_ranges if e > global_token_count
+        ]
 
     # 计算 marker_token_indices（在 build_segments 之前，因为需要知道每个 slot 的 global token 索引）
+    # marker_token_indices: global + local 合并，用于 attn2 K/V 注入（所有 @图X 文本都绑定视觉特征）
+    # global_marker_indices: 仅 global，用于 segment_global_suppressions（只抑制 global，不抑制 local）
     marker_token_indices = {}
+    global_marker_indices = {}
     for slot, spec in marker_specs.items():
         exact_markers = spec["exact"]
         loose_markers = spec["loose"]
@@ -1198,28 +1380,70 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
             global_indices = _find_marker_phrase_token_indices(
                 raw_tokenizer, full_prompt, exact_markers,
                 stop_markers=all_markers,
-                phrase_extend_tokens=8,
+                phrase_extend_tokens=0,  # 不限制 token 数量，由逗号/句号标点控制停止
+                stop_at_punctuation=True,
             )
             global_indices = sorted(set(idx for idx in global_indices if 0 <= idx < global_token_count))
 
+        # 按段扫描 local_indices，每段每主体只保留第一次出现的 token 范围
+        # 设计理由：
+        #   - @图X 在同一段内出现多次（如"@图4 盯着@图1，@图4 说：..."），
+        #     视觉特征已通过第一次出现注入绑定，后续 @图4 只是文字引用，无需重复注入
+        #   - 避免段内某个主体 token 数量过多导致 softmax 失衡
+        #   - 段间平衡由 relay_mask 时间惩罚自然控制（每段只看到对应段的 token）
         local_indices = []
-        if loose_markers:
-            local_indices = _find_marker_phrase_token_indices(
+        if loose_markers and token_ranges:
+            # 对 full_prompt 调用 ranges 版本，得到该 slot 在 local 区域的所有 token 范围
+            all_local_ranges = _find_marker_phrase_token_ranges(
                 raw_tokenizer, full_prompt, loose_markers,
                 stop_markers=all_markers,
-                phrase_extend_tokens=12,
+                phrase_extend_tokens=0,  # 不限制 token 数量，由逗号/句号标点控制停止
+                stop_at_punctuation=True,
             )
-            local_indices = sorted(set(idx for idx in local_indices if idx >= global_token_count))
+            # 过滤出 local 区域（token >= global_token_count）的范围
+            all_local_ranges = [
+                (s, e) for s, e in all_local_ranges
+                if s >= global_token_count
+            ]
+            # 按 token 起始位置排序
+            all_local_ranges.sort(key=lambda r: r[0])
 
+            # 遍历段，每段只保留该 slot 的第一次出现
+            # 注：token_ranges 只包含 local 段（不包含 global 段）
+            # global 段的 token 范围是 [0, global_token_count)
+            for seg_start, seg_end in token_ranges:
+                # 找到落在该段内的第一个范围（按 token 起始位置判断）
+                # 注：phrase_extend_tokens 扩展可能跨段，但只按 tok_start 判断归属段
+                for tok_start, tok_end in all_local_ranges:
+                    if tok_start >= seg_start and tok_start < seg_end:
+                        # 这是该 slot 在该段内的第一次出现，收集该范围的 token
+                        local_indices.extend(range(tok_start, tok_end))
+                        break  # 每段只保留第一次出现
+
+            local_indices = sorted(set(local_indices))
+
+        # 合并 global + local：确保 local 中的 @图X（动作、台词）也获得视觉特征注入
+        # global token 全帧可见无时间惩罚；local token 受 relay_mask 时间惩罚控制段内可见性
+        combined_indices = sorted(set(global_indices + local_indices))
+        if combined_indices:
+            marker_token_indices[slot] = combined_indices
         if global_indices:
-            marker_token_indices[slot] = global_indices
+            global_marker_indices[slot] = global_indices
+
+        if global_indices and local_indices:
+            log.info(
+                "[Yuan CLIP Timeline/MSR] slot=%s 全局+局部标记绑定 (global=%d tokens 全帧可见, local=%d tokens 受时间惩罚), "
+                "exact=%s, loose=%s",
+                slot, len(global_indices), len(local_indices),
+                exact_markers, loose_markers,
+            )
+        elif global_indices:
             log.info(
                 "[Yuan CLIP Timeline/MSR] slot=%s 使用全局标记绑定 (%d tokens, 无时间惩罚, 全帧可见), "
                 "exact=%s",
                 slot, len(global_indices), exact_markers,
             )
         elif local_indices:
-            marker_token_indices[slot] = local_indices
             log.info(
                 "[Yuan CLIP Timeline/MSR] slot=%s 使用局部标记绑定 (%d tokens, 受时间惩罚, 仅对应段可见), "
                 "loose=%s",
@@ -1231,6 +1455,8 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
 
     # 构建每段需抑制的 global marker token 索引
     # 对于某段没出现的 @主体，其 global marker 被抑制，防止镜头切换时不该出现的主体特征泄露
+    # 注意：只抑制 global_marker_indices，不抑制 local_indices
+    # local token 的时间惩罚由 relay_mask（build_segments 的 marker_token_ranges）控制
     segment_global_suppressions = []
     for seg_idx, local_text in enumerate(locals_list):
         local_folded = local_text.casefold()
@@ -1246,7 +1472,7 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
                     break
         # 该段需抑制的 global token indices = 所有 slot 的 global indices - 出现在该段的 slot
         suppressed_indices = []
-        for slot, indices in marker_token_indices.items():
+        for slot, indices in global_marker_indices.items():
             if slot == "background":
                 continue
             if slot not in appeared_slots and indices:
@@ -1308,6 +1534,11 @@ def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_p
             "preserve_text_strength": 1.0,
             "normalize_ref_summary": True,
             "max_ref_frames": max_ref_frames,
+            # local token 注入策略：按段扫描，每段每主体只保留第一次出现
+            # 已在 local_indices 收集阶段实现，无需额外参数控制
+            # attn1 latent boost 参数（参考 licon-MSR-V3 LTXMSRReferenceTokenBooster）
+            "latent_boost_strength": 0.2,    # K boost 强度，0 表示禁用
+            "include_background": True,      # 是否包含背景 latent token
         }
 
     apply_patches(patched, relay_mask_fn, pointer_config)
