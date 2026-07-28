@@ -5,20 +5,732 @@ Yuan CLIP Timeline - 视觉时间轴提示词编码节点
 """
 
 import json
-import logging
 import math
 import re
 import types
+import os
+import base64
+import time
+import io as _io
+import asyncio
 
 import torch
 import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+
+# PyAV 为可选依赖（音频提取/视频解码用），缺失时降级不阻断节点加载
+try:
+    import av
+except ImportError:
+    av = None
+
 import comfy.ldm.modules.attention
 import comfy.model_management
+import folder_paths
+from server import PromptServer
+from aiohttp import web
 
-log = logging.getLogger(__name__)
+# 自定义 socket 类型 — 用字符串定义以保证所有 ComfyUI 版本兼容
+GuideData = "YUAN_CLIP_GUIDE_DATA"
+MotionGuideData = "YUAN_CLIP_MOTION_GUIDE_DATA"
 
 # text_input 时间格式解析：匹配行首的 "0-3s", "3-5秒", "5-7s" 等
 _TIME_RANGE_PATTERN = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*[s秒]\s*[：:]?\s*')
+
+# 多媒体引导上传子目录（独立于 LTX 导演，避免冲突）
+_TIMELINE_UPLOAD_SUBDIR = "yuan_clip"
+
+
+# ==============================================================================
+# Windows 连接重置异常抑制（避免 PyAV/上传时 ConnectionResetError 刷屏）
+# ==============================================================================
+try:
+    _loop = None
+    try:
+        _loop = asyncio.get_event_loop()
+    except RuntimeError:
+        try:
+            _loop = asyncio.get_event_loop_policy().get_event_loop()
+        except Exception:
+            pass
+    if _loop is not None:
+        _old_handler = _loop.get_exception_handler()
+
+        def _silence_connection_reset_handler(loop, context):
+            exception = context.get('exception')
+            if (isinstance(exception, (ConnectionResetError, ConnectionAbortedError)) or
+                    (isinstance(exception, OSError) and getattr(exception, 'winerror', None) in (10054, 10053))):
+                return
+            if _old_handler:
+                _old_handler(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        _loop.set_exception_handler(_silence_connection_reset_handler)
+except Exception:
+    pass
+
+
+# ==============================================================================
+# 多媒体引导：HTTP endpoint（文件去重/上传/音频提取/打开目录）
+# ==============================================================================
+
+@PromptServer.instance.routes.get("/yuan_clip_timeline_check_file")
+async def _yuan_clip_timeline_check_file(request):
+    filename = request.query.get("filename", "")
+    file_size = request.query.get("size", "")
+    if not filename:
+        return web.json_response({"exists": False})
+
+    upload_dir = folder_paths.get_input_directory()
+    temp_dir = os.path.join(upload_dir, _TIMELINE_UPLOAD_SUBDIR)
+
+    possible_paths = [os.path.join(temp_dir, filename), os.path.join(upload_dir, filename)]
+    found_path = None
+    for p in possible_paths:
+        if os.path.exists(p) and os.path.isfile(p):
+            if file_size:
+                try:
+                    if os.path.getsize(p) == int(file_size):
+                        found_path = p
+                        break
+                except ValueError:
+                    found_path = p
+                    break
+            else:
+                found_path = p
+                break
+    if found_path:
+        rel_name = os.path.relpath(found_path, upload_dir).replace('\\', '/')
+        return web.json_response({"exists": True, "name": rel_name})
+
+    # 后缀模糊匹配
+    base_name = os.path.basename(filename)
+    suffix = f"_{base_name}"
+    try:
+        for search_dir in [temp_dir, upload_dir]:
+            if os.path.exists(search_dir):
+                for f_name in os.listdir(search_dir):
+                    if f_name.endswith(suffix) or f_name == base_name:
+                        pot_path = os.path.join(search_dir, f_name)
+                        if os.path.isfile(pot_path):
+                            if file_size:
+                                try:
+                                    if os.path.getsize(pot_path) == int(file_size):
+                                        rel_name = os.path.relpath(pot_path, upload_dir).replace('\\', '/')
+                                        return web.json_response({"exists": True, "name": rel_name})
+                                except ValueError:
+                                    pass
+                            else:
+                                rel_name = os.path.relpath(pot_path, upload_dir).replace('\\', '/')
+                                return web.json_response({"exists": True, "name": rel_name})
+    except Exception:
+        pass
+    return web.json_response({"exists": False})
+
+
+def _read_and_write_file_chunk(file, file_path, mode):
+    chunk_bytes = file.file.read()
+    with open(file_path, mode) as f:
+        f.write(chunk_bytes)
+
+
+@PromptServer.instance.routes.post("/yuan_clip_timeline_upload_chunk")
+async def _yuan_clip_timeline_upload_chunk(request):
+    post = await request.post()
+    file = post.get("file")
+    filename = post.get("filename")
+    chunk_index = int(post.get("chunk_index"))
+    total_chunks = int(post.get("total_chunks"))
+
+    upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
+    os.makedirs(upload_dir, exist_ok=True)
+    filename = os.path.basename(filename)
+    file_path = os.path.join(upload_dir, filename)
+    if not os.path.realpath(file_path).startswith(os.path.realpath(upload_dir)):
+        return web.json_response({"error": "无效的文件名"}, status=400)
+
+    mode = "ab" if chunk_index > 0 else "wb"
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _read_and_write_file_chunk, file, file_path, mode)
+
+    if chunk_index == total_chunks - 1:
+        audio_file, peaks = None, None
+        try:
+            audio_file, peaks = await loop.run_in_executor(None, _extract_audio_from_video, file_path)
+        except Exception:
+            pass
+        return web.json_response({
+            "name": f"{_TIMELINE_UPLOAD_SUBDIR}/{filename}",
+            "audio_file": audio_file,
+            "peaks": peaks,
+        })
+    return web.json_response({"status": "ok"})
+
+
+# ==============================================================================
+# 多媒体引导：音频提取与波形峰值
+# ==============================================================================
+
+def _read_wav_peaks(wav_path):
+    import wave
+    peaks = []
+    with wave.open(wav_path, 'rb') as w:
+        n_frames = w.getnframes()
+        if n_frames > 0:
+            frames_bytes = w.readframes(n_frames)
+            samples = np.frombuffer(frames_bytes, dtype=np.int16)
+            num_peaks = 200
+            step = max(1, len(samples) // num_peaks)
+            for i in range(num_peaks):
+                chunk = samples[i * step: (i + 1) * step]
+                if len(chunk) > 0:
+                    peaks.append(float(np.max(np.abs(chunk)) / 32767.0))
+                else:
+                    peaks.append(0.0)
+        else:
+            peaks = [0.0] * 200
+    return peaks
+
+
+def _extract_audio_from_video(video_path):
+    import wave
+    try:
+        base, _ = os.path.splitext(video_path)
+        output_wav = base + "_extracted_audio.wav"
+        if os.path.exists(output_wav) and os.path.getsize(output_wav) > 44:
+            try:
+                with wave.open(output_wav, 'rb') as w_check:
+                    if w_check.getframerate() == 44100:
+                        peaks = _read_wav_peaks(output_wav)
+                        input_dir = folder_paths.get_input_directory()
+                        rel_output = os.path.relpath(output_wav, input_dir).replace('\\', '/')
+                        return rel_output, peaks
+            except Exception:
+                pass
+
+        with av.open(video_path) as container:
+            if not container.streams.audio:
+                return None, None
+            stream = container.streams.audio[0]
+            resampler = av.AudioResampler(format='s16', layout='mono', rate=44100)
+            audio_bytes = bytearray()
+            for frame in container.decode(stream):
+                for resampled_frame in resampler.resample(frame):
+                    arr = resampled_frame.to_ndarray()
+                    audio_bytes.extend(arr.tobytes())
+            for resampled_frame in resampler.resample(None):
+                arr = resampled_frame.to_ndarray()
+                audio_bytes.extend(arr.tobytes())
+            if not audio_bytes:
+                return None, None
+            with wave.open(output_wav, 'wb') as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(44100)
+                w.writeframes(audio_bytes)
+
+        peaks = _read_wav_peaks(output_wav)
+        input_dir = folder_paths.get_input_directory()
+        rel_output = os.path.relpath(output_wav, input_dir).replace('\\', '/')
+        return rel_output, peaks
+    except Exception:
+        return None, None
+
+
+def _get_audio_peaks(audio_path):
+    _, ext = os.path.splitext(audio_path)
+    if ext.lower() == ".wav":
+        try:
+            return _read_wav_peaks(audio_path)
+        except Exception:
+            pass
+    try:
+        with av.open(audio_path) as container:
+            if not container.streams.audio:
+                return None
+            stream = container.streams.audio[0]
+            resampler = av.AudioResampler(format='s16', layout='mono', rate=8000)
+            audio_bytes = bytearray()
+            for frame in container.decode(stream):
+                for resampled_frame in resampler.resample(frame):
+                    arr = resampled_frame.to_ndarray()
+                    audio_bytes.extend(arr.tobytes())
+            for resampled_frame in resampler.resample(None):
+                arr = resampled_frame.to_ndarray()
+                audio_bytes.extend(arr.tobytes())
+            if not audio_bytes:
+                return None
+            peaks = []
+            samples = np.frombuffer(audio_bytes, dtype=np.int16)
+            num_peaks = 200
+            step = max(1, len(samples) // num_peaks)
+            for i in range(num_peaks):
+                chunk = samples[i * step: (i + 1) * step]
+                if len(chunk) > 0:
+                    peaks.append(float(np.max(np.abs(chunk)) / 32767.0))
+                else:
+                    peaks.append(0.0)
+            return peaks
+    except Exception:
+        return None
+
+
+@PromptServer.instance.routes.get("/yuan_clip_timeline_get_audio")
+async def _yuan_clip_timeline_get_audio(request):
+    filename = request.query.get("filename")
+    if not filename:
+        return web.json_response({"error": "缺少文件名"}, status=400)
+
+    upload_dir = folder_paths.get_input_directory()
+    clean_filename = filename.replace('\\', '/')
+    file_path = os.path.join(upload_dir, clean_filename)
+    if not os.path.exists(file_path):
+        basename = os.path.basename(clean_filename)
+        temp_path = os.path.join(upload_dir, _TIMELINE_UPLOAD_SUBDIR, basename)
+        if os.path.exists(temp_path):
+            file_path = temp_path
+        else:
+            file_path = os.path.join(upload_dir, basename)
+
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+        return web.json_response({"error": "文件未找到"}, status=404)
+
+    _, ext = os.path.splitext(file_path)
+    is_audio = ext.lower() in [".wav", ".mp3", ".ogg", ".flac", ".m4a"]
+    if is_audio:
+        peaks = None
+        try:
+            peaks = _get_audio_peaks(file_path)
+        except Exception:
+            pass
+        rel_path = os.path.relpath(file_path, upload_dir).replace('\\', '/')
+        return web.json_response({"audio_file": rel_path, "peaks": peaks})
+
+    audio_file, peaks = None, None
+    try:
+        loop = asyncio.get_event_loop()
+        audio_file, peaks = await loop.run_in_executor(None, _extract_audio_from_video, file_path)
+    except Exception:
+        pass
+    return web.json_response({"audio_file": audio_file, "peaks": peaks})
+
+
+@PromptServer.instance.routes.get("/yuan_clip_timeline_get_seg_images")
+async def _yuan_clip_timeline_get_seg_images(request):
+    """返回最新一次 segment_images 端口分配的图像文件列表（按时间戳分组取最新一组）。"""
+    upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
+    files = []
+    if os.path.exists(upload_dir):
+        for f in os.listdir(upload_dir):
+            if f.startswith("segimg_") and f.endswith(".png"):
+                # 解析 segimg_{ts}_{i}.png
+                body = f[len("segimg_"):-len(".png")]
+                parts = body.split("_")
+                if len(parts) == 2:
+                    try:
+                        ts = int(parts[0])
+                        idx = int(parts[1])
+                        files.append({"file": f, "ts": ts, "index": idx})
+                    except ValueError:
+                        pass
+    if not files:
+        return web.json_response({"files": []})
+    # 取最新的 ts（同一批分配的文件共享时间戳）
+    max_ts = max(f["ts"] for f in files)
+    latest_files = [f for f in files if f["ts"] == max_ts]
+    latest_files.sort(key=lambda f: f["index"])
+    return web.json_response({
+        "files": [{"file": f["file"], "index": f["index"]} for f in latest_files]
+    })
+
+
+@PromptServer.instance.routes.post("/yuan_clip_timeline_clear_seg_images")
+async def _yuan_clip_timeline_clear_seg_images(request):
+    """清理磁盘上的 segimg_*.png 文件（用户点击清空时调用，避免切换工作流后自动重载）。"""
+    upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
+    removed = 0
+    if os.path.exists(upload_dir):
+        for f in os.listdir(upload_dir):
+            if f.startswith("segimg_") and f.endswith(".png"):
+                try:
+                    os.remove(os.path.join(upload_dir, f))
+                    removed += 1
+                except Exception:
+                    pass
+    return web.json_response({"success": True, "removed": removed})
+
+
+# ==============================================================================
+# 多媒体引导：图像/视频张量加载与处理
+# ==============================================================================
+
+def _resolve_image_path(ref: str) -> str:
+    """解析图像/视频引用路径，支持 output:/input:/temp: 类型前缀。
+    无前缀或 input: 前缀 → input 目录；
+    output: 前缀 → output 目录；
+    temp: 前缀 → temp 目录。
+    返回绝对路径（文件可能不存在）。
+    """
+    if not ref:
+        return ""
+    ref = ref.strip()
+    # 检测前缀 "output:" / "input:" / "temp:"
+    if ":" in ref and not ref[1:3] == ":\\" and not ref.startswith("\\\\"):
+        prefix, _, rest = ref.partition(":")
+        prefix = prefix.lower()
+        if prefix == "output":
+            return os.path.join(folder_paths.get_output_directory(), rest)
+        if prefix == "temp":
+            return os.path.join(folder_paths.get_temp_directory(), rest)
+        if prefix == "input":
+            return os.path.join(folder_paths.get_input_directory(), rest)
+    return os.path.join(folder_paths.get_input_directory(), ref)
+
+
+def _load_image_tensor(seg: dict) -> torch.Tensor:
+    """加载图像为 [1,H,W,3] float32。
+    imageFile 支持类型前缀（output:/input:/temp:），无前缀默认 input 目录。
+    回退 base64；都失败返回 512x512 黑色零张量。
+    """
+    if seg.get("imageFile"):
+        file_path = _resolve_image_path(seg["imageFile"])
+        if file_path and os.path.exists(file_path):
+            img = Image.open(file_path).convert("RGB")
+            arr = np.array(img, dtype=np.float32) / 255.0
+            return torch.from_numpy(arr).unsqueeze(0)
+    b64_str = seg.get("imageB64", "")
+    if not b64_str or b64_str.startswith("/view?"):
+        return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+    if "," in b64_str:
+        b64_str = b64_str.split(",", 1)[1]
+    try:
+        img_bytes = base64.b64decode(b64_str)
+        img = Image.open(_io.BytesIO(img_bytes)).convert("RGB")
+        arr = np.array(img, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr).unsqueeze(0)
+    except Exception:
+        return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+
+
+def _load_video_tensor(seg: dict, frame_rate: float) -> torch.Tensor:
+    """从视频文件按 trim 参数提取帧序列，返回 [N,H,W,3] float32。"""
+    file_path = _resolve_image_path(seg.get("imageFile", ""))
+    if not file_path or not os.path.exists(file_path):
+        return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+
+    trim_start_frames = float(seg.get("trimStart", 0))
+    length_frames = float(seg.get("length", 1))
+    start_sec = trim_start_frames / frame_rate
+    frames = []
+    try:
+        with av.open(file_path) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            if stream.time_base:
+                seek_pts = int((max(0, start_sec - 0.5)) / float(stream.time_base))
+            else:
+                seek_pts = int((max(0, start_sec - 0.5)) * av.time_base)
+            container.seek(seek_pts, stream=stream, backward=True)
+            for frame in container.decode(stream):
+                frame_time = frame.time
+                if frame_time is None and frame.pts is not None and stream.time_base:
+                    frame_time = float(frame.pts * stream.time_base)
+                if frame_time is None:
+                    frame_time = 0.0
+                if frame_time < start_sec - 0.01:
+                    continue
+                frames.append(frame.to_ndarray(format='rgb24'))
+                if len(frames) >= int(length_frames):
+                    break
+    except Exception:
+        pass
+    if not frames:
+        return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+    frames_np = np.array(frames, dtype=np.float32) / 255.0
+    return torch.from_numpy(frames_np)
+
+
+def _snap_to_divisible(val, div):
+    """将值对齐到 div 的整数倍，最小为 div。"""
+    return max(div, (val // div) * div)
+
+
+def _resize_image(tensor: torch.Tensor, target_w: int, target_h: int, method: str, divisible_by: int) -> torch.Tensor:
+    """将 [N,H,W,3] 张量缩放到目标尺寸，并对齐到 divisible_by。"""
+    tw = _snap_to_divisible(target_w, divisible_by)
+    th = _snap_to_divisible(target_h, divisible_by)
+    N, H, W, C = tensor.shape
+    if H == th and W == tw:
+        return tensor
+    t_nchw = tensor.permute(0, 3, 1, 2)
+    if method == "stretch to fit":
+        resized = F.interpolate(t_nchw, size=(th, tw), mode="bilinear", align_corners=False)
+    elif method == "maintain aspect ratio":
+        ratio = min(tw / W, th / H)
+        new_w = _snap_to_divisible(int(W * ratio), divisible_by)
+        new_h = _snap_to_divisible(int(H * ratio), divisible_by)
+        resized = F.interpolate(t_nchw, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    elif method in ("pad", "pad green"):
+        ratio = min(tw / W, th / H)
+        new_w = _snap_to_divisible(int(W * ratio), divisible_by)
+        new_h = _snap_to_divisible(int(H * ratio), divisible_by)
+        inner = F.interpolate(t_nchw, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        pad_l = (tw - new_w) // 2
+        pad_t = (th - new_h) // 2
+        if method == "pad green":
+            resized = torch.zeros((N, C, th, tw), dtype=t_nchw.dtype, device=t_nchw.device)
+            resized[:, 0, :, :] = 102 / 255.0
+            resized[:, 1, :, :] = 1.0
+            resized[:, 2, :, :] = 0.0
+            resized[:, :, pad_t:pad_t + new_h, pad_l:pad_l + new_w] = inner
+        else:
+            resized = F.pad(inner, (pad_l, tw - new_w - pad_l, pad_t, th - new_h - pad_t), mode="constant", value=0)
+    elif method == "crop":
+        ratio = max(tw / W, th / H)
+        new_w = int(W * ratio)
+        new_h = int(H * ratio)
+        inner = F.interpolate(t_nchw, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        left = (new_w - tw) // 2
+        top = (new_h - th) // 2
+        resized = inner[:, :, top:top + th, left:left + tw]
+    else:
+        resized = F.interpolate(t_nchw, size=(th, tw), mode="bilinear", align_corners=False)
+    return resized.permute(0, 2, 3, 1)
+
+
+def _compress_image(tensor: torch.Tensor, crf: int) -> torch.Tensor:
+    """对 [N,H,W,3] 张量施加 H.264 压缩伪影。crf=0 不压缩。"""
+    if crf == 0:
+        return tensor
+    N, H, W, C = tensor.shape
+    h = (H // 2) * 2
+    w = (W // 2) * 2
+    tensor_bytes = (tensor[:, :h, :w, :] * 255.0).byte().cpu().numpy()
+    try:
+        buf = _io.BytesIO()
+        container = av.open(buf, mode="w", format="mp4")
+        stream = container.add_stream("libx264", rate=24)
+        stream.width = w
+        stream.height = h
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": str(crf), "preset": "ultrafast"}
+        for i in range(N):
+            frame = av.VideoFrame.from_ndarray(tensor_bytes[i], format="rgb24")
+            for pkt in stream.encode(frame):
+                container.mux(pkt)
+        for pkt in stream.encode(None):
+            container.mux(pkt)
+        container.close()
+        buf.seek(0)
+        container_r = av.open(buf, mode="r")
+        decoded = [frame_r.to_ndarray(format="rgb24") for frame_r in container_r.decode(video=0)]
+        container_r.close()
+        if not decoded:
+            return tensor
+        decoded_np = np.stack(decoded).astype(np.float32) / 255.0
+        out = tensor.clone()
+        dec_N = min(N, len(decoded))
+        out[:dec_N, :h, :w] = torch.from_numpy(decoded_np[:dec_N]).to(tensor.device, tensor.dtype)
+        return out
+    except Exception:
+        return tensor
+
+
+def _build_combined_audio(timeline_data_str: str, start_frame: int, duration_frames: int,
+                          frame_rate: float, override_audio: bool = False) -> dict:
+    """解析 timeline JSON，加载/裁剪音频并按全局时间轴对齐合成。"""
+    target_sr = 44100
+    total_samples = max(1, int(math.ceil(duration_frames / frame_rate * target_sr)))
+    empty_audio = {"waveform": torch.zeros((1, 2, total_samples), dtype=torch.float32), "sample_rate": target_sr}
+    if not timeline_data_str:
+        return empty_audio
+    try:
+        data = json.loads(timeline_data_str)
+        if override_audio:
+            audio_segs = data.get("motionSegments", [])
+        else:
+            audio_segs = data.get("audioSegments", [])
+    except Exception:
+        return empty_audio
+    if not audio_segs:
+        return empty_audio
+
+    out_waveform = torch.zeros((2, total_samples), dtype=torch.float32)
+    for seg in audio_segs:
+        buffer = None
+        file_key = "videoFile" if override_audio else "audioFile"
+        if seg.get(file_key):
+            file_path = _resolve_image_path(seg[file_key])
+            if file_path and not os.path.exists(file_path):
+                basename = os.path.basename(seg[file_key])
+                fallback_path = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR, basename)
+                if os.path.exists(fallback_path):
+                    file_path = fallback_path
+            if file_path and os.path.exists(file_path):
+                with open(file_path, "rb") as f:
+                    buffer = _io.BytesIO(f.read())
+        if not override_audio and not buffer and seg.get("audioB64"):
+            b64 = seg.get("audioB64")
+            if "," in b64:
+                b64 = b64.split(",", 1)[1]
+            try:
+                audio_bytes = base64.b64decode(b64)
+                buffer = _io.BytesIO(audio_bytes)
+            except Exception:
+                pass
+        if not buffer:
+            continue
+        try:
+            clip_frames = []
+            with av.open(buffer) as container:
+                if not container.streams.audio:
+                    continue
+                stream = container.streams.audio[0]
+                resampler = av.AudioResampler(format='fltp', layout='stereo', rate=target_sr)
+                for frame in container.decode(stream):
+                    for resampled_frame in resampler.resample(frame):
+                        arr = resampled_frame.to_ndarray()
+                        clip_frames.append(torch.from_numpy(arr))
+                for resampled_frame in resampler.resample(None):
+                    arr = resampled_frame.to_ndarray()
+                    clip_frames.append(torch.from_numpy(arr))
+            if not clip_frames:
+                continue
+            waveform = torch.cat(clip_frames, dim=1)
+            trim_start_frames = float(seg.get("trimStart", 0))
+            length_frames = float(seg.get("length", 1))
+            start_frames = float(seg.get("start", 0))
+            if start_frames + length_frames <= start_frame:
+                continue
+            offset = max(0, start_frame - start_frames)
+            trim_start_frames += offset
+            length_frames = max(1, length_frames - offset)
+            start_frames = max(0, start_frames - start_frame)
+            start_sample_src = int(trim_start_frames / frame_rate * target_sr)
+            length_samples = int(length_frames / frame_rate * target_sr)
+            end_sample_src = start_sample_src + length_samples
+            if start_sample_src < 0:
+                start_sample_src = 0
+            if end_sample_src > waveform.shape[1]:
+                end_sample_src = waveform.shape[1]
+            actual_length = end_sample_src - start_sample_src
+            if actual_length <= 0:
+                continue
+            clip_waveform = waveform[:, start_sample_src:end_sample_src]
+            start_sample_dst = int(start_frames / frame_rate * target_sr)
+            if start_sample_dst >= out_waveform.shape[1]:
+                continue
+            end_sample_dst = start_sample_dst + actual_length
+            if end_sample_dst > out_waveform.shape[1]:
+                actual_length = out_waveform.shape[1] - start_sample_dst
+                clip_waveform = clip_waveform[:, :actual_length]
+                end_sample_dst = start_sample_dst + actual_length
+            if actual_length <= 0:
+                continue
+            out_waveform[:, start_sample_dst:end_sample_dst] += clip_waveform
+        except Exception:
+            continue
+    return {"waveform": out_waveform.unsqueeze(0), "sample_rate": target_sr}
+
+
+# ==============================================================================
+# 多媒体引导：guide_data / motion_guide_data 构建
+# ==============================================================================
+
+def _build_guide_data(tdata: dict, start_frame: int, duration_frames: int, frame_rate: float,
+                      guide_strength_str: str, custom_width: int, custom_height: int,
+                      resize_method: str, divisible_by: int, img_compression: int) -> tuple:
+    """从 timeline_data 构建图像引导数据。返回 (guide_data, derived_w, derived_h)。"""
+    guide_data = {"images": [], "insert_frames": [], "strengths": [], "frame_rate": frame_rate}
+    derived_w, derived_h = custom_width, custom_height
+    try:
+        img_segs = [
+            s for s in tdata.get("segments", [])
+            if s.get("type", "image") in ("image", "video")
+            and (s.get("imageFile") or s.get("imageB64"))
+            and int(s.get("start", 0)) < start_frame + duration_frames
+            and int(s.get("start", 0)) + int(s.get("length", 1)) > start_frame
+        ]
+        img_segs.sort(key=lambda s: s["start"])
+        strengths = []
+        if guide_strength_str and guide_strength_str.strip():
+            strengths = [float(x.strip()) for x in guide_strength_str.split(",") if x.strip()]
+        for idx, seg in enumerate(img_segs):
+            seg_start = int(seg.get("start", 0))
+            offset = max(0, start_frame - seg_start)
+            if seg.get("type") == "video":
+                if offset > 0:
+                    seg["trimStart"] = float(seg.get("trimStart", 0)) + offset
+                    seg["length"] = max(1, int(seg.get("length", 1)) - offset)
+                tensor = _load_video_tensor(seg, float(frame_rate))
+            else:
+                tensor = _load_image_tensor(seg)
+            src_h, src_w = tensor.shape[1], tensor.shape[2]
+
+            if custom_width > 0 and custom_height > 0:
+                tensor = _resize_image(tensor, custom_width, custom_height, resize_method, divisible_by)
+            elif custom_width > 0:
+                tgt_w = _snap_to_divisible(custom_width, divisible_by)
+                tgt_h = _snap_to_divisible(int(src_h * tgt_w / src_w), divisible_by)
+                tensor = _resize_image(tensor, tgt_w, tgt_h, "stretch to fit", divisible_by)
+            elif custom_height > 0:
+                tgt_h = _snap_to_divisible(custom_height, divisible_by)
+                tgt_w = _snap_to_divisible(int(src_w * tgt_h / src_h), divisible_by)
+                tensor = _resize_image(tensor, tgt_w, tgt_h, "stretch to fit", divisible_by)
+            else:
+                tensor = _resize_image(tensor, src_w, src_h, "maintain aspect ratio", divisible_by)
+
+            if img_compression > 0:
+                tensor = _compress_image(tensor, img_compression)
+            if idx == 0:
+                derived_h = tensor.shape[1]
+                derived_w = tensor.shape[2]
+            if seg.get("isEndFrame"):
+                insert_frame = max(0, seg_start + int(seg.get("length", 1)) - 1 - start_frame)
+            else:
+                insert_frame = max(0, seg_start - start_frame)
+            strength = strengths[idx] if idx < len(strengths) else 1.0
+            guide_data["images"].append(tensor)
+            guide_data["insert_frames"].append(insert_frame)
+            guide_data["strengths"].append(float(strength))
+
+    except Exception:
+        pass
+    return guide_data, derived_w, derived_h
+
+
+def _build_motion_guide_data(tdata: dict, start_frame: int, duration_frames: int,
+                             frame_rate: float, resize_method: str,
+                             use_custom_motion: bool) -> dict:
+    """从 timeline_data 构建运动引导数据（IC-LoRA 视频分段）。"""
+    motion_guide_data = {
+        "segments": [], "frame_rate": float(frame_rate),
+        "duration_frames": int(duration_frames), "resize_method": resize_method,
+    }
+    try:
+        motion_segments = tdata.get("motionSegments", []) if use_custom_motion else []
+        for seg in motion_segments:
+            seg_start = int(seg.get("start", 0))
+            length = int(seg.get("length", 1))
+            if seg_start >= start_frame + duration_frames or seg_start + length <= start_frame:
+                continue
+            if not seg.get("videoFile"):
+                continue
+            offset = max(0, start_frame - seg_start)
+            new_start = max(0, seg_start - start_frame)
+            clipped_len = min(length - offset, duration_frames - new_start)
+            if clipped_len <= 0:
+                continue
+            clean = dict(seg)
+            clean["start"] = new_start
+            clean["length"] = clipped_len
+            clean["trimStart"] = float(seg.get("trimStart", 0)) + offset
+            motion_guide_data["segments"].append(clean)
+    except Exception:
+        pass
+    return motion_guide_data
 
 
 # ==============================================================================
@@ -98,107 +810,37 @@ def create_mask_fn(q_token_idx, fallback_tokens_per_frame, latent_frames):
     return mask_fn
 
 
-def build_segments(token_ranges, segment_lengths, epsilon=1e-3, marker_token_ranges=None, segment_global_suppressions=None):
+def build_segments(token_ranges, segment_lengths, epsilon=1e-3):
     """为时间惩罚构建每段元数据。
 
-    marker_token_ranges: 所有 @主体在 full_prompt 中的 token 范围列表 [(tok_start, tok_end), ...]。
-        如果提供，段内每个 @主体 marker 会获得独立 midpoint（基于该 marker 在段内的相对位置），
-        段内非 marker 文本仍用段的整体 midpoint。这样段内多个 @主体不会共享同一时间中心。
-    segment_global_suppressions: 每段需抑制的 global marker token 索引列表 [tensor, ...]。
-        长度与 segment_lengths 相同。对于某段没出现的 @主体，其 global marker 被抑制，
-        防止镜头切换时不该出现的主体视觉特征泄露到当前段。
-        抑制使用 suppress 模式：Gaussian 中心惩罚 exp(-d²/2σ²)，段中心最强。
+    设计限制：midpoint/window/sigma 以「段」为最小粒度构建。一个 local_prompt 段内引用
+    多个 @图X（如 `@图1 在左边，@图2 在右边`）时，两角色描述的所有 token 共享同一个
+    midpoint 和 window，时间维度上无法在段内再细分各角色的活跃区间。
+
+    若需要段内多主体时间细分，需重构为 token 级元数据（每个 @图X 描述 token 独立 midpoint），
+    这会影响 build_temporal_cost 等下游函数。当前实现下，建议把不同角色拆到不同段处理。
     """
     sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
 
     q_token_idx = []
     frame_cursor = 0
 
-    for seg_idx, ((tok_start, tok_end), L) in enumerate(zip(token_ranges, segment_lengths)):
+    for (tok_start, tok_end), L in zip(token_ranges, segment_lengths):
         if L <= 0:
             frame_cursor += L
             continue
         seg_midpoint = (2 * frame_cursor + L) // 2
-        base_window = max(L // 2 - 2, 0)
-
-        # 收集段内的 marker token 范围
-        seg_markers = []
-        if marker_token_ranges:
-            for m_start, m_end in marker_token_ranges:
-                # marker 与段有交集
-                overlap_lo = max(m_start, tok_start)
-                overlap_hi = min(m_end, tok_end)
-                if overlap_lo < overlap_hi:
-                    seg_markers.append((overlap_lo, overlap_hi))
-
-        if seg_markers:
-            # 段内有 marker：为每个 marker 构建独立子段，非 marker 文本用段的整体 midpoint
-            seg_markers.sort(key=lambda r: r[0])
-            marker_tokens = set()
-            seg_len = max(1, tok_end - tok_start)
-
-            for m_start, m_end in seg_markers:
-                # marker 在段内的相对位置 → 独立 midpoint
-                m_center = (m_start + m_end) / 2.0
-                rel_pos = (m_center - tok_start) / seg_len
-                m_midpoint = frame_cursor + rel_pos * L
-                # marker 子段窗口：较小，让时间惩罚更聚焦
-                m_window = max(L // 4 - 1, 0)
-                q_token_idx.append({
-                    "local_token_idx": torch.arange(m_start, m_end),
-                    "midpoint": m_midpoint,
-                    "window": float(m_window),
-                    "sigma": sigma,
-                    "strength": 1.0,
-                    "window_audio": float(m_window),
-                    "sigma_audio": sigma,
-                    "strength_audio": 1.0,
-                })
-                for t in range(m_start, m_end):
-                    marker_tokens.add(t)
-
-            # 非 marker token 用段的整体 midpoint
-            non_marker_tokens = [t for t in range(tok_start, tok_end) if t not in marker_tokens]
-            if non_marker_tokens:
-                q_token_idx.append({
-                    "local_token_idx": torch.tensor(non_marker_tokens, dtype=torch.long),
-                    "midpoint": seg_midpoint,
-                    "window": float(max(base_window, 0)),
-                    "sigma": sigma,
-                    "strength": 1.0,
-                    "window_audio": float(max(base_window, 0)),
-                    "sigma_audio": sigma,
-                    "strength_audio": 1.0,
-                })
-        else:
-            # 段内无 marker：保持原有行为，所有 token 共享段 midpoint
-            q_token_idx.append({
-                "local_token_idx": torch.arange(tok_start, tok_end),
-                "midpoint": seg_midpoint,
-                "window": float(max(base_window, 0)),
-                "sigma": sigma,
-                "strength": 1.0,
-                "window_audio": float(max(base_window, 0)),
-                "sigma_audio": sigma,
-                "strength_audio": 1.0,
-            })
-
-        # 抑制当前段未出现的 global marker（防止镜头切换时串扰）
-        if segment_global_suppressions and seg_idx < len(segment_global_suppressions):
-            supp = segment_global_suppressions[seg_idx]
-            if supp is not None and len(supp) > 0:
-                if isinstance(supp, list):
-                    supp = torch.tensor(supp, dtype=torch.long)
-                q_token_idx.append({
-                    "local_token_idx": supp,
-                    "midpoint": seg_midpoint,
-                    "sigma": sigma,
-                    "strength": 1.0,
-                    "suppress": True,
-                    "sigma_audio": sigma,
-                    "strength_audio": 1.0,
-                })
-
+        base_window = max(L // 2 - 1, 0)
+        q_token_idx.append({
+            "local_token_idx": torch.arange(tok_start, tok_end),
+            "midpoint": seg_midpoint,
+            "window": float(max(base_window, 0)),
+            "sigma": sigma,
+            "strength": 1.0,
+            "window_audio": float(max(base_window, 0)),
+            "sigma_audio": sigma,
+            "strength_audio": 1.0,
+        })
         frame_cursor += L
 
     return q_token_idx
@@ -218,6 +860,82 @@ def get_raw_tokenizer(clip):
         f"无法从 CLIP 对象中找到原始分词器。"
         f"已知属性: {[a for a in dir(tokenizer_wrapper) if not a.startswith('_')]}"
     )
+
+
+def _flatten_token_ids(raw):
+    """展平 CLIP tokenize 返回的 token ids 为一维列表。"""
+    if isinstance(raw, dict):
+        raw = raw.get("input_ids", [])
+    if isinstance(raw, torch.Tensor):
+        raw = raw.detach().cpu().tolist()
+    if raw and isinstance(raw[0], (list, tuple)):
+        raw = raw[0]
+    return list(raw or [])
+
+
+def _token_count(raw_tokenizer, text):
+    """计算文本的 CLIP token 数量（减去 EOS）。"""
+    ids = _flatten_token_ids(raw_tokenizer(text))
+    eos_adj = 1 if getattr(raw_tokenizer, "add_eos", False) else 0
+    return max(0, len(ids) - eos_adj)
+
+
+def _find_marker_phrase_token_indices(
+    raw_tokenizer,
+    prompt_text,
+    markers,
+    stop_markers=None,
+    stop_at_punctuation=True,
+    stop_at_other_marker=True,
+):
+    """返回 marker token 索引列表（离散）。
+    markers 如 ['@图1', '@图2']，定位这些标记在 CLIP token 序列中的位置。
+    """
+    if raw_tokenizer is None or not prompt_text or not markers:
+        return []
+    prompt_folded = prompt_text.casefold()
+    stop_chars = set(",，.。")
+    ranges = []
+    sorted_markers = sorted(set(m for m in markers if m), key=len, reverse=True)
+    covered_char_ranges = []
+    all_markers = [m for m in (stop_markers or markers) if m]
+
+    for marker in sorted_markers:
+        marker_folded = marker.casefold()
+        marker_len = len(marker)
+        start = 0
+        while True:
+            char_start = prompt_folded.find(marker_folded, start)
+            if char_start < 0:
+                break
+            if any(c_start <= char_start < c_end for c_start, c_end in covered_char_ranges):
+                start = char_start + marker_len
+                continue
+            char_stop = char_start + marker_len
+            scan = char_stop
+            while scan < len(prompt_text):
+                if stop_at_punctuation and prompt_text[scan] in stop_chars:
+                    break
+                if stop_at_other_marker:
+                    tail = prompt_folded[scan:]
+                    if any(tail.startswith(other.casefold()) for other in all_markers if other != marker):
+                        break
+                scan += 1
+            char_stop = max(char_stop, scan)
+            covered_char_ranges.append((char_start, char_stop))
+            tok_start = _token_count(raw_tokenizer, prompt_text[:char_start])
+            marker_tok_end = _token_count(raw_tokenizer, prompt_text[:char_start + marker_len])
+            phrase_tok_end = _token_count(raw_tokenizer, prompt_text[:char_stop])
+            tok_end = max(marker_tok_end, phrase_tok_end)
+            if tok_end <= tok_start:
+                tok_end = tok_start + 1
+            ranges.append((tok_start, tok_end))
+            start = char_start + marker_len
+
+    indices = []
+    for tok_start, tok_end in ranges:
+        indices.extend(range(tok_start, tok_end))
+    return sorted(set(i for i in indices if i >= 0))
 
 
 def map_token_indices(raw_tokenizer, global_prompt, local_prompts):
@@ -295,10 +1013,6 @@ def distribute_segment_lengths(num_segments, latent_frames, specified_lengths=No
         clipped = [max(1, min(L, latent_frames)) for L in specified_lengths]
         total = sum(clipped)
         if total != latent_frames:
-            log.warning(
-                "[Yuan CLIP Timeline] segment_lengths 总和(%d) != latent_frames(%d)，自动重新规范化",
-                total, latent_frames,
-            )
             return _redistribute_to_total(clipped, latent_frames)
         return clipped
 
@@ -357,36 +1071,18 @@ def detect_model_type(model):
     )
 
 
-def apply_patches(model_clone, mask_fn, pointer_config=None):
+def apply_patches(model_clone, mask_fn):
     diffusion_model = model_clone.get_model_object("diffusion_model")
-
     to = model_clone.model_options["transformer_options"]
     to["promptrelay_mask_fn"] = mask_fn
-
-    if pointer_config is not None:
-        to["licon_msr_v3_relay_mask_fn"] = mask_fn
-        to["licon_msr_v3_marker_token_indices"] = pointer_config["marker_token_indices"]
-
     for idx, block in enumerate(diffusion_model.transformer_blocks):
-        # 包装 attn1：参考 latent token boost（仅在 pointer_config 存在时）
-        if pointer_config is not None:
-            attn1 = getattr(block, "attn1", None)
-            if attn1 is not None:
-                key = f"diffusion_model.transformer_blocks.{idx}.attn1.forward"
-                underlying = model_clone.get_model_object(key)
-                wrapper = _make_ltx_latent_booster_wrapper(underlying, pointer_config, idx)
-                model_clone.add_object_patch(key, types.MethodType(wrapper, attn1))
-
         for attr in ("attn2", "audio_attn2"):
             module = getattr(block, attr, None)
             if module is None:
                 continue
             key = f"diffusion_model.transformer_blocks.{idx}.{attr}.forward"
             underlying = model_clone.get_model_object(key)
-            if attr == "attn2" and pointer_config is not None:
-                wrapper = _make_ltx_marker_relay_wrapper(underlying, mask_fn, pointer_config, idx)
-            else:
-                wrapper = _make_ltx_mask_wrapper(underlying, mask_fn)
+            wrapper = _make_ltx_mask_wrapper(underlying, mask_fn)
             model_clone.add_object_patch(key, types.MethodType(wrapper, module))
 
 
@@ -426,712 +1122,6 @@ def _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames):
 
 
 # ==============================================================================
-# MSR Info / Marker Relay 辅助函数 (来自 Licon MSR V3)
-# ==============================================================================
-
-def _flatten_token_ids(raw):
-    if isinstance(raw, dict):
-        raw = raw.get("input_ids", [])
-    if isinstance(raw, torch.Tensor):
-        raw = raw.detach().cpu().tolist()
-    if raw and isinstance(raw[0], (list, tuple)):
-        raw = raw[0]
-    return list(raw or [])
-
-
-def _token_count(raw_tokenizer, text):
-    ids = _flatten_token_ids(raw_tokenizer(text))
-    eos_adj = 1 if getattr(raw_tokenizer, "add_eos", False) else 0
-    return max(0, len(ids) - eos_adj)
-
-
-def _find_marker_phrase_token_indices(
-    raw_tokenizer,
-    prompt_text,
-    markers,
-    stop_markers=None,
-    phrase_extend_tokens=0,
-    stop_at_punctuation=True,
-    stop_at_other_marker=True,
-):
-    """返回 marker token 索引列表（离散）。保留向后兼容。"""
-    ranges = _find_marker_phrase_token_ranges(
-        raw_tokenizer, prompt_text, markers,
-        stop_markers=stop_markers,
-        phrase_extend_tokens=phrase_extend_tokens,
-        stop_at_punctuation=stop_at_punctuation,
-        stop_at_other_marker=stop_at_other_marker,
-    )
-    indices = []
-    for tok_start, tok_end in ranges:
-        indices.extend(range(tok_start, tok_end))
-    return sorted(set(i for i in indices if i >= 0))
-
-
-def _find_marker_phrase_token_ranges(
-    raw_tokenizer,
-    prompt_text,
-    markers,
-    stop_markers=None,
-    phrase_extend_tokens=0,
-    stop_at_punctuation=True,
-    stop_at_other_marker=True,
-):
-    """返回 marker token 范围列表 [(tok_start, tok_end), ...]，每个 marker 匹配一个连续范围。
-
-    用于 build_segments 为段内每个 @主体构建独立时间窗口。
-    """
-    if raw_tokenizer is None or not prompt_text:
-        return []
-
-    all_markers = [m for m in (stop_markers or markers) if m]
-    prompt_folded = prompt_text.casefold()
-    # 仅在逗号或句号（中英文）处停止扫描
-    # 设计理由：用户要求 @ 绑定范围由标点控制，而非固定 token 数量
-    # 逗号/句号代表一个完整描述项的结束，其他标点（如！？;：）不停止扫描
-    stop_chars = set(",，.。")
-    ranges = []
-
-    sorted_markers = sorted(set(m for m in markers if m), key=len, reverse=True)
-    covered_char_ranges = []
-
-    for marker in sorted_markers:
-        marker_folded = marker.casefold()
-        marker_len = len(marker)
-        start = 0
-        while True:
-            char_start = prompt_folded.find(marker_folded, start)
-            if char_start < 0:
-                break
-
-            if any(c_start <= char_start < c_end for c_start, c_end in covered_char_ranges):
-                start = char_start + marker_len
-                continue
-
-            char_stop = char_start + marker_len
-            scan = char_stop
-            while scan < len(prompt_text):
-                if stop_at_punctuation and prompt_text[scan] in stop_chars:
-                    break
-                if stop_at_other_marker:
-                    tail = prompt_folded[scan:]
-                    if any(tail.startswith(other.casefold()) for other in all_markers if other != marker):
-                        break
-                scan += 1
-
-            char_stop = max(char_stop, scan)
-            covered_char_ranges.append((char_start, char_stop))
-
-            tok_start = _token_count(raw_tokenizer, prompt_text[:char_start])
-            marker_tok_end = _token_count(raw_tokenizer, prompt_text[:char_start + marker_len])
-            phrase_tok_end = _token_count(raw_tokenizer, prompt_text[:char_stop])
-            tok_end = max(marker_tok_end, phrase_tok_end)
-            if phrase_extend_tokens > 0:
-                tok_end = min(tok_end, tok_start + int(phrase_extend_tokens))
-            if tok_end <= tok_start:
-                tok_end = tok_start + 1
-            ranges.append((tok_start, tok_end))
-            start = char_start + marker_len
-
-    return sorted(ranges, key=lambda r: r[0])
-
-
-def _map_subject_to_ref_latent_indices(
-    subject, source_frame_count, latent_frame_count, reference_latent_count=None,
-    max_ref_frames=None,
-):
-    """将主体映射到参考latent索引。
-
-    当运行时 latent_frame_count 与 msr_info 中的 reference_latent_count 不一致时
-    （例如 LTXV 对参考帧做了额外时间压缩），放弃使用 latent_start/latent_end
-    （它们基于 reference_latent_count 计算，会截断或重叠），
-    改用 frame_start/frame_end 按比例重新映射，避免图4特征丢失或与图3污染。
-
-    max_ref_frames: 每个主体最多使用几个参考 latent 帧（取前 N 个）。
-    避免参考帧过多导致 ref_summary 均值模糊，各主体统一取 2 帧以内保证公平。
-    """
-    if source_frame_count <= 0 or latent_frame_count <= 0:
-        return []
-
-    # 判断运行时latent帧数是否与msr_info中一致
-    runtime_mismatch = (
-        reference_latent_count is not None
-        and reference_latent_count > 0
-        and latent_frame_count != reference_latent_count
-    )
-
-    if not runtime_mismatch and "latent_start" in subject and "latent_end" in subject:
-        ls = int(subject.get("latent_start", 0))
-        le = int(subject.get("latent_end", ls))
-        ls = max(0, min(latent_frame_count - 1, ls))
-        le = max(ls, min(latent_frame_count - 1, le))
-        indices = list(range(ls, le + 1))
-    else:
-        # 运行时不一致或没有latent_start/latent_end时，使用frame_start/frame_end重新计算
-        fs = int(subject.get("frame_start", 0))
-        fe = int(subject.get("frame_end", -1))
-        fs = max(0, min(source_frame_count - 1, fs))
-        fe = max(fs, min(source_frame_count - 1, fe))
-
-        if latent_frame_count == source_frame_count:
-            indices = list(range(fs, fe + 1))
-        elif latent_frame_count == 1:
-            indices = [0]
-        else:
-            stride = (source_frame_count - 1) / float(latent_frame_count - 1)
-            indices = []
-            for latent_idx in range(latent_frame_count):
-                source_anchor = int(round(latent_idx * stride))
-                if fs <= source_anchor <= fe:
-                    indices.append(latent_idx)
-            if not indices:
-                center = (fs + fe) * 0.5
-                nearest = int(round(center / stride))
-                indices = [max(0, min(latent_frame_count - 1, nearest))]
-
-    # 每个主体最多取 max_ref_frames 个参考 latent 帧（取前 N 个）
-    if max_ref_frames is not None and len(indices) > max_ref_frames:
-        indices = indices[:max_ref_frames]
-
-    return indices
-
-
-def _parse_block_filter(text, n_blocks):
-    if not text or not text.strip():
-        return None
-    out = set()
-    for raw in text.split(","):
-        part = raw.strip()
-        if not part:
-            continue
-        if "-" in part:
-            try:
-                a, b = part.split("-", 1)
-                lo, hi = sorted((int(a.strip()), int(b.strip())))
-                out.update(range(max(0, lo), min(n_blocks - 1, hi) + 1))
-            except Exception:
-                continue
-        else:
-            try:
-                idx = int(part)
-                if 0 <= idx < n_blocks:
-                    out.add(idx)
-            except Exception:
-                continue
-    return frozenset(out) if out else None
-
-
-def _target_count_from_latent_shape(target_latent_shape, spatial_patch_size=1, temporal_patch_size=1):
-    """从 latent_shape (B, C, T, H, W) 计算目标 token 数和每帧 token 数。
-    返回 (target_count, tokens_per_frame)，失败返回 (None, None)。
-    """
-    if target_latent_shape is None:
-        return None, None
-    _, _, target_frames, h_lat, w_lat = target_latent_shape
-    tokens_per_frame = (
-        max(1, h_lat // max(1, spatial_patch_size))
-        * max(1, w_lat // max(1, spatial_patch_size))
-    )
-    target_count = max(1, target_frames // max(1, temporal_patch_size)) * tokens_per_frame
-    return int(target_count), int(tokens_per_frame)
-
-
-def _build_slot_ref_indices_from_target_latent(
-    msr_info,
-    slot,
-    seq,
-    device,
-    target_latent_shape,
-    spatial_patch_size=1,
-    temporal_patch_size=1,
-    max_ref_frames=None,
-):
-    if not isinstance(msr_info, dict) or target_latent_shape is None:
-        return None
-
-    reference_frame_count = int(msr_info.get("reference_frame_count") or 0)
-    if reference_frame_count <= 0:
-        return None
-
-    reference_latent_count = int(msr_info.get("reference_latent_count") or 0)
-
-    subjects = list(msr_info.get("subjects") or [])
-    background = msr_info.get("background")
-    if isinstance(background, dict):
-        subjects.append(dict(background))
-
-    subject = None
-    for item in subjects:
-        if isinstance(item, dict) and str(item.get("slot")) == str(slot):
-            subject = item
-            break
-    if subject is None:
-        return None
-
-    _, _, target_frames, h_lat, w_lat = target_latent_shape
-    tokens_per_frame = (
-        max(1, h_lat // max(1, spatial_patch_size))
-        * max(1, w_lat // max(1, spatial_patch_size))
-    )
-    if tokens_per_frame <= 0:
-        return None
-
-    target_count = (
-        max(1, target_frames // max(1, temporal_patch_size))
-        * tokens_per_frame
-    )
-    if target_count <= 0 or target_count >= seq:
-        return None
-
-    ref_count = seq - target_count
-    if ref_count <= 0 or ref_count % tokens_per_frame != 0:
-        return None
-
-    ref_latent_frames = ref_count // tokens_per_frame
-
-    latent_indices = _map_subject_to_ref_latent_indices(
-        subject,
-        source_frame_count=reference_frame_count,
-        latent_frame_count=ref_latent_frames,
-        reference_latent_count=reference_latent_count,
-        max_ref_frames=max_ref_frames,
-    )
-    ranges = []
-    for latent_idx in latent_indices:
-        start = target_count + latent_idx * tokens_per_frame
-        stop = start + tokens_per_frame
-        if target_count <= start < stop <= seq:
-            ranges.append(torch.arange(start, stop, device=device, dtype=torch.long))
-
-    if not ranges:
-        return None
-    return torch.cat(ranges, dim=0) if len(ranges) > 1 else ranges[0]
-
-
-def _positive_batch_mask(transformer_options, batch_size, device):
-    cond_or_uncond = transformer_options.get("cond_or_uncond")
-    if not cond_or_uncond or batch_size <= 0:
-        return None
-
-    cond_or_uncond = list(cond_or_uncond)
-    group_count = len(cond_or_uncond)
-    if group_count <= 0 or batch_size % group_count != 0:
-        return None
-
-    group_size = batch_size // group_count
-    mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
-    for group_idx, value in enumerate(cond_or_uncond):
-        if value == 0:
-            start = group_idx * group_size
-            mask[start:start + group_size] = True
-    return mask
-
-
-def _is_negative_only_call(transformer_options):
-    cond_or_uncond = transformer_options.get("cond_or_uncond")
-    return bool(cond_or_uncond) and all(value != 0 for value in cond_or_uncond)
-
-
-def _relay_mask_for_positive_rows(relay_mask, transformer_options, batch_size, device, dtype):
-    positive_mask = _positive_batch_mask(transformer_options, batch_size, device)
-    if positive_mask is None:
-        return relay_mask
-    if not positive_mask.any():
-        return None
-
-    if relay_mask.dim() == 2:
-        out = torch.zeros(
-            batch_size,
-            1,
-            relay_mask.shape[-2],
-            relay_mask.shape[-1],
-            device=device,
-            dtype=dtype,
-        )
-        out[positive_mask, 0, :, :] = relay_mask.to(device=device, dtype=dtype)
-        return out
-
-    view_shape = [batch_size] + [1] * (relay_mask.dim() - 1)
-    return relay_mask * positive_mask.view(*view_shape).to(device=relay_mask.device, dtype=relay_mask.dtype)
-
-
-def _make_ltx_marker_relay_wrapper(
-    underlying,
-    mask_fn,
-    pointer_config,
-    block_idx,
-):
-    def wrapped(_self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
-        direct_supported = all(hasattr(_self, name) for name in ("to_q", "to_k", "to_v", "q_norm", "k_norm", "to_out"))
-
-        if _is_negative_only_call(transformer_options):
-            return underlying(
-                x,
-                context=context,
-                mask=mask,
-                pe=pe,
-                k_pe=k_pe,
-                transformer_options=transformer_options,
-            )
-
-        if not direct_supported:
-            if context is not None:
-                relay_mask = mask_fn(x.shape[1], context.shape[1], x.dtype, x.device, transformer_options)
-                if relay_mask is not None:
-                    relay_mask = _relay_mask_for_positive_rows(
-                        relay_mask, transformer_options, x.shape[0], x.device, x.dtype
-                    )
-                if relay_mask is not None:
-                    mask = relay_mask if mask is None else mask + relay_mask
-            return underlying(
-                x,
-                context=context,
-                mask=mask,
-                pe=pe,
-                k_pe=k_pe,
-                transformer_options=transformer_options,
-            )
-
-        context = x if context is None else context
-        q = _self.to_q(x)
-        k = _self.to_k(context)
-        v = _self.to_v(context)
-
-        if context is not None:
-            marker_token_indices = pointer_config["marker_token_indices"]
-            msr_info = pointer_config["msr_info"]
-            latent_shape = pointer_config["latent_shape"]
-            pointer_blocks = pointer_config["pointer_blocks"]
-            spatial_patch_size = pointer_config["spatial_patch_size"]
-            temporal_patch_size = pointer_config["temporal_patch_size"]
-            binding_strength = pointer_config["binding_strength"]
-            preserve_text_strength = pointer_config["preserve_text_strength"]
-            normalize_ref_summary = pointer_config["normalize_ref_summary"]
-            max_ref_frames = pointer_config.get("max_ref_frames", 2)
-            positive_mask = _positive_batch_mask(transformer_options, x.shape[0], x.device)
-            positive_rows = None
-            if positive_mask is not None:
-                positive_rows = torch.where(positive_mask)[0]
-
-            # === K/V 标记注入：把每个 slot 的参考 latent 特征注入到对应 @图X 文本 token 上 ===
-            if pointer_blocks is None or block_idx in pointer_blocks:
-                max_context_index = context.shape[1] - 1
-                _slots_missing_logged = set()
-
-                for slot, token_indices in marker_token_indices.items():
-                    usable = [idx for idx in token_indices if idx <= max_context_index]
-                    if not usable:
-                        if slot not in _slots_missing_logged:
-                            _slots_missing_logged.add(slot)
-                            log.warning(
-                                "[Yuan CLIP Timeline/MSR] block=%d slot=%s 所有标记token(%s)超出context范围(max=%d)，"
-                                "该主体无法绑定——full_prompt token数超过实际context长度(%d, 由max_frames/段落数动态决定)导致截断，"
-                                "请缩短global_prompt描述或减少主体数量",
-                                block_idx, slot, token_indices[:5], max_context_index, context.shape[1],
-                            )
-                        continue
-
-                    ref_indices = _build_slot_ref_indices_from_target_latent(
-                        msr_info,
-                        slot,
-                        seq=x.shape[1],
-                        device=x.device,
-                        target_latent_shape=latent_shape,
-                        spatial_patch_size=spatial_patch_size,
-                        temporal_patch_size=temporal_patch_size,
-                        max_ref_frames=max_ref_frames,
-                    )
-                    if ref_indices is None or ref_indices.numel() == 0:
-                        continue
-
-                    ref_summary = x[:, ref_indices, :].mean(dim=1)
-                    marker_tensor = torch.as_tensor(usable, device=k.device, dtype=torch.long)
-
-                    ref_k = _self.to_k(ref_summary[:, None, :]).to(dtype=k.dtype, device=k.device)
-                    ref_v = _self.to_v(ref_summary[:, None, :]).to(dtype=v.dtype, device=v.device)
-                    if normalize_ref_summary:
-                        marker_norm = k[:, marker_tensor, :].norm(dim=-1, keepdim=True).mean(dim=1)
-                        ref_k = F.normalize(ref_k, dim=-1) * marker_norm.clamp_min(1e-6)
-                        ref_v = F.normalize(ref_v, dim=-1) * marker_norm.to(dtype=ref_v.dtype, device=ref_v.device).clamp_min(1e-6)
-
-                    # 统一 binding_strength：global 和 local 用相同强度
-                    # 设计理由：
-                    #   - 用户要求"@ 完全注入"，不应区分 global/local 强度
-                    #   - 段内平衡已通过"每段每主体只保留第一次出现"实现，
-                    #     不再需要通过降低 local 强度来避免 softmax 失衡
-                    #   - global token 全帧可见（无时间惩罚），local token 段内可见（有时间惩罚）
-                    #     可见性由 relay_mask 控制，与 binding_strength 无关
-                    per_token_strength_k = torch.full(
-                        (len(usable),), float(binding_strength),
-                        device=k.device, dtype=k.dtype,
-                    )
-                    per_token_strength_v = torch.full(
-                        (len(usable),), float(binding_strength),
-                        device=v.device, dtype=v.dtype,
-                    )
-
-                    # per-token 扩展到 K/V 维度 [num_markers]
-                    # 注：ref_k/ref_v 形状为 [B, num_markers, C]，per_token_strength 仅在 num_markers 维度广播
-                    per_token_strength_k = per_token_strength_k.view(-1)
-                    per_token_strength_v = per_token_strength_v.view(-1)
-
-                    if positive_rows is not None:
-                        if positive_rows.numel() == 0:
-                            continue
-                        # ref_k[positive_rows] 形状 [num_positive, num_markers, C]
-                        # per_token_strength_k 形状 [num_markers]，需 view(1, -1, 1) 广播
-                        strength_k_pos = per_token_strength_k.view(1, -1, 1)
-                        strength_v_pos = per_token_strength_v.view(1, -1, 1)
-                        k[positive_rows[:, None], marker_tensor[None, :], :] = (
-                            k[positive_rows[:, None], marker_tensor[None, :], :] * float(preserve_text_strength)
-                            + ref_k[positive_rows] * strength_k_pos
-                        )
-                        v[positive_rows[:, None], marker_tensor[None, :], :] = (
-                            v[positive_rows[:, None], marker_tensor[None, :], :] * float(preserve_text_strength)
-                            + ref_v[positive_rows] * strength_v_pos
-                        )
-                    else:
-                        # ref_k 形状 [B, num_markers, C]
-                        strength_k_full = per_token_strength_k.view(1, -1, 1)
-                        strength_v_full = per_token_strength_v.view(1, -1, 1)
-                        k[:, marker_tensor, :] = (
-                            k[:, marker_tensor, :] * float(preserve_text_strength)
-                            + ref_k * strength_k_full
-                        )
-                        v[:, marker_tensor, :] = (
-                            v[:, marker_tensor, :] * float(preserve_text_strength)
-                            + ref_v * strength_v_full
-                        )
-
-        q = _self.q_norm(q)
-        k = _self.k_norm(k)
-
-        if pe is not None:
-            try:
-                from comfy.ldm.lightricks.model import apply_rotary_emb
-                q = apply_rotary_emb(q, pe)
-                k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
-            except Exception:
-                pass
-
-        if context is not None:
-            relay_mask = mask_fn(x.shape[1], context.shape[1], x.dtype, x.device, transformer_options)
-            if relay_mask is not None:
-                relay_mask = _relay_mask_for_positive_rows(
-                    relay_mask, transformer_options, x.shape[0], x.device, x.dtype
-                )
-            if relay_mask is not None:
-                mask = relay_mask if mask is None else mask + relay_mask
-
-        if mask is None:
-            out = comfy.ldm.modules.attention.optimized_attention(
-                q,
-                k,
-                v,
-                _self.heads,
-                attn_precision=getattr(_self, "attn_precision", None),
-                transformer_options=transformer_options,
-            )
-        else:
-            out = comfy.ldm.modules.attention.optimized_attention_masked(
-                q,
-                k,
-                v,
-                _self.heads,
-                mask,
-                attn_precision=getattr(_self, "attn_precision", None),
-                transformer_options=transformer_options,
-            )
-
-        to_gate_logits = getattr(_self, "to_gate_logits", None)
-        if to_gate_logits is not None:
-            gate_logits = to_gate_logits(x)
-            b, t, _ = out.shape
-            out = out.view(b, t, _self.heads, _self.dim_head)
-            gates = 2.0 * torch.sigmoid(gate_logits)
-            out = out * gates.unsqueeze(-1)
-            out = out.view(b, t, _self.heads * _self.dim_head)
-
-        return _self.to_out(out)
-
-    return wrapped
-
-
-def _make_ltx_latent_booster_wrapper(underlying, pointer_config, block_idx):
-    """attn1 wrapper：在执行自注意力前，直接缩放参考 latent token 的值。
-
-    参考 licon-MSR-V3 的 LTXMSRReferenceTokenBooster 机制：
-    - 仅收集 background 的参考 latent token 索引（不收集 subjects）
-    - x[:, ref_indices, :] *= (1.0 + boost_strength)
-    - 让目标 token 通过正常自注意力自然获取背景特征
-
-    设计理由：
-    - attn1 是自注意力，所有 target token 与同一组 ref token 交互，无法按段区分
-    - 若 boost 所有 subjects 的 ref latent，会导致跨段污染（@图3 的视觉特征
-      在段1/段3也被 boost，污染 @图4 等其他主体）
-    - subjects 的视觉特征完全由 attn2 (marker_relay) + relay_mask 控制，
-      attn2 有时间惩罚机制能正确区分段
-    - background 全帧可见，attn1 boost background 不会跨段污染
-    - 符合约束：仅 K boost（0.2强度），无 V 注入，无 softmax 归一化
-    """
-    def wrapped(_self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
-        boost_strength = float(pointer_config.get("latent_boost_strength", 0.2))
-
-        # 仅在正向批次、指定 block、boost>0 时执行
-        if (
-            boost_strength > 0.0
-            and not _is_negative_only_call(transformer_options)
-        ):
-            pointer_blocks = pointer_config.get("pointer_blocks")
-            if pointer_blocks is None or block_idx in pointer_blocks:
-                msr_info = pointer_config["msr_info"]
-                latent_shape = pointer_config["latent_shape"]
-                spatial_patch_size = pointer_config["spatial_patch_size"]
-                temporal_patch_size = pointer_config["temporal_patch_size"]
-
-                target_count, tokens_per_frame = _target_count_from_latent_shape(
-                    latent_shape, spatial_patch_size, temporal_patch_size
-                )
-
-                if (
-                    target_count is not None
-                    and 0 < target_count < x.shape[1]
-                    and tokens_per_frame > 0
-                ):
-                    ref_count = x.shape[1] - target_count
-                    if ref_count > 0 and ref_count % tokens_per_frame == 0:
-                        ref_latent_frames = ref_count // tokens_per_frame
-
-                        # 仅收集 background 的 ref latent 索引（不收集 subjects）
-                        # subjects 的视觉特征由 attn2 (marker_relay) + relay_mask 控制，
-                        # attn1 全帧 boost subjects 会导致跨段污染
-                        # 复用 _build_slot_ref_indices_from_target_latent 避免索引计算重复
-                        all_ref_indices = []
-                        if pointer_config.get("include_background", True):
-                            ref_indices = _build_slot_ref_indices_from_target_latent(
-                                msr_info,
-                                "background",
-                                seq=x.shape[1],
-                                device=x.device,
-                                target_latent_shape=latent_shape,
-                                spatial_patch_size=spatial_patch_size,
-                                temporal_patch_size=temporal_patch_size,
-                                max_ref_frames=pointer_config.get("max_ref_frames", 2),
-                            )
-                            if ref_indices is not None and ref_indices.numel() > 0:
-                                all_ref_indices = ref_indices.tolist()
-
-                        if all_ref_indices:
-                            ref_tensor = torch.as_tensor(
-                                sorted(set(all_ref_indices)),
-                                device=x.device, dtype=torch.long,
-                            )
-                            positive_mask = _positive_batch_mask(
-                                transformer_options, x.shape[0], x.device
-                            )
-                            x = x.clone()
-                            # 构建 per-batch boost factor：正向批次应用 boost，负向批次不变。
-                            # 相比 V3 的全批次统一 boost，此处适配本项目更高的
-                            # boost_strength(0.2 vs V3 默认 0.05)，避免削弱 CFG 区分度。
-                            # 显式赋值而非 *=，避免混合布尔+整数高级索引的原地修改歧义。
-                            if positive_mask is not None:
-                                factor = torch.ones(
-                                    x.shape[0], 1, 1, device=x.device, dtype=x.dtype,
-                                )
-                                factor[positive_mask] = 1.0 + boost_strength
-                                x[:, ref_tensor, :] = x[:, ref_tensor, :] * factor
-                            else:
-                                x[:, ref_tensor, :] = x[:, ref_tensor, :] * (1.0 + boost_strength)
-
-        return underlying(
-            x, context=context, mask=mask, pe=pe, k_pe=k_pe,
-            transformer_options=transformer_options,
-        )
-
-    return wrapped
-
-
-def _parse_yuan_map_config(msr_info, config_str):
-    role_order = []
-    role_descriptions = {}
-    background_role = None
-    other_lines = []
-
-    bg_keywords = ("背景", "场景", "bg", "background", "environment", "scene")
-    pic_num_pattern = re.compile(r'^@图\s*(\d+)$', re.IGNORECASE)
-
-    # 按角色边界分割：逗号+@ 或换行，不破坏描述内的逗号
-    lines = re.split(r'[，,]\s*(?=@)|\n', config_str)
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r'@(\S+?)\s*[=:：]\s*(.+)', line)
-        if m:
-            role_name = "@" + m.group(1).strip()
-            desc = m.group(2).strip()
-            role_order.append(role_name)
-            role_descriptions[role_name] = desc
-            role_lower = role_name.lower()
-            if any(kw in role_lower for kw in [kw.lower() for kw in bg_keywords]):
-                background_role = role_name
-        else:
-            other_lines.append(line)
-
-    subjects = msr_info.get("subjects") or []
-    subject_slots = []
-    for item in subjects:
-        if isinstance(item, dict) and "slot" in item:
-            subject_slots.append(str(item["slot"]))
-
-    role_slots = {}
-    used_slots = set()
-    numeric_roles = []
-    custom_roles = []
-
-    for role_name in role_order:
-        if role_name == background_role:
-            continue
-        pic_match = pic_num_pattern.match(role_name)
-        if pic_match:
-            slot_num = pic_match.group(1)
-            numeric_roles.append((role_name, slot_num))
-        else:
-            custom_roles.append(role_name)
-
-    for role_name, slot_num in numeric_roles:
-        if slot_num in subject_slots and slot_num not in used_slots:
-            role_slots[slot_num] = role_name
-            used_slots.add(slot_num)
-            log.info("[Yuan CLIP Timeline/MSR] @图%s 按数字匹配到 slot=%s", slot_num, slot_num)
-        else:
-            log.warning("[Yuan CLIP Timeline/MSR] @图%s 对应的 slot=%s 不存在或已被占用，将尝试按顺序分配", slot_num, slot_num)
-            custom_roles.append(role_name)
-
-    subject_idx = 0
-    for role_name in custom_roles:
-        while subject_idx < len(subject_slots) and subject_slots[subject_idx] in used_slots:
-            subject_idx += 1
-        if subject_idx < len(subject_slots):
-            slot = subject_slots[subject_idx]
-            role_slots[slot] = role_name
-            used_slots.add(slot)
-            log.info("[Yuan CLIP Timeline/MSR] 自定义角色 %s 按顺序匹配到 slot=%s", role_name, slot)
-            subject_idx += 1
-        else:
-            log.warning("[Yuan CLIP Timeline/MSR] 自定义角色 %s 无可用 slot，绑定被跳过", role_name)
-
-    log.info("[Yuan CLIP Timeline/MSR] 角色-slot映射结果: %s", role_slots)
-    return role_descriptions, role_slots, background_role, other_lines
-
-
-def _split_local_prompts(local_prompts):
-    if "|" in local_prompts:
-        return [p.strip() for p in local_prompts.split("|") if p.strip()]
-    return [p.strip() for p in local_prompts.splitlines() if p.strip()]
-
-
-# ==============================================================================
 # LTXV 空潜空间自动生成（video / audio 原理一致：零张量 + type 标记，由采样器加噪去噪）
 # ==============================================================================
 
@@ -1146,10 +1136,6 @@ def _auto_generate_latent(width, height, length_frames):
     samples = torch.zeros(
         [1, 128, latent_t, h // 32, w // 32],
         device=comfy.model_management.intermediate_device(),
-    )
-    log.info(
-        "[Yuan CLIP Timeline] 自动生成视频潜空间: %dx%d, %d 像素帧 (%d 潜空间帧)",
-        w, h, length_frames, latent_t,
     )
     return {"samples": samples}
 
@@ -1167,10 +1153,6 @@ def _auto_generate_audio_latent(audio_vae, length_frames, frame_rate):
     samples = torch.zeros(
         (1, z_channels, num_audio_latents, audio_freq),
         device=comfy.model_management.intermediate_device(),
-    )
-    log.info(
-        "[Yuan CLIP Timeline] 自动生成音频潜空间: video=%d 像素帧 (fps=%.1f), audio=%d latents, ch=%d, freq=%d",
-        length_frames, frame_rate, num_audio_latents, z_channels, audio_freq,
     )
     return {"samples": samples, "type": "audio"}
 
@@ -1204,18 +1186,9 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
     raw_tokenizer = get_raw_tokenizer(clip)
     full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
 
-    log.info("[Yuan CLIP Timeline] 全局: tokens [0:%d] (%d tokens)", token_ranges[0][0], token_ranges[0][0])
-    for i, (s, e) in enumerate(token_ranges):
-        log.info("[Yuan CLIP Timeline] 段 %d: tokens [%d:%d] (%d tokens)", i, s, e, e - s)
-
     conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
 
     effective_lengths = distribute_segment_lengths(len(locals_list), latent_frames, parsed_lengths)
-
-    log.info(
-        "[Yuan CLIP Timeline] 潜空间: %d 帧, %d tokens/帧, 段: %s",
-        latent_frames, tokens_per_frame, effective_lengths,
-    )
 
     q_token_idx = build_segments(token_ranges, effective_lengths, epsilon)
     mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
@@ -1223,327 +1196,95 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
     patched = model.clone()
     apply_patches(patched, mask_fn)
 
-    return patched, conditioning
+    return patched, conditioning, effective_lengths
 
 
-def _encode_relay_with_msr(model, clip, latent, msr_info, global_prompt, local_prompts, segment_lengths, epsilon, binding_strength=0.35):
-    """基于 msr_info 的 @角色 Prompt Relay 编码（与 YuanNode 功能一致）。
-    global_prompt 中使用 @图1=描述、@背景=描述 格式定义角色。"""
-    if not isinstance(msr_info, dict):
-        raise ValueError("Yuan CLIP Timeline: msr_info must be a dict")
+# ==============================================================================
+# @图X 角色解析：从 global_prompt 提取 @图X=描述 定义
+# ==============================================================================
 
-    role_descriptions, role_slots, background_role, other_lines = _parse_yuan_map_config(msr_info, global_prompt)
-    if not role_descriptions and not background_role:
-        raise ValueError("Yuan CLIP Timeline: global_prompt 中未找到有效的 @角色 定义")
+_MSR_CHAR_PATTERN = re.compile(r'^@图(\d+)\s*[=：:]\s*(.+)')
 
-    # 从 @角色定义构建全局提示词
-    # role_descriptions 已包含 background_role（_parse_yuan_map_config 将 @背景 也加入 role_order），
-    # 无需额外 append 背景描述，否则描述出现两次，浪费 CLIP token
-    global_prompt_parts = []
-    for role_name, desc in role_descriptions.items():
-        global_prompt_parts.append(f"{role_name}是{desc}")
-    global_prompt = "。".join(global_prompt_parts) + ("。" if global_prompt_parts else "")
+# @图X=描述 行保留在 global_prompt 中，作为角色定义 + token 标记。
+# K/V 视觉特征注入：@图X 在文本中的 token 位置被标记，注入对应主体参考帧的 K/V。
 
-    # 追加非角色行（风格、环境音效等描述）
-    if other_lines:
-        global_prompt += "。" + "。".join(other_lines)
 
-    locals_list = _split_local_prompts(local_prompts.strip())
-    if not locals_list:
-        raise ValueError("Yuan CLIP Timeline: local_prompts 不能为空，使用 | 或换行分隔段落")
+def _parse_msr_characters(global_prompt: str) -> tuple:
+    """解析 global_prompt 中的 @图X=描述 行。
 
-    patch_size, temporal_stride = detect_model_type(model)
+    返回:
+        char_map: dict, {"@图1": "描述1", "@图2": "描述2", ...}
+        char_list: list of dict, [{"tag": "@图1"}, ...]
+    """
+    char_map = {}
+    char_list = []
+    if not global_prompt:
+        return char_map, char_list
 
-    samples = latent["samples"]
-    latent_shape = tuple(samples.shape)
-    latent_frames = samples.shape[2]
-    tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
-
-    raw_tokenizer = get_raw_tokenizer(clip)
-
-    # 构建 @角色 标记规格
-    # exact_markers: 用于global区域搜索，必须是带@前缀或较长的标记，避免子串误匹配
-    # loose_markers: 用于local区域搜索，额外包含短别名（如"图X"），方便用户在段落中不带@引用
-    marker_specs = {}
-    for slot, role_name in role_slots.items():
-        marker_name = role_name.lstrip("@")
-        exact_markers = [role_name]
-        loose_markers = [role_name, marker_name]
-        m = re.match(r'图\s*(\d+)', marker_name)
+    for line in global_prompt.split("\n"):
+        m = _MSR_CHAR_PATTERN.match(line.strip())
         if m:
-            num = m.group(1)
-            exact_markers.extend([f"参考图{num}", f"pic{num}"])
-            loose_markers.extend([f"参考图{num}", f"pic{num}", f"图{num}"])
-        seen_exact = set()
-        seen_loose = set()
-        marker_specs[slot] = {
-            "exact": [m for m in exact_markers if not (m in seen_exact or seen_exact.add(m))],
-            "loose": [m for m in loose_markers if not (m in seen_loose or seen_loose.add(m))],
-        }
-    if background_role:
-        bg_marker_name = background_role.lstrip("@")
-        bg_exact = [background_role, "bg", "background"]
-        bg_loose = [background_role, bg_marker_name, "bg", "background", "背景", "场景"]
-        seen_exact = set()
-        seen_loose = set()
-        marker_specs["background"] = {
-            "exact": [m for m in bg_exact if not (m in seen_exact or seen_exact.add(m))],
-            "loose": [m for m in bg_loose if not (m in seen_loose or seen_loose.add(m))],
-        }
+            tag = f"@图{m.group(1)}"
+            desc = m.group(2).strip()
+            char_map[tag] = desc
+            char_list.append({"tag": tag})
 
-    # 补充 msr_info.subjects 中存在、但 global_prompt 未定义 @图X=描述 的 slot
-    # 这些 slot 仍可能在 local_prompts 中以 @图X 形式出现，需要为其构建 marker_specs
-    # 否则 local 中的 @图3 等标记无法被识别，导致该主体视觉特征完全不注入
-    subjects_in_msr = msr_info.get("subjects") or []
-    for item in subjects_in_msr:
-        if not isinstance(item, dict):
-            continue
-        slot = str(item.get("slot", ""))
-        if not slot or slot in marker_specs:
-            continue
-        # 用户未在 global_prompt 中定义此 slot，用默认名称 @图{slot} 构建
-        default_role = f"@图{slot}"
-        default_name = default_role.lstrip("@")
-        default_exact = [default_role, f"参考图{slot}", f"pic{slot}"]
-        default_loose = [default_role, default_name, f"参考图{slot}", f"pic{slot}", f"图{slot}"]
-        seen_exact = set()
-        seen_loose = set()
-        marker_specs[slot] = {
-            "exact": [m for m in default_exact if not (m in seen_exact or seen_exact.add(m))],
-            "loose": [m for m in default_loose if not (m in seen_loose or seen_loose.add(m))],
-        }
-        log.info(
-            "[Yuan CLIP Timeline/MSR] slot=%s 未在 global_prompt 中定义，使用默认标记 %s "
-            "（仅 local 绑定，受时间惩罚）",
-            slot, default_role,
-        )
+    return char_map, char_list
 
-    full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
-    global_token_count = token_ranges[0][0] if token_ranges else 0
-    total_prompt_tokens = token_ranges[-1][1] if token_ranges else 0
 
-    log.info("[Yuan CLIP Timeline/MSR] 全局: tokens [0:%d] (%d tokens)", global_token_count, global_token_count)
-    for i, (s, e) in enumerate(token_ranges):
-        log.info("[Yuan CLIP Timeline/MSR] 段 %d: tokens [%d:%d] (%d tokens)", i, s, e, e - s)
-    log.info(
-        "[Yuan CLIP Timeline/MSR] full_prompt 总token数=%d (global=%d + local=%d)",
-        total_prompt_tokens, global_token_count, total_prompt_tokens - global_token_count,
-    )
+def _generate_short_alias(desc: str, max_chars: int = 10) -> str:
+    """从角色描述中提取简短别名，用于后续 @图X 引用时节省 CLIP token。
 
-    conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
+    取前 max_chars 个字符，在标点处截断，确保别名简短且具有辨识度。
+    例如 "亚洲中年男性，背头，金丝眼镜" → "亚洲中年男性，背头"
+    """
+    short = desc[:max_chars]
+    for sep in ['，', '、', '。', '；', '：', ',']:
+        idx = short.rfind(sep)
+        if idx > max_chars // 2:
+            short = short[:idx]
+            break
+    return short.strip()
 
-    parsed_lengths = None
-    if segment_lengths.strip():
-        pixel_lengths = [int(x.strip()) for x in segment_lengths.split(",") if x.strip()]
-        parsed_lengths = _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames)
-    effective_lengths = distribute_segment_lengths(len(locals_list), latent_frames, parsed_lengths)
 
-    log.info(
-        "[Yuan CLIP Timeline/MSR] 潜空间: %d 帧, %d tokens/帧, 段: %s",
-        latent_frames, tokens_per_frame, effective_lengths,
-    )
+def _escape_repl(text: str) -> str:
+    """转义 re.sub 替换字符串中的反斜杠，避免描述文本含 \\ 时被当作组引用。"""
+    return text.replace('\\', '\\\\')
 
-    # all_markers: 所有 loose 标记的合并去重列表
-    # 用途1: stop_markers 防止跨标记扩展
-    # 用途2: 扫描 local 段内 marker token 范围（用于 build_segments 段内独立 midpoint）
-    all_markers = []
-    for spec in marker_specs.values():
-        all_markers.extend(spec["loose"])
-    all_markers = sorted(set(all_markers), key=len, reverse=True)
 
-    # 收集 local 段内的 @主体 marker token 范围，用于 build_segments 为段内每个 @主体构建独立时间窗口
-    local_marker_ranges = []
-    if global_token_count < total_prompt_tokens and all_markers:
-        all_ranges = _find_marker_phrase_token_ranges(
-            raw_tokenizer, full_prompt, all_markers,
-            stop_markers=all_markers,
-            phrase_extend_tokens=0,  # 不限制 token 数量，由逗号/句号标点控制停止
-            stop_at_punctuation=True,
-        )
-        local_marker_ranges = [
-            (s, e) for s, e in all_ranges if e > global_token_count
-        ]
+def _apply_msr_replacements(text: str, char_map: dict, force_short: bool = False, seen_tags: set = None) -> str:
+    """将文本中的 @图X 引用替换为角色描述。
 
-    # 计算 marker_token_indices（在 build_segments 之前，因为需要知道每个 slot 的 global token 索引）
-    # marker_token_indices: global + local 合并，用于 attn2 K/V 注入（所有 @图X 文本都绑定视觉特征）
-    # global_marker_indices: 仅 global，用于 segment_global_suppressions（只抑制 global，不抑制 local）
-    marker_token_indices = {}
-    global_marker_indices = {}
-    for slot, spec in marker_specs.items():
-        exact_markers = spec["exact"]
-        loose_markers = spec["loose"]
-        if not exact_markers and not loose_markers:
-            continue
-
-        global_indices = []
-        if global_token_count > 0:
-            global_indices = _find_marker_phrase_token_indices(
-                raw_tokenizer, full_prompt, exact_markers,
-                stop_markers=all_markers,
-                phrase_extend_tokens=0,  # 不限制 token 数量，由逗号/句号标点控制停止
-                stop_at_punctuation=True,
-            )
-            global_indices = sorted(set(idx for idx in global_indices if 0 <= idx < global_token_count))
-
-        # 按段扫描 local_indices，每段每主体只保留第一次出现的 token 范围
-        # 设计理由：
-        #   - @图X 在同一段内出现多次（如"@图4 盯着@图1，@图4 说：..."），
-        #     视觉特征已通过第一次出现注入绑定，后续 @图4 只是文字引用，无需重复注入
-        #   - 避免段内某个主体 token 数量过多导致 softmax 失衡
-        #   - 段间平衡由 relay_mask 时间惩罚自然控制（每段只看到对应段的 token）
-        local_indices = []
-        if loose_markers and token_ranges:
-            # 对 full_prompt 调用 ranges 版本，得到该 slot 在 local 区域的所有 token 范围
-            all_local_ranges = _find_marker_phrase_token_ranges(
-                raw_tokenizer, full_prompt, loose_markers,
-                stop_markers=all_markers,
-                phrase_extend_tokens=0,  # 不限制 token 数量，由逗号/句号标点控制停止
-                stop_at_punctuation=True,
-            )
-            # 过滤出 local 区域（token >= global_token_count）的范围
-            all_local_ranges = [
-                (s, e) for s, e in all_local_ranges
-                if s >= global_token_count
-            ]
-            # 按 token 起始位置排序
-            all_local_ranges.sort(key=lambda r: r[0])
-
-            # 遍历段，每段只保留该 slot 的第一次出现
-            # 注：token_ranges 只包含 local 段（不包含 global 段）
-            # global 段的 token 范围是 [0, global_token_count)
-            for seg_start, seg_end in token_ranges:
-                # 找到落在该段内的第一个范围（按 token 起始位置判断）
-                # 注：phrase_extend_tokens 扩展可能跨段，但只按 tok_start 判断归属段
-                for tok_start, tok_end in all_local_ranges:
-                    if tok_start >= seg_start and tok_start < seg_end:
-                        # 这是该 slot 在该段内的第一次出现，收集该范围的 token
-                        local_indices.extend(range(tok_start, tok_end))
-                        break  # 每段只保留第一次出现
-
-            local_indices = sorted(set(local_indices))
-
-        # 合并 global + local：确保 local 中的 @图X（动作、台词）也获得视觉特征注入
-        # global token 全帧可见无时间惩罚；local token 受 relay_mask 时间惩罚控制段内可见性
-        combined_indices = sorted(set(global_indices + local_indices))
-        if combined_indices:
-            marker_token_indices[slot] = combined_indices
-        if global_indices:
-            global_marker_indices[slot] = global_indices
-
-        if global_indices and local_indices:
-            log.info(
-                "[Yuan CLIP Timeline/MSR] slot=%s 全局+局部标记绑定 (global=%d tokens 全帧可见, local=%d tokens 受时间惩罚), "
-                "exact=%s, loose=%s",
-                slot, len(global_indices), len(local_indices),
-                exact_markers, loose_markers,
-            )
-        elif global_indices:
-            log.info(
-                "[Yuan CLIP Timeline/MSR] slot=%s 使用全局标记绑定 (%d tokens, 无时间惩罚, 全帧可见), "
-                "exact=%s",
-                slot, len(global_indices), exact_markers,
-            )
-        elif local_indices:
-            log.info(
-                "[Yuan CLIP Timeline/MSR] slot=%s 使用局部标记绑定 (%d tokens, 受时间惩罚, 仅对应段可见), "
-                "loose=%s",
-                slot, len(local_indices), loose_markers,
-            )
+    - 按数字倒序排序避免子串误匹配（@图1 误匹配 @图10 前缀）。
+    - 正则带负向断言 @图X(?！\\d)，确保 @图1 不会匹配到 @图10 中。
+    - 首次出现使用完整描述，后续出现使用简短别名以节省 CLIP token。
+    - force_short=True 时全部使用简短别名（用于 CLIP 截断主动缓解）。
+    - seen_tags 非空时，已在 seen_tags 中的标签视为"已出现"，全部用简短别名；
+      本函数会更新 seen_tags（首次出现的标签会被加入）。
+    """
+    if not text or not char_map:
+        return text
+    if seen_tags is None:
+        seen_tags = set()
+    modified = text
+    sorted_items = sorted(char_map.items(),
+                         key=lambda kv: int(kv[0][2:]),
+                         reverse=True)
+    for tag, desc in sorted_items:
+        short_alias = _generate_short_alias(desc)
+        num = tag[2:]
+        pattern = re.compile(rf'@图{num}(?!\d)')
+        if force_short:
+            modified = pattern.sub(_escape_repl(short_alias), modified)
+        elif tag in seen_tags:
+            # 该标签已在之前的文本中出现过，全部用简短别名
+            modified = pattern.sub(_escape_repl(short_alias), modified)
         else:
-            log.warning("[Yuan CLIP Timeline/MSR] slot=%s 未找到任何标记 token (exact=%s, loose=%s)，该主体无法绑定",
-                        slot, exact_markers, loose_markers)
-
-    # 构建每段需抑制的 global marker token 索引
-    # 对于某段没出现的 @主体，其 global marker 被抑制，防止镜头切换时不该出现的主体特征泄露
-    # 注意：只抑制 global_marker_indices，不抑制 local_indices
-    # local token 的时间惩罚由 relay_mask（build_segments 的 marker_token_ranges）控制
-    segment_global_suppressions = []
-    for seg_idx, local_text in enumerate(locals_list):
-        local_folded = local_text.casefold()
-        # 找到该段出现的 slot
-        appeared_slots = set()
-        for slot, spec in marker_specs.items():
-            if slot == "background":
-                continue  # 背景全段可见，不抑制
-            # 用该 slot 的 exact + loose 标记检查是否出现在段文本中
-            for marker in spec["exact"] + spec["loose"]:
-                if marker.casefold() in local_folded:
-                    appeared_slots.add(slot)
-                    break
-        # 该段需抑制的 global token indices = 所有 slot 的 global indices - 出现在该段的 slot
-        suppressed_indices = []
-        for slot, indices in global_marker_indices.items():
-            if slot == "background":
-                continue
-            if slot not in appeared_slots and indices:
-                suppressed_indices.extend(indices)
-        if suppressed_indices:
-            suppressed_indices = sorted(set(suppressed_indices))
-            segment_global_suppressions.append(suppressed_indices)
-        else:
-            segment_global_suppressions.append(None)
-
-    q_token_idx = build_segments(
-        token_ranges, effective_lengths, epsilon,
-        marker_token_ranges=local_marker_ranges,
-        segment_global_suppressions=segment_global_suppressions,
-    )
-    relay_mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
-
-    log.info("[Yuan CLIP Timeline/MSR] 标记绑定汇总: %s", {k: len(v) for k, v in marker_token_indices.items()})
-
-    if msr_info:
-        subjects = msr_info.get("subjects") or []
-        bg = msr_info.get("background") or {}
-        log.info(
-            "[Yuan CLIP Timeline/MSR] msr_info: ref_frames=%s, ref_latents=%s, subjects=%s, bg=%s",
-            msr_info.get("reference_frame_count"),
-            msr_info.get("reference_latent_count"),
-            [(s.get("slot"), s.get("frame_start"), s.get("frame_end"), s.get("latent_start"), s.get("latent_end")) for s in subjects],
-            (bg.get("frame_start"), bg.get("frame_end"), bg.get("latent_start"), bg.get("latent_end")),
-        )
-
-    patched = model.clone()
-
-    pointer_config = None
-    if marker_token_indices:
-        diffusion_model = patched.get_model_object("diffusion_model")
-        n_blocks = len(diffusion_model.transformer_blocks)
-        pointer_blocks = _parse_block_filter("8-47", n_blocks)
-        log.info("[Yuan CLIP Timeline/MSR] 模型 blocks=%d, pointer_blocks=%s", n_blocks, sorted(pointer_blocks)[:5])
-
-        # 动态计算每个主体最大参考latent帧数
-        # max_ref_frames = 每段最少latent帧 / 被@主体数量（取整）
-        # 例如：5段每段9帧，3个主体 → 9//3=3帧；4段每段12帧，4个主体 → 12//4=3帧
-        num_at_subjects = len(marker_token_indices) - (1 if "background" in marker_token_indices else 0)
-        per_segment_latent = min(effective_lengths) if effective_lengths else latent_frames
-        max_ref_frames = max(1, per_segment_latent // max(1, num_at_subjects))
-        log.info(
-            "[Yuan CLIP Timeline/MSR] 动态max_ref_frames=%d (每段%d latents / %d 主体)",
-            max_ref_frames, per_segment_latent, num_at_subjects,
-        )
-
-        pointer_config = {
-            "marker_token_indices": marker_token_indices,
-            "msr_info": msr_info,
-            "latent_shape": latent_shape,
-            "pointer_blocks": pointer_blocks,
-            "spatial_patch_size": 1,
-            "temporal_patch_size": 1,
-            "binding_strength": binding_strength,
-            "preserve_text_strength": 1.0,
-            "normalize_ref_summary": True,
-            "max_ref_frames": max_ref_frames,
-            # local token 注入策略：按段扫描，每段每主体只保留第一次出现
-            # 已在 local_indices 收集阶段实现，无需额外参数控制
-            # attn1 latent boost 参数（参考 licon-MSR-V3 LTXMSRReferenceTokenBooster）
-            "latent_boost_strength": 0.2,    # K boost 强度，0 表示禁用
-            "include_background": True,      # 是否包含背景 latent token
-        }
-
-    apply_patches(patched, relay_mask_fn, pointer_config)
-
-    return patched, conditioning
+            # 第一次出现用完整描述，后续用简短别名
+            modified = pattern.sub(_escape_repl(desc), modified, count=1)
+            modified = pattern.sub(_escape_repl(short_alias), modified)
+            seen_tags.add(tag)
+    return modified
 
 
 # ==============================================================================
@@ -1557,73 +1298,147 @@ class YuanCLIPTimeline:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL", {"tooltip": "要补丁的扩散模型"}),
-                "clip": ("CLIP", {"tooltip": "用于编码提示词的 CLIP 模型"}),
-                "audio_vae": ("VAE", {"tooltip": "Audio VAE，用于生成音频潜空间。video latent 与 audio latent 使用相同的帧数/帧率，保证对齐。"}),
-                "global_prompt": ("STRING", {
+                "模型": ("MODEL", {"tooltip": "要补丁的扩散模型"}),
+                "CLIP模型": ("CLIP", {"tooltip": "用于编码提示词的 CLIP 模型"}),
+                "音频VAE": ("VAE", {"tooltip": "Audio VAE，用于生成音频潜空间。video latent 与 audio latent 使用相同的帧数/帧率，保证对齐。"}),
+                "全局提示词": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "贯穿整个视频的全局提示词。用于锚定持久的角色、物体和场景上下文。\n连接 msr_info 时，在此用 @图1=描述、@图2=描述、@背景=描述 定义角色，每行一条。\n@图X 格式会按数字X自动匹配第X张参考图像（不依赖书写顺序）；也支持自定义名称（如@张三=描述），自定义名称按书写顺序依次匹配未占用的参考图像。"
+                    "tooltip": "贯穿整个视频的全局提示词。用于锚定持久的角色、物体和场景上下文。"
+                               "@图X=描述 格式的行作为角色定义，同时在 CLIP token 中标记 @图X 位置，"
+                               "由 K/V 视觉特征注入机制把对应 motionSegments 参考帧的视觉特征注入到这些 token 的 K/V。"
+                               "示例：\n场景描述\n@图1=角色描述\n@图2=另一角色描述"
                 }),
-                "max_frames": ("INT", {
+                "最大帧数": ("INT", {
                     "default": 129, "min": 1, "max": 10000, "step": 1,
                     "tooltip": "像素空间总帧数。仅用于编辑器的视觉缩放比例，实际帧数仍从潜空间读取。"
                 }),
-                "timeline_data": ("STRING", {
+                "时间轴数据": ("STRING", {
                     "default": "",
                     "tooltip": "时间轴编辑器的 JSON 状态（自动管理，请勿手动编辑）。"
                 }),
-                "local_prompts": ("STRING", {
+                "段落提示词": ("STRING", {
                     "multiline": True, "default": "",
                     "tooltip": "由时间轴编辑器自动填充。"
                 }),
-                "segment_lengths": ("STRING", {
+                "段落长度": ("STRING", {
                     "default": "",
                     "tooltip": "由时间轴编辑器自动填充（像素空间帧数）。"
                 }),
-                "epsilon": ("FLOAT", {
+                "衰减参数": ("FLOAT", {
                     "default": 1e-3, "min": 1e-6, "max": 0.99, "step": 1e-4,
                     "tooltip": "惩罚衰减参数。低于约 0.1 的值均产生锐利边界（论文默认 0.001）。"
                                "如需更柔和的过渡，尝试 0.5 或更高值。"
                 }),
-                "fps": ("FLOAT", {
+                "帧率": ("FLOAT", {
                     "default": 24.0, "min": 0.1, "max": 240.0, "step": 0.1,
-                    "tooltip": "每秒帧数 — 仅在 time_units 设为'seconds'时影响时间轴编辑器的显示。"
+                    "tooltip": "每秒帧数 — 仅在 时间单位 设为'seconds'时影响时间轴编辑器的显示。"
                 }),
-                "time_units": (["frames", "seconds"], {
+                "时间单位": (["frames", "seconds"], {
                     "default": "frames",
                     "tooltip": "以帧或秒显示标尺、段范围、长度输入和总数。内部存储始终为像素空间帧。"
                 }),
-                "width": ("INT", {
+                "宽度": ("INT", {
                     "default": 768, "min": 32, "max": 8192, "step": 32,
-                    "tooltip": "自动生成潜空间的目标宽度（未连接 latent 输入时生效）。"
+                    "tooltip": "自动生成潜空间的目标宽度（未连接 潜空间 输入时生效）。"
                 }),
-                "height": ("INT", {
+                "高度": ("INT", {
                     "default": 512, "min": 32, "max": 8192, "step": 32,
-                    "tooltip": "自动生成潜空间的目标高度（未连接 latent 输入时生效）。"
+                    "tooltip": "自动生成潜空间的目标高度（未连接 潜空间 输入时生效）。"
                 }),
             },
             "optional": {
-                "latent": ("LATENT", {"tooltip": "潜空间视频 — 从形状读取尺寸。不连接时自动生成 LTXV 空潜空间。"}),
-                "text_input": ("STRING", {
+                "潜空间": ("LATENT", {"tooltip": "潜空间视频 — 从形状读取尺寸。不连接时自动生成 LTXV 空潜空间。"}),
+                "文本输入": ("STRING", {
                     "multiline": True, "default": "",
                     "tooltip": "按行输入的提示词文本，支持两种模式：\n1. 时间格式（如 \"0-3s 提示词A\"），按指定秒数动态分配帧长\n2. 纯文本行，自动均分到各段落\n连接上游文本输出节点（如 Yuan TXT Splitter）可批量填充。"
                 }),
-                "prompt_lock": ("BOOLEAN", {
+                "提示词锁定": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "开启：预览模式：提示词只读不可编辑。\n关闭：各段落可自由编辑，不受 text_input 影响。"
+                    "tooltip": "开启：预览模式：提示词只读不可编辑。\n关闭：各段落可自由编辑，不受 文本输入 影响。"
                 }),
-                "msr_info": ("MSR_INFO", {
-                    "tooltip": "连接多帧参考节点的 msr_info 输出。连接后启用 @角色标记绑定功能：\nglobal_prompt 中用 @图1=描述、@背景=描述 定义角色，\nlocal_prompts/text_input 中用 @图1、@图2 等引用角色，\n模型自动将标记 token 绑定到参考帧。"
+                # --- 多媒体引导（与下游 Yuan 引导注入节点配合） ---
+                "引导强度": ("STRING", {
+                    "default": "",
+                    "tooltip": "从时间轴编辑器自动填充（图像分段的引导强度，逗号分隔）。"
                 }),
-                "binding_strength": ("FLOAT", {
-                    "default": 0.35, "min": 0.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "标记绑定强度。控制 @角色 token 与参考帧的绑定程度。\n值越高绑定越强，但过高可能导致伪影。仅在 msr_info 连接时生效。"
+                "起始帧": ("INT", {
+                    "default": 0, "min": 0, "max": 10000, "step": 1,
+                    "tooltip": "时间轴生成的起始帧。用于引导分段在生成区间内的裁剪偏移。"
+                }),
+                "自定义宽度": ("INT", {
+                    "default": 0, "min": 0, "max": 8192, "step": 1,
+                    "tooltip": "图像引导缩放的目标宽度。设为 0 则跟随 宽度。"
+                }),
+                "自定义高度": ("INT", {
+                    "default": 0, "min": 0, "max": 8192, "step": 1,
+                    "tooltip": "图像引导缩放的目标高度。设为 0 则跟随 高度。"
+                }),
+                "缩放方式": (["maintain aspect ratio", "stretch to fit", "pad", "pad green", "crop"], {
+                    "default": "maintain aspect ratio",
+                    "tooltip": "图像引导分段缩放至目标尺寸的方式。"
+                }),
+                "整除数": ("INT", {
+                    "default": 32, "min": 1, "max": 256, "step": 1,
+                    "tooltip": "将输出图像尺寸对齐到可被该数整除（如 LTX 为 32）。"
+                }),
+                "图像压缩": ("INT", {
+                    "default": 0, "min": 0, "max": 100, "step": 1,
+                    "tooltip": "对每张引导图像应用的 H.264 CRF 压缩。0 = 不压缩，值越高伪影越多。"
+                }),
+                "使用自定义音频": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "开启则使用时间轴音频，关闭则从零生成音频。"
+                }),
+                "使用自定义运动": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "开启则使用时间轴运动引导（IC-LoRA 视频分段），关闭则忽略。"
+                }),
+                "音频修复": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "是否用生成的音频对音轨中的空白间隙进行修复。"
+                }),
+                "覆盖音频": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "使用 IC-LoRA 视频的音频，而非使用音轨。"
+                }),
+                "段落图像": ("IMAGE", {
+                    "tooltip": "段落引导图像输入。支持单张或多张图像（batch）。\n"
+                               "按段落数量自动分配到对应段落：第1张→第1段、第2张→第2段……\n"
+                               "多出段落数量的图像将被截取，不作参考。\n"
+                               "连接后会覆盖编辑器中已上传的引导图。"
+                }),
+                "运动图像": ("IMAGE", {
+                    "tooltip": "IC-LoRA 轨道图像/视频输入。支持单张或多张图像（batch）。\n"
+                               "每张图像自动创建为一个静态段，帧数由 运动图像帧数 控制。\n"
+                               "连接后会覆盖编辑器中已有的运动段。"
+                }),
+                "运动图像帧数": ("INT", {
+                    "default": 16, "min": 8, "max": 32, "step": 8,
+                    "tooltip": "每张运动图像的帧数（8/16/24/32）。"
+                }),
+                "音频输入": ("AUDIO", {
+                    "tooltip": "音频输入端口。连接上游音频节点（如 LoadAudio）后，"
+                               "音频会自动作为一条音频段添加到时间轴音频轨道，按原始时长分配帧数。\n"
+                               "连接后会覆盖编辑器中已上传的音频段（仅在锁定状态下生效）。"
+                }),
+                # --- Ref Guidance：参考 cond 引导（在下游 Yuan 引导注入节点接管 attn2）---
+                "参考强度": ("FLOAT", {
+                    "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "K/V 视觉特征注入强度：把 motionSegments 参考帧的视觉特征注入到对应 @图X token 的 K/V。"
+                               "k[marker] = k[marker]*(1-alpha) + ref_k*alpha。0=不注入。"
+                               "建议 0.3-0.5，确保主体视觉特征一致性。"
+                }),
+                "参考阈值": ("FLOAT", {
+                    "default": 5.0, "min": 0.0, "max": 10.0, "step": 0.001,
+                    "tooltip": "段内主体抑制：基于 motionSegments 帧范围，段外帧的 @图X token K/V 注入强度衰减系数。"
+                               "越大越宽松（段外衰减弱），越小越严格（段外强抑制）。"
                 }),
             },
         }
 
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "LATENT", "LATENT")
-    RETURN_NAMES = ("model", "positive", "video_latent", "audio_latent")
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "LATENT", "LATENT", GuideData, MotionGuideData, "FLOAT", "AUDIO")
+    RETURN_NAMES = ("模型", "正向条件", "视频潜空间", "音频潜空间",
+                     "引导数据", "运动引导数据", "帧率", "音频")
     FUNCTION = "encode_timeline"
     CATEGORY = "Yuan Tool/CLIP"
 
@@ -1633,10 +1448,53 @@ class YuanCLIPTimeline:
         "#a07060", "#e377c2", "#7f7f7f", "#c4c447", "#3fbac4",
     ]
 
-    def encode_timeline(self, model, clip, audio_vae, global_prompt, max_frames, timeline_data,
-                        local_prompts, segment_lengths, epsilon, fps=24.0, time_units="frames",
-                        width=768, height=512, latent=None, text_input="", prompt_lock=True,
-                        msr_info=None, binding_strength=0.35):
+    def encode_timeline(self, 模型, CLIP模型, 音频VAE, 全局提示词, 最大帧数, 时间轴数据,
+                        段落提示词, 段落长度, 衰减参数, 帧率=24.0, 时间单位="frames",
+                        宽度=768, 高度=512, 潜空间=None, 文本输入="", 提示词锁定=True,
+                        引导强度="", 起始帧=0,
+                        自定义宽度=0, 自定义高度=0, 缩放方式="maintain aspect ratio",
+                        整除数=32, 图像压缩=0, 使用自定义音频=False,
+                        使用自定义运动=True, 音频修复=True, 覆盖音频=False,
+                        段落图像=None,
+                        运动图像=None,
+                        运动图像帧数=16,
+                        音频输入=None,
+                        参考强度=0.0,
+                        参考阈值=5.0):
+        # 中文参数名 → 英文别名（保持函数体内代码不变）
+        model = 模型
+        clip = CLIP模型
+        audio_vae = 音频VAE
+        global_prompt = 全局提示词
+        max_frames = 最大帧数
+        timeline_data = 时间轴数据
+        local_prompts = 段落提示词
+        segment_lengths = 段落长度
+        epsilon = 衰减参数
+        fps = 帧率
+        width = 宽度
+        height = 高度
+        latent = 潜空间
+        text_input = 文本输入
+        prompt_lock = 提示词锁定
+        guide_strength = 引导强度
+        start_frame = 起始帧
+        custom_width = 自定义宽度
+        custom_height = 自定义高度
+        resize_method = 缩放方式
+        divisible_by = 整除数
+        img_compression = 图像压缩
+        use_custom_audio = 使用自定义音频
+        use_custom_motion = 使用自定义运动
+        inpaint_audio = 音频修复
+        override_audio = 覆盖音频
+        segment_images = 段落图像
+        motion_images = 运动图像
+        motion_image_frames = 运动图像帧数
+        audio_input = 音频输入
+        ref_alpha = 参考强度
+        ref_tau = 参考阈值
+
         # --- 处理 text_input：仅在锁定模式下按行智能分配到 local_prompts 和 timeline_data ---
         if prompt_lock and text_input and text_input.strip():
             lines_raw = text_input.split("\n")
@@ -1667,15 +1525,12 @@ class YuanCLIPTimeline:
                 # --- 动态时长分布：按时间格式分配帧数 ---
                 lines_prompts = [p["prompt"] for p in parsed_time_lines]
                 local_prompts = " | ".join(lines_prompts)
-                log.info("[Yuan CLIP Timeline] text_input 提供 %d 行带时间格式的文本，按动态时长分配", len(parsed_time_lines))
 
                 # 从时间段中读取最大结束时间，自动计算 max_frames
                 max_end_sec = max(p["end_sec"] for p in parsed_time_lines)
                 raw_max = int(max_end_sec * fps) + 1
                 # 对齐 LTXV 时间步长 (8): 实际输出帧 = (max_frames//8)*8+1，确保 max_frames 与此一致
                 max_frames = ((raw_max - 2) // 8 + 1) * 8 + 1
-                log.info("[Yuan CLIP Timeline] 最大结束时间 %.1f秒, fps %.1f, 自动计算 max_frames=%d (原始值%d, 对齐 LTXV stride 8)",
-                         max_end_sec, fps, max_frames, raw_max)
 
                 # 将秒数转换为帧数
                 frame_allocations = []
@@ -1689,14 +1544,10 @@ class YuanCLIPTimeline:
                     # 时间轴已满：从末尾段落借用空间
                     excess = total_frames - max_frames
                     frame_allocations[-1] = max(1, frame_allocations[-1] - excess)
-                    log.info("[Yuan CLIP Timeline] 总时长 (%d帧) 超出 max_frames (%d帧)，末尾段落缩减 %d 帧",
-                             total_frames, max_frames, excess)
                 elif total_frames < max_frames:
                     # 末尾段落未填满：填充剩余时间段
                     leftover = max_frames - total_frames
                     frame_allocations[-1] += leftover
-                    log.info("[Yuan CLIP Timeline] 总时长 (%d帧) 未满 max_frames (%d帧)，末尾段落扩展 %d 帧",
-                             total_frames, max_frames, leftover)
 
                 # 构建 timeline_data
                 new_segs = []
@@ -1716,7 +1567,6 @@ class YuanCLIPTimeline:
                 lines = [line.strip() for line in lines_raw if line.strip()]
                 if lines:
                     local_prompts = " | ".join(lines)
-                    log.info("[Yuan CLIP Timeline] text_input 提供 %d 行文本，已均分到段落", len(lines))
 
                     try:
                         td = json.loads(timeline_data) if timeline_data and timeline_data.strip() else None
@@ -1755,27 +1605,322 @@ class YuanCLIPTimeline:
                     except (json.JSONDecodeError, ValueError, KeyError):
                         pass
 
+        # --- 解析 timeline_data ---
+        try:
+            tdata = json.loads(timeline_data) if timeline_data else {}
+        except Exception:
+            tdata = {}
+
+        # global_prompt 为空时从 timeline_data 全局提示词面板回填
+        if not global_prompt:
+            global_prompt = tdata.get("global_prompt", "")
+
+        # --- 处理 segment_images 端口：将图像 batch 按段数分配到对应段落 ---
+        # 第1张→第1段、第2张→第2段……多出段落数量的图像忽略，不足的段落保持原状
+        # 锁定状态下拒绝上游数据，完全以时间轴编辑器内的数据为准
+        if segment_images is not None and prompt_lock:
+            try:
+                segments = tdata.get("segments", [])
+                if segments:
+                    # 确保 tensor 为 4D [B,H,W,3]
+                    if segment_images.dim() == 3:
+                        segment_images = segment_images.unsqueeze(0)
+                    batch_size = segment_images.shape[0]
+                    # 段落数量与图像数量取最小值，多出的图像忽略
+                    alloc_count = min(len(segments), batch_size)
+                    upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
+                    os.makedirs(upload_dir, exist_ok=True)
+                    ts = int(time.time() * 1000)
+                    for i in range(alloc_count):
+                        img_tensor = segment_images[i].clamp(0, 1).cpu()
+                        arr = (img_tensor.numpy() * 255.0).astype(np.uint8)
+                        pil_img = Image.fromarray(arr, mode="RGB")
+                        fname = f"segimg_{ts}_{i}.png"
+                        fpath = os.path.join(upload_dir, fname)
+                        pil_img.save(fpath, format="PNG")
+                        segments[i]["imageFile"] = f"{_TIMELINE_UPLOAD_SUBDIR}/{fname}"
+                        segments[i]["imageB64"] = ""  # 清空 base64，统一使用文件路径
+                        segments[i]["type"] = "image"
+                    # 重新序列化 timeline_data 以保持下游一致性
+                    timeline_data = json.dumps(tdata)
+                    # 通过 WebSocket 通知前端刷新时间轴 UI（比 executed 事件更可靠）
+                    try:
+                        PromptServer.instance.send_sync("yuan_clip_seg_images_updated", {
+                            "files": [{"file": f"segimg_{ts}_{i}.png", "index": i} for i in range(alloc_count)],
+                            "timestamp": ts,
+                        })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # --- 处理 motion_images 端口：将图像/视频合并为 IC-LoRA 轨道段 ---
+        # 所有图像合并为单个段，携带 frameFiles 供 Guide 节点解码为连续帧序列
+        # 锁定状态下拒绝上游数据，完全以时间轴编辑器内的数据为准
+        if motion_images is not None and prompt_lock:
+            try:
+                # 每张运动图像的帧数由 运动图像帧数 参数控制（8/16/24/32）
+                seg_frame_len = max(8, min(32, int(motion_image_frames)))
+                # 确保 tensor 为 4D [B,H,W,3]
+                if motion_images.dim() == 3:
+                    motion_images = motion_images.unsqueeze(0)
+                batch_size = motion_images.shape[0]
+                upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
+                os.makedirs(upload_dir, exist_ok=True)
+                ts = int(time.time() * 1000)
+                new_motion_segs = []
+
+                # 保存所有图像
+                saved_refs = []
+                for i in range(batch_size):
+                    img_tensor = motion_images[i].clamp(0, 1).cpu()
+                    arr = (img_tensor.numpy() * 255.0).astype(np.uint8)
+                    pil_img = Image.fromarray(arr, mode="RGB")
+                    fname = f"motion_seg_{ts}_{i}.png"
+                    fpath = os.path.join(upload_dir, fname)
+                    pil_img.save(fpath, format="PNG")
+                    saved_refs.append(f"{_TIMELINE_UPLOAD_SUBDIR}/{fname}")
+
+                # 每张图像创建一个独立的运动段，连续排列
+                # 前端显示为一段段，后端 Guide 节点 B 分支会自动合并相邻静态图像段为合成视频序列处理
+                # 描述字段按顺序对应 global_prompt 中的 @图X=描述 行
+                char_map, char_list = _parse_msr_characters(global_prompt)
+                current_start = 0
+                for i, ref in enumerate(saved_refs):
+                    seg_len = min(seg_frame_len, max_frames - current_start)
+                    if seg_len <= 0:
+                        break
+                    # 描述：按顺序对应 @图X=描述；无对应角色定义时为空
+                    char_desc = ""
+                    if i < len(char_list):
+                        tag = char_list[i].get("tag")
+                        if tag and tag in char_map:
+                            char_desc = char_map[tag]
+                    seg = {
+                        "videoFile": ref,
+                        "frameFiles": [ref],
+                        "start": current_start,
+                        "length": seg_len,
+                        "trimStart": 0.0,
+                        "isStaticImage": True,
+                        "fileName": f"motion_seg_{ts}_{i}.png",
+                        "description": char_desc,
+                        "videoAttentionStrength": 0.65,
+                    }
+                    new_motion_segs.append(seg)
+                    current_start += seg_len
+
+                # 替换 motionSegments（连接端口后覆盖已有运动段）
+                tdata["motionSegments"] = new_motion_segs
+
+                timeline_data = json.dumps(tdata)
+                # 通过 WebSocket 通知前端刷新
+                try:
+                    PromptServer.instance.send_sync("yuan_clip_motion_images_updated", {
+                        "files": [{"file": f"motion_seg_{ts}_{i}.png", "index": i} for i in range(batch_size)],
+                        "count": batch_size,
+                        "frame_len": seg_frame_len,
+                    })
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # --- 处理 音频输入 端口：将上游 AUDIO 数据保存为音频文件并添加到音频轨道 ---
+        # 锁定状态下拒绝上游数据，完全以时间轴编辑器内的数据为准
+        if audio_input is not None and prompt_lock:
+            try:
+                waveform = audio_input.get("waveform") if isinstance(audio_input, dict) else None
+                sample_rate = audio_input.get("sample_rate") if isinstance(audio_input, dict) else None
+                if waveform is not None and sample_rate:
+                    # waveform: [B, C, N] 或 [C, N]，取第 0 batch
+                    if waveform.dim() == 3:
+                        wav_2d = waveform[0]
+                    elif waveform.dim() == 2:
+                        wav_2d = waveform
+                    else:
+                        wav_2d = None
+                    if wav_2d is not None:
+                        # 转为单声道 float32 [-1,1]，再转 int16 保存为 wav
+                        if wav_2d.shape[0] > 1:
+                            mono = wav_2d.mean(dim=0, keepdim=True)
+                        else:
+                            mono = wav_2d
+                        mono_np = mono.cpu().numpy()
+                        # 限制到 [-1,1] 后转 int16
+                        int16_np = np.clip(mono_np, -1.0, 1.0)
+                        int16_np = (int16_np * 32767.0).astype(np.int16)
+                        import wave
+                        upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
+                        os.makedirs(upload_dir, exist_ok=True)
+                        ts = int(time.time() * 1000)
+                        fname = f"audio_in_{ts}.wav"
+                        fpath = os.path.join(upload_dir, fname)
+                        with wave.open(fpath, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(int(sample_rate))
+                            wf.writeframes(int16_np.tobytes())
+                        # 计算音频时长对应帧数（按当前帧率）
+                        duration_sec = int16_np.shape[0] / float(sample_rate)
+                        desired_len = max(1, int(math.ceil(duration_sec * fps)))
+                        # 物理碰撞分配位置（与前端 _findFreeSlot 同样从0开始遍历找空隙）
+                        existing_audio = tdata.get("audioSegments", [])
+                        max_f = int(max_frames)
+                        start_pos = 0
+                        # 复用前端 _findFreeSlot 思路：找第一个能放下 desired_len 的空隙
+                        sorted_segs = sorted(existing_audio, key=lambda s: s.get("start", 0))
+                        cursor = 0
+                        for s in sorted_segs:
+                            s_start = int(s.get("start", 0))
+                            s_len = int(s.get("length", 0))
+                            gap = s_start - cursor
+                            if gap >= desired_len:
+                                start_pos = cursor
+                                break
+                            cursor = max(cursor, s_start + s_len)
+                        else:
+                            start_pos = cursor
+                        seg_len = min(desired_len, max(1, max_f - start_pos))
+                        if seg_len > 0:
+                            new_audio_seg = {
+                                "audioFile": f"{_TIMELINE_UPLOAD_SUBDIR}/{fname}",
+                                "audioB64": "",
+                                "start": start_pos,
+                                "length": seg_len,
+                                "trimStart": 0.0,
+                                "fileName": fname,
+                            }
+                            existing_audio.append(new_audio_seg)
+                            tdata["audioSegments"] = existing_audio
+                            timeline_data = json.dumps(tdata)
+                            try:
+                                PromptServer.instance.send_sync("yuan_clip_audio_input_updated", {
+                                    "file": fname,
+                                    "audioFile": f"{_TIMELINE_UPLOAD_SUBDIR}/{fname}",
+                                    "start": start_pos,
+                                    "length": seg_len,
+                                    "trimStart": 0.0,
+                                    "fileName": fname,
+                                })
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        # --- @图X=描述 角色解析 + marker token 定位 ---
+        # @图X=描述 行保留在 global_prompt 中作为 token 标记
+        # K/V 注入：定位 @图X 在 CLIP token 中的位置，注入对应主体参考帧的 K/V
+        marker_token_indices = {}  # {subject_num_str: [token_indices]}
+        if global_prompt and "@图" in global_prompt:
+            char_map, char_list = _parse_msr_characters(global_prompt)
+            if char_list:
+                # 构建 markers 列表并定位 token 位置
+                try:
+                    raw_tok = get_raw_tokenizer(clip)
+                    for item in char_list:
+                        tag = item["tag"]  # @图1
+                        num = tag[2:]  # 1
+                        indices = _find_marker_phrase_token_indices(raw_tok, global_prompt, [tag])
+                        if indices:
+                            marker_token_indices[num] = indices
+                except Exception:
+                    pass
+                # 替换 local_prompts 中的 @图X 引用为描述文本（local 段不保留 @图X 标记）
+                if local_prompts:
+                    modified = _apply_msr_replacements(local_prompts, char_map)
+                    if modified != local_prompts:
+                        local_prompts = modified
+                # 替换 motionSegments 描述中的 @图X 引用
+                motion_segs = tdata.get("motionSegments", []) if tdata else []
+                if motion_segs:
+                    seg_changed = False
+                    seen_tags = set()
+                    for seg in motion_segs:
+                        desc = seg.get("description", "")
+                        if desc and "@图" in desc:
+                            new_desc = _apply_msr_replacements(desc, char_map, seen_tags=seen_tags)
+                            if new_desc != desc:
+                                seg["description"] = new_desc
+                                seg_changed = True
+                    if seg_changed:
+                        timeline_data = json.dumps(tdata)
+
+        # --- 构建 guide_data（图像/视频引导），同时推导输出尺寸 ---
+        cw = custom_width if custom_width > 0 else width
+        ch = custom_height if custom_height > 0 else height
+        guide_data, derived_w, derived_h = _build_guide_data(
+            tdata, start_frame, max_frames, float(fps), guide_strength,
+            cw, ch, resize_method, divisible_by, img_compression,
+        )
+
+        # （参考图像已通过 frameFiles 合并段统一走 IC-LoRA 视频路径）
+
         # --- 自动生成 LTXV 潜空间（如果未连接 latent 输入） ---
         # max_frames 已在动态分配时对齐 LTXV stride 8，ltxv_length 直接使用 max_frames
         ltxv_length = max_frames
         if latent is None:
-            latent = _auto_generate_latent(width, height, ltxv_length)
+            # 优先使用引导图像推导的尺寸，否则使用 width/height
+            gen_w = derived_w if derived_w > 0 else width
+            gen_h = derived_h if derived_h > 0 else height
+            latent = _auto_generate_latent(gen_w, gen_h, ltxv_length)
 
-        # --- 编码路径选择：msr_info 连接时使用 Marker Relay 编码，否则使用标准 Relay 编码 ---
-        if msr_info is not None:
-            log.info("[Yuan CLIP Timeline] 检测到 msr_info 输入，启用 @角色标记绑定 (Marker Relay)")
-            patched, conditioning = _encode_relay_with_msr(
-                model, clip, latent, msr_info, global_prompt, local_prompts, segment_lengths, epsilon, binding_strength,
-            )
-        else:
-            patched, conditioning = _encode_relay(
-                model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
-            )
+        patched, conditioning, effective_lengths = _encode_relay(
+            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
+        )
 
-        # --- 自动生成音频潜空间（原理同 video latent：零张量 + type="audio"，由采样器加噪去噪）---
+        # --- 音频潜空间（保留原有自动生成逻辑） ---
         audio_latent = _auto_generate_audio_latent(audio_vae, ltxv_length, fps)
 
-        return (patched, conditioning, latent, audio_latent)
+        # --- 合成时间轴音频（供下游音频修复/替换使用） ---
+        if use_custom_audio or override_audio:
+            audio_out = _build_combined_audio(timeline_data, start_frame, ltxv_length, float(fps), override_audio=override_audio)
+        else:
+            total_samples = max(1, int(math.ceil(ltxv_length / float(fps) * 44100)))
+            audio_out = {"waveform": torch.zeros((1, 2, total_samples), dtype=torch.float32), "sample_rate": 44100}
+
+        # --- 构建 motion_guide_data（IC-LoRA 视频分段） ---
+        motion_guide_data = _build_motion_guide_data(
+            tdata, start_frame, max_frames, float(fps), resize_method, use_custom_motion,
+        )
+
+        guide_data["start_frame"] = start_frame
+        guide_data["duration_frames"] = max_frames
+        guide_data["resize_method"] = resize_method
+        guide_data["inpaint_audio"] = inpaint_audio
+        guide_data["use_custom_audio"] = use_custom_audio or override_audio
+
+        # --- K/V 视觉特征注入：marker_token_indices + subject_ref_ranges ---
+        # 替换原 Ref Guidance 全局文本引导，改为 attn2 K/V 注入
+        # @图X 在 global_prompt 中的 token 位置被标记，注入对应主体参考帧的 K/V
+        if marker_token_indices and ref_alpha > 0.0:
+            guide_data["marker_token_indices"] = marker_token_indices
+            guide_data["ref_alpha"] = float(ref_alpha)
+            guide_data["ref_tau"] = float(ref_tau)
+            # 从 motionSegments 构建主体参考帧范围映射
+            # 第 X 个 motionSegment 对应 @图X，帧范围 = (start, start+length) 转为 latent 索引
+            motion_segs = tdata.get("motionSegments", []) if tdata else []
+            subject_ref_ranges = {}  # {subject_num_str: (latent_start, latent_end)}
+            time_scale = 8  # LTXV 标准 time_scale_factor
+            for idx, mseg in enumerate(motion_segs):
+                subject_num = str(idx + 1)
+                if subject_num not in marker_token_indices:
+                    continue
+                seg_start = int(mseg.get("start", 0))
+                seg_length = int(mseg.get("length", 1))
+                if seg_length <= 0:
+                    continue
+                # 像素帧转 latent 索引（向下取整 start，向上取整 end）
+                latent_start = seg_start // time_scale
+                latent_end = (seg_start + seg_length + time_scale - 1) // time_scale
+                subject_ref_ranges[subject_num] = (latent_start, max(latent_start + 1, latent_end))
+            if subject_ref_ranges:
+                guide_data["subject_ref_ranges"] = subject_ref_ranges
+        else:
+            guide_data["ref_alpha"] = 0.0
+
+        return (patched, conditioning, latent, audio_latent, guide_data, motion_guide_data,
+                float(fps), audio_out)
 
 
 # ==============================================================================
