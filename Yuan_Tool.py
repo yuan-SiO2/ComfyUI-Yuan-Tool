@@ -18,7 +18,7 @@ class YuanTool:
             "required": {
                 "width": ("INT", {"default": 736, "min": 32, "max": 8192, "step": 32}),
                 "height": ("INT", {"default": 1280, "min": 32, "max": 8192, "step": 32}),
-                "frame_multiplier": ([8, 16, 24, 32], {"default": 16}),
+                "frame_multiplier": ([1, 8, 16, 24, 32], {"default": 16}),
                 "list_mode": ("BOOLEAN", {"default": False, "label_on": "true", "label_off": "false"}),
             },
             "optional": {
@@ -60,9 +60,11 @@ class YuanTool:
 
         background_image = self._prepare_image(background, (width, height), preserve_full=False) if background is not None else None
 
-        # 背景帧数：有背景图时 +8 帧，无背景时为 0
-        bg_frame_count = 8 if background_image is not None else 0
-        frame_count = len(subjects) * frame_multiplier + 1 + bg_frame_count
+        # 背景帧数：有背景图时与 frame_multiplier 一致，无背景时为 0
+        bg_frame_count = frame_multiplier if background_image is not None else 0
+        # slot1 多1帧用于 VAE 8帧分组对齐；frame_multiplier=1 时无对齐意义，不加
+        first_slot_extra = 1 if frame_multiplier > 1 else 0
+        frame_count = len(subjects) * frame_multiplier + first_slot_extra + bg_frame_count
         frames = self._expand_frames_with_info(
             subjects, background_image, frame_multiplier, frame_count
         )
@@ -155,12 +157,14 @@ class YuanTool:
         #   slot2: frames[17,32] → latent 3(f17-24) + latent 4(f25-32) = 纯img2
         #   slot3: frames[33,48] → latent 5(f33-40) + latent 6(f41-48) = 纯img3
         for index, image in enumerate(subjects):
-            repeats = frame_multiplier + (1 if index == 0 else 0)
+            # slot1 多1帧用于 VAE 8帧分组对齐；frame_multiplier=1 时无对齐意义，不加
+            extra = 1 if (index == 0 and frame_multiplier > 1) else 0
+            repeats = frame_multiplier + extra
             frames.extend([image] * repeats)
 
-        # 仅当提供了背景图时才添加背景帧
+        # 仅当提供了背景图时才添加背景帧（帧数与 frame_multiplier 一致）
         if background is not None:
-            frames.extend([background] * 8)
+            frames.extend([background] * frame_multiplier)
 
         if len(frames) > frame_count:
             frames = frames[:frame_count]

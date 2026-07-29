@@ -750,7 +750,7 @@ def build_temporal_cost(q_token_idx, Lq, Lk, device, dtype, tokens_per_frame):
             cost = strength * torch.exp(-(d**2) / (2 * seg["sigma"]**2))
         else:
             cost = strength * (torch.relu(d - seg["window"]) ** 2) / (2 * seg["sigma"] ** 2)
-        offset[:, local] = cost.to(offset.dtype)
+        offset[:, local] += cost.to(offset.dtype)
 
     return offset
 
@@ -770,7 +770,7 @@ def build_temporal_cost_scaled(q_token_idx, Lq, Lk, device, dtype, latent_frames
         else:
             window_a = seg.get("window_audio", seg["window"])
             cost = strength_a * (torch.relu(d - window_a) ** 2) / (2 * sigma_a ** 2)
-        offset[:, local] = cost.to(offset.dtype)
+        offset[:, local] += cost.to(offset.dtype)
 
     return offset
 
@@ -810,24 +810,26 @@ def create_mask_fn(q_token_idx, fallback_tokens_per_frame, latent_frames):
     return mask_fn
 
 
-def build_segments(token_ranges, segment_lengths, epsilon=1e-3):
+def build_segments(token_ranges, segment_lengths, epsilon=1e-3,
+                   marker_token_indices=None, marker_segment_refs=None, ref_tau=5.0):
     """为时间惩罚构建每段元数据。
 
-    设计限制：midpoint/window/sigma 以「段」为最小粒度构建。一个 local_prompt 段内引用
-    多个 @图X（如 `@图1 在左边，@图2 在右边`）时，两角色描述的所有 token 共享同一个
-    midpoint 和 window，时间维度上无法在段内再细分各角色的活跃区间。
-
-    若需要段内多主体时间细分，需重构为 token 级元数据（每个 @图X 描述 token 独立 midpoint），
-    这会影响 build_temporal_cost 等下游函数。当前实现下，建议把不同角色拆到不同段处理。
+    @图X token 级 mask 抑制 + K/V 全强度注入：
+    - @图X token 的活跃帧范围 = 引用它的主轨 local 段的帧范围（段内全可见，cost=0）
+    - 段外帧对该 @图X token 的 attention 权重按高斯衰减（suppress=True）
+    - K/V 注入保持全强度（effective_alpha = ref_alpha）
+    - 效果：段内帧看到全强度 K/V + 全可见，段外帧看到全强度 K/V + 衰减 attention 权重
     """
     sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
 
     q_token_idx = []
     frame_cursor = 0
+    seg_frame_ranges = []
 
     for (tok_start, tok_end), L in zip(token_ranges, segment_lengths):
         if L <= 0:
             frame_cursor += L
+            seg_frame_ranges.append((frame_cursor, frame_cursor))
             continue
         seg_midpoint = (2 * frame_cursor + L) // 2
         base_window = max(L // 2 - 1, 0)
@@ -841,7 +843,36 @@ def build_segments(token_ranges, segment_lengths, epsilon=1e-3):
             "sigma_audio": sigma,
             "strength_audio": 1.0,
         })
+        seg_frame_ranges.append((frame_cursor, frame_cursor + L))
         frame_cursor += L
+
+    # --- @图X token 级 mask 抑制 ---
+    if marker_token_indices and marker_segment_refs:
+        sigma_suppress = max(1.0, ref_tau)
+        for subject_num, token_indices in marker_token_indices.items():
+            ref_seg_indices = marker_segment_refs.get(subject_num, [])
+            if not ref_seg_indices:
+                continue
+            for seg_idx in ref_seg_indices:
+                if seg_idx >= len(seg_frame_ranges):
+                    continue
+                seg_start_frame, seg_end_frame = seg_frame_ranges[seg_idx]
+                L_seg = seg_end_frame - seg_start_frame
+                if L_seg <= 0:
+                    continue
+                seg_midpoint = (seg_start_frame + seg_end_frame) // 2
+                base_window = max(L_seg // 2, 1)
+                q_token_idx.append({
+                    "local_token_idx": torch.tensor(token_indices, dtype=torch.long),
+                    "midpoint": seg_midpoint,
+                    "window": float(base_window),
+                    "sigma": sigma_suppress,
+                    "strength": 1.0,
+                    "suppress": True,
+                    "window_audio": float(base_window),
+                    "sigma_audio": sigma_suppress,
+                    "strength_audio": 1.0,
+                })
 
     return q_token_idx
 
@@ -887,14 +918,20 @@ def _find_marker_phrase_token_indices(
     stop_markers=None,
     stop_at_punctuation=True,
     stop_at_other_marker=True,
+    stop_at_equals=True,
 ):
     """返回 marker token 索引列表（离散）。
     markers 如 ['@图1', '@图2']，定位这些标记在 CLIP token 序列中的位置。
+
+    stop_at_equals=True 时，遇到 '=' 立即停止，只定位 @图X 标记本身，
+    不扩展到描述文本（避免 K/V 注入覆盖文本描述语义）。
     """
     if raw_tokenizer is None or not prompt_text or not markers:
         return []
     prompt_folded = prompt_text.casefold()
     stop_chars = set(",，.。")
+    if stop_at_equals:
+        stop_chars.add("=")
     ranges = []
     sorted_markers = sorted(set(m for m in markers if m), key=len, reverse=True)
     covered_char_ranges = []
@@ -1157,7 +1194,8 @@ def _auto_generate_audio_latent(audio_vae, length_frames, frame_rate):
     return {"samples": samples, "type": "audio"}
 
 
-def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon):
+def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
+                  marker_tags=None, marker_segment_refs=None, ref_tau=5.0):
     for name, val in (("global_prompt", global_prompt),
                       ("local_prompts", local_prompts),
                       ("segment_lengths", segment_lengths)):
@@ -1186,17 +1224,36 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
     raw_tokenizer = get_raw_tokenizer(clip)
     full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
 
+    # 在 full_prompt 中定位所有 @图X token（global + local）
+    # local 段保留了 @图X 标记（keep_marker=True），K/V 注入能直接作用于 local 段中的 @图X token
+    marker_token_indices = {}
+    if marker_tags:
+        try:
+            indices = _find_marker_phrase_token_indices(raw_tokenizer, full_prompt, marker_tags)
+            if indices:
+                # 按主体编号分组
+                for tag in marker_tags:
+                    num = tag[2:]
+                    tag_indices = _find_marker_phrase_token_indices(raw_tokenizer, full_prompt, [tag])
+                    if tag_indices:
+                        marker_token_indices[num] = tag_indices
+        except Exception:
+            pass
+
     conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
 
     effective_lengths = distribute_segment_lengths(len(locals_list), latent_frames, parsed_lengths)
 
-    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon)
+    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon,
+                                 marker_token_indices=marker_token_indices,
+                                 marker_segment_refs=marker_segment_refs,
+                                 ref_tau=ref_tau)
     mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
 
     patched = model.clone()
     apply_patches(patched, mask_fn)
 
-    return patched, conditioning, effective_lengths
+    return patched, conditioning, effective_lengths, marker_token_indices
 
 
 # ==============================================================================
@@ -1252,7 +1309,8 @@ def _escape_repl(text: str) -> str:
     return text.replace('\\', '\\\\')
 
 
-def _apply_msr_replacements(text: str, char_map: dict, force_short: bool = False, seen_tags: set = None) -> str:
+def _apply_msr_replacements(text: str, char_map: dict, force_short: bool = False,
+                            seen_tags: set = None, keep_marker: bool = False) -> str:
     """将文本中的 @图X 引用替换为角色描述。
 
     - 按数字倒序排序避免子串误匹配（@图1 误匹配 @图10 前缀）。
@@ -1261,6 +1319,9 @@ def _apply_msr_replacements(text: str, char_map: dict, force_short: bool = False
     - force_short=True 时全部使用简短别名（用于 CLIP 截断主动缓解）。
     - seen_tags 非空时，已在 seen_tags 中的标签视为"已出现"，全部用简短别名；
       本函数会更新 seen_tags（首次出现的标签会被加入）。
+    - keep_marker=True 时保留 @图X 标记并在后面添加描述（用于 local 段 K/V 注入）：
+      "@图1在喝奶茶" → "@图1女孩在喝奶茶"
+      这样 K/V 注入能直接作用于 local 段中的 @图X token，关联视觉特征与行为描述。
     """
     if not text or not char_map:
         return text
@@ -1274,7 +1335,15 @@ def _apply_msr_replacements(text: str, char_map: dict, force_short: bool = False
         short_alias = _generate_short_alias(desc)
         num = tag[2:]
         pattern = re.compile(rf'@图{num}(?!\d)')
-        if force_short:
+        if keep_marker:
+            # 保留 @图X 标记，在后面添加描述
+            if force_short or tag in seen_tags:
+                replacement = f"{tag}{short_alias}"
+            else:
+                replacement = f"{tag}{desc}"
+                seen_tags.add(tag)
+            modified = pattern.sub(_escape_repl(replacement), modified)
+        elif force_short:
             modified = pattern.sub(_escape_repl(short_alias), modified)
         elif tag in seen_tags:
             # 该标签已在之前的文本中出现过，全部用简短别名
@@ -1705,6 +1774,7 @@ class YuanCLIPTimeline:
                         "isStaticImage": True,
                         "fileName": f"motion_seg_{ts}_{i}.png",
                         "description": char_desc,
+                        "subjectNum": i + 1,
                         "videoAttentionStrength": 0.65,
                     }
                     new_motion_segs.append(seg)
@@ -1810,25 +1880,27 @@ class YuanCLIPTimeline:
 
         # --- @图X=描述 角色解析 + marker token 定位 ---
         # @图X=描述 行保留在 global_prompt 中作为 token 标记
-        # K/V 注入：定位 @图X 在 CLIP token 中的位置，注入对应主体参考帧的 K/V
-        marker_token_indices = {}  # {subject_num_str: [token_indices]}
+        # K/V 注入：定位 @图X 在 full_prompt（global+local）中的位置，注入对应主体参考帧的 K/V
+        marker_token_indices = {}  # {subject_num_str: [token_indices]}（在 _encode_relay 中填充）
+        marker_segment_refs = {}   # {subject_num_str: [seg_idx, ...]} 每个 @图X 被哪些 local 段引用
+        marker_tags = []           # [@图1, @图2, ...] 用于在 full_prompt 中定位所有 @图X token
         if global_prompt and "@图" in global_prompt:
             char_map, char_list = _parse_msr_characters(global_prompt)
             if char_list:
-                # 构建 markers 列表并定位 token 位置
-                try:
-                    raw_tok = get_raw_tokenizer(clip)
-                    for item in char_list:
-                        tag = item["tag"]  # @图1
-                        num = tag[2:]  # 1
-                        indices = _find_marker_phrase_token_indices(raw_tok, global_prompt, [tag])
-                        if indices:
-                            marker_token_indices[num] = indices
-                except Exception:
-                    pass
-                # 替换 local_prompts 中的 @图X 引用为描述文本（local 段不保留 @图X 标记）
+                # 构建 markers 列表（用于后续在 full_prompt 中定位所有 @图X token）
+                marker_tags = [item["tag"] for item in char_list]
+                # 在替换前，记录每个 local 段引用了哪些 @图X（用于 token 级 mask 抑制）
+                if local_prompts and marker_tags:
+                    local_list = [p.strip() for p in local_prompts.split("|") if p.strip()]
+                    for seg_idx, local_text in enumerate(local_list):
+                        for tag in marker_tags:
+                            num = tag[2:]
+                            if tag in local_text:
+                                marker_segment_refs.setdefault(num, []).append(seg_idx)
+                # 替换 local_prompts 中的 @图X 引用，保留 @图X 标记并添加描述
+                # 这样 K/V 注入能直接作用于 local 段中的 @图X token，关联视觉特征与行为描述
                 if local_prompts:
-                    modified = _apply_msr_replacements(local_prompts, char_map)
+                    modified = _apply_msr_replacements(local_prompts, char_map, keep_marker=True)
                     if modified != local_prompts:
                         local_prompts = modified
                 # 替换 motionSegments 描述中的 @图X 引用
@@ -1865,8 +1937,11 @@ class YuanCLIPTimeline:
             gen_h = derived_h if derived_h > 0 else height
             latent = _auto_generate_latent(gen_w, gen_h, ltxv_length)
 
-        patched, conditioning, effective_lengths = _encode_relay(
+        patched, conditioning, effective_lengths, marker_token_indices = _encode_relay(
             model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
+            marker_tags=marker_tags if marker_tags else None,
+            marker_segment_refs=marker_segment_refs if marker_segment_refs else None,
+            ref_tau=ref_tau,
         )
 
         # --- 音频潜空间（保留原有自动生成逻辑） ---
@@ -1898,12 +1973,17 @@ class YuanCLIPTimeline:
             guide_data["ref_alpha"] = float(ref_alpha)
             guide_data["ref_tau"] = float(ref_tau)
             # 从 motionSegments 构建主体参考帧范围映射
-            # 第 X 个 motionSegment 对应 @图X，帧范围 = (start, start+length) 转为 latent 索引
+            # 优先从 motionSegment 的 subjectNum 字段读取 @图X 编号（显式绑定），
+            # 若未设置则回退到数组下标 idx+1（向后兼容旧数据）
             motion_segs = tdata.get("motionSegments", []) if tdata else []
             subject_ref_ranges = {}  # {subject_num_str: (latent_start, latent_end)}
             time_scale = 8  # LTXV 标准 time_scale_factor
             for idx, mseg in enumerate(motion_segs):
-                subject_num = str(idx + 1)
+                raw_num = mseg.get("subjectNum")
+                if isinstance(raw_num, int) and raw_num > 0:
+                    subject_num = str(raw_num)
+                else:
+                    subject_num = str(idx + 1)
                 if subject_num not in marker_token_indices:
                     continue
                 seg_start = int(mseg.get("start", 0))

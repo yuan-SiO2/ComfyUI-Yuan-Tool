@@ -80,6 +80,7 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
     subject_ref_ranges = getattr(self, "subject_ref_ranges", {})
     ref_alpha = getattr(self, "ref_alpha", 0.0)
     ref_tau = getattr(self, "ref_tau", 5.0)
+    subject_ref_features = getattr(self, "subject_ref_features", None)
 
     # 计算 K/V
     q = self.q_norm(self.to_q(x))
@@ -109,57 +110,57 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
         # token 越界保护：marker token 索引可能超过 context 长度（CLIP 截断）
         max_context_index = context.shape[1] - 1
 
-        # 段内主体抑制系数：ref_tau 越小，注入强度衰减越强
-        # suppression_factor = min(1.0, ref_tau / 10.0)，范围 (0, 1]
-        suppression_factor = min(1.0, ref_tau / 10.0)
-        effective_alpha = ref_alpha * suppression_factor
+        # K/V 注入强度：段内全强度注入，段外抑制由 token 级 mask 负责
+        # ref_tau 控制 mask 的段外高斯衰减速度（在 build_segments 中使用）
+        # 这里保持全强度注入，让 mask 机制控制段外帧对 @图X token 的 attention 权重
+        effective_alpha = ref_alpha
 
         for subject_num, token_indices in marker_token_indices.items():
-            if subject_num not in subject_ref_ranges:
+            # 检查 subject 是否有可用的参考特征
+            has_independent_feature = (subject_ref_features is not None
+                                       and subject_num in subject_ref_features)
+            if not has_independent_feature and subject_num not in subject_ref_ranges:
                 continue
             # 越界过滤：只保留 context 范围内的 token
             usable = [idx for idx in token_indices if idx <= max_context_index]
             if not usable:
                 continue
-            ref_start, ref_end = subject_ref_ranges[subject_num]
 
-            # 从 x（视频 token）取参考帧范围均值
-            if T is not None and H is not None and W is not None:
-                ref_indices = []
-                for t in range(ref_start, min(ref_end, T)):
-                    ref_indices.extend(range(t * H * W, (t + 1) * H * W))
-                if not ref_indices:
-                    continue
-                ref_indices_t = torch.as_tensor(ref_indices, device=x.device, dtype=torch.long)
-                # 仅从正向批次取均值，避免负向条件污染 ref_summary
-                if positive_rows is not None:
-                    ref_summary = x[positive_rows][:, ref_indices_t, :].mean(dim=1)  # (num_pos, C)
-                else:
-                    ref_summary = x[:, ref_indices_t, :].mean(dim=1)  # (B, C)
+            if has_independent_feature:
+                # 独立视觉编码：用预计算的 ref_summary，不从 x 取
+                # 彻底解耦物理坐标系错位问题
+                ref_summary = subject_ref_features[subject_num].to(device=x.device, dtype=x.dtype)
+                # 扩展到正向批次数
+                num_pos = len(positive_rows) if positive_rows is not None else x.shape[0]
+                ref_summary = ref_summary.expand(num_pos, -1)  # [num_pos, inner_dim]
             else:
-                # 无法获取帧维度，用全局均值
-                if positive_rows is not None:
-                    ref_summary = x[positive_rows].mean(dim=1)
+                # 向后兼容：从 x 取参考帧（物理坐标可能错位）
+                ref_start, ref_end = subject_ref_ranges[subject_num]
+                if T is not None and H is not None and W is not None:
+                    ref_indices = []
+                    for t in range(ref_start, min(ref_end, T)):
+                        ref_indices.extend(range(t * H * W, (t + 1) * H * W))
+                    if not ref_indices:
+                        continue
+                    ref_indices_t = torch.as_tensor(ref_indices, device=x.device, dtype=torch.long)
+                    if positive_rows is not None:
+                        ref_summary = x[positive_rows][:, ref_indices_t, :].mean(dim=1)
+                    else:
+                        ref_summary = x[:, ref_indices_t, :].mean(dim=1)
                 else:
-                    ref_summary = x.mean(dim=1)
+                    if positive_rows is not None:
+                        ref_summary = x[positive_rows].mean(dim=1)
+                    else:
+                        ref_summary = x.mean(dim=1)
 
             # 投影为 ref_k/ref_v
-            ref_k = self.to_k(ref_summary[:, None, :]).to(dtype=k.dtype, device=k.device)  # (B', 1, C)
+            # ref_k 必须经过 k_norm（RMSNorm），与原始 K 的处理保持一致
+            # 否则 ref_k 的尺度与 k 不匹配，导致 attention 权重异常
+            ref_k = self.k_norm(self.to_k(ref_summary[:, None, :])).to(dtype=k.dtype, device=k.device)  # (B', 1, C)
             ref_v = self.to_v(ref_summary[:, None, :]).to(dtype=v.dtype, device=v.device)  # (B', 1, C)
 
-            # 范数对齐：让 ref_k/ref_v 的范数与 marker token 的 K 范数匹配
-            marker_tensor = torch.as_tensor(usable, device=k.device, dtype=torch.long)
-            if positive_rows is not None:
-                # 仅对正向行计算范数
-                marker_norm_k = k[positive_rows][:, marker_tensor, :].norm(dim=-1, keepdim=True).mean(dim=1)
-                marker_norm_v = v[positive_rows][:, marker_tensor, :].norm(dim=-1, keepdim=True).mean(dim=1)
-            else:
-                marker_norm_k = k[:, marker_tensor, :].norm(dim=-1, keepdim=True).mean(dim=1)
-                marker_norm_v = v[:, marker_tensor, :].norm(dim=-1, keepdim=True).mean(dim=1)
-            ref_k = torch.nn.functional.normalize(ref_k, dim=-1) * marker_norm_k.clamp_min(1e-6)
-            ref_v = torch.nn.functional.normalize(ref_v, dim=-1) * marker_norm_v.to(v.dtype).clamp_min(1e-6)
-
             # K/V 注入：k[marker] = k[marker]*(1-alpha) + ref_k*alpha
+            marker_tensor = torch.as_tensor(usable, device=k.device, dtype=torch.long)
             ref_k_expanded = ref_k.expand(-1, len(usable), -1)  # (B', num_markers, C)
             ref_v_expanded = ref_v.expand(-1, len(usable), -1)  # (B', num_markers, C)
             if positive_rows is not None:
@@ -211,11 +212,12 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
 class _LTXVCrossAttentionRefPatch:
     """把 K/V 注入参数绑定到 attn2 模块，替换其 forward。"""
 
-    def __init__(self, marker_token_indices, subject_ref_ranges, ref_alpha, ref_tau):
+    def __init__(self, marker_token_indices, subject_ref_ranges, ref_alpha, ref_tau, subject_ref_features=None):
         self.marker_token_indices = marker_token_indices
         self.subject_ref_ranges = subject_ref_ranges
         self.ref_alpha = ref_alpha
         self.ref_tau = ref_tau
+        self.subject_ref_features = subject_ref_features
 
     def __get__(self, obj, objtype=None):
         def wrapped_attention(self_module, *args, **kwargs):
@@ -223,6 +225,7 @@ class _LTXVCrossAttentionRefPatch:
             self_module.subject_ref_ranges = self.subject_ref_ranges
             self_module.ref_alpha = self.ref_alpha
             self_module.ref_tau = self.ref_tau
+            self_module.subject_ref_features = self.subject_ref_features
             return _ltxv_crossattn_forward_kv_injection(self_module, *args, **kwargs)
         return types.MethodType(wrapped_attention, obj)
 
@@ -835,15 +838,65 @@ class YuanClipGuide:
         if (ref_alpha > 0.0 and model is not None and marker_token_indices
                 and subject_ref_ranges):
             ref_tau = float(guide_data.get("ref_tau", 5.0))
+            # --- 独立视觉编码：为每个 @图X 参考图预计算 visual feature ---
+            # 不依赖 video token x 中参考帧的物理位置，彻底解耦坐标系错位问题
+            subject_ref_features = {}
+            try:
+                diffusion_model = model.get_model_object("diffusion_model")
+                patchify_proj = diffusion_model.patchify_proj
+                for idx, seg in enumerate(segments):
+                    raw_num = seg.get("subjectNum")
+                    if isinstance(raw_num, int) and raw_num > 0:
+                        subject_num = str(raw_num)
+                    else:
+                        subject_num = str(idx + 1)
+                    if subject_num not in marker_token_indices:
+                        continue
+                    video_file = seg.get("videoFile")
+                    if not video_file:
+                        continue
+                    length_frames = int(seg.get("length", 1))
+                    if length_frames <= 0:
+                        continue
+                    # 加载参考帧
+                    video_frames = _load_motion_video_frames(
+                        video_file, 0, length_frames, director_fps,
+                        seg.get("resampleMode", "nearest"),
+                        frame_files=seg.get("frameFiles"),
+                    )
+                    # VAE 编码
+                    _, guide_latent = cls._encode_for_timeline(
+                        vae, latent_width, latent_height, video_frames, scale_factors,
+                        latent_downscale_factor, resize_method=active_resize_method,
+                    )
+                    # patchify + patchify_proj → visual token [B, F*H*W, inner_dim]
+                    patches, _ = cls.PATCHIFIER.patchify(guide_latent)
+                    patches = patchify_proj(patches)
+                    # 中心区域加权均值 → ref_summary [B, inner_dim]
+                    F_g = guide_latent.shape[2]
+                    H_g = guide_latent.shape[3]
+                    W_g = guide_latent.shape[4]
+                    weight_grid = torch.full((H_g, W_g), 0.3, device=patches.device, dtype=patches.dtype)
+                    ch_start, ch_end = H_g // 4, H_g - H_g // 4
+                    cw_start, cw_end = W_g // 4, W_g - W_g // 4
+                    if ch_end > ch_start and cw_end > cw_start:
+                        weight_grid[ch_start:ch_end, cw_start:cw_end] = 1.0
+                    ref_weights = weight_grid.flatten().repeat(F_g)
+                    ref_weights_expanded = ref_weights[None, :, None]
+                    ref_summary = (patches * ref_weights_expanded).sum(dim=1) / ref_weights.sum().clamp_min(1e-6)
+                    subject_ref_features[subject_num] = ref_summary
+            except Exception:
+                pass
             model = cls._apply_ref_guidance_patch(
                 model, marker_token_indices, subject_ref_ranges, ref_alpha, ref_tau,
+                subject_ref_features=subject_ref_features if subject_ref_features else None,
             )
 
         return (model, positive, negative, {"samples": latent_image, "noise_mask": noise_mask})
 
     @classmethod
     def _apply_ref_guidance_patch(cls, model, marker_token_indices, subject_ref_ranges,
-                                  ref_alpha, ref_tau):
+                                  ref_alpha, ref_tau, subject_ref_features=None):
         """把 K/V 注入参数绑定到 attn2，替换其 forward。
 
         仅处理视频分支（audio_attn2 不参与），与 PromptRelay 兼容：
@@ -855,6 +908,7 @@ class YuanClipGuide:
         for idx, block in enumerate(diffusion_model.transformer_blocks):
             patched_attn2 = _LTXVCrossAttentionRefPatch(
                 marker_token_indices, subject_ref_ranges, ref_alpha, ref_tau,
+                subject_ref_features=subject_ref_features,
             ).__get__(block.attn2, block.__class__)
             model_clone.add_object_patch(
                 f"diffusion_model.transformer_blocks.{idx}.attn2.forward", patched_attn2,
