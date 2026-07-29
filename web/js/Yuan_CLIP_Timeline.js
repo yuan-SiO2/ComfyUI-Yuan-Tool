@@ -254,6 +254,7 @@ function parseInitial(jsonStr, maxFrames) {
         isStaticImage: !!m.isStaticImage,
         fileName: typeof m.fileName === "string" ? m.fileName : "",
         description: typeof m.description === "string" ? m.description : "",
+        subjectNum: Number.isInteger(m.subjectNum) ? m.subjectNum : 0,
       }));
     }
     if (Array.isArray(obj?.audioSegments)) {
@@ -1026,6 +1027,7 @@ class TimelineEditor {
 
       // 描述字段：按顺序对应 @图X=描述；无对应角色定义时为空
       const charDesc = (i < chars.length) ? chars[i].desc : "";
+      // 显式绑定 @图X 编号（第 i 张图对应 @图(i+1)），后端据此反查，不再依赖数组下标
       const seg = {
         videoFile: ref,
         frameFiles: [ref],
@@ -1035,6 +1037,7 @@ class TimelineEditor {
         isStaticImage: true,
         fileName: img.filename,
         description: charDesc,
+        subjectNum: i + 1,
         videoAttentionStrength: 0.65,
       };
       newMotionSegs.push(seg);
@@ -2114,6 +2117,8 @@ class TimelineEditor {
       const slot = this._findFreeSlot(this.timeline.motionSegments, copy.length, max);
       copy.start = slot.start;
       copy.length = slot.length;
+      // 粘贴时重新分配 subjectNum，避免与原段冲突导致 K/V 注入帧范围覆盖
+      copy.subjectNum = this.timeline.motionSegments.reduce((mx, s) => Math.max(mx, s.subjectNum || 0), 0) + 1;
       this.timeline.motionSegments.push(copy);
       this.selectedMotionIndices = new Set([this.timeline.motionSegments.length - 1]);
       this.selectedIndices.clear();
@@ -3941,6 +3946,8 @@ class TimelineEditor {
           trimStart: 0.0,
           isStaticImage: isImage,
           fileName: file.name,
+          // 显式绑定 @图X 编号：取当前 motionSegments 中最大 subjectNum + 1，无则 = 1
+          subjectNum: this.timeline.motionSegments.reduce((mx, s) => Math.max(mx, s.subjectNum || 0), 0) + 1,
           videoAttentionStrength: 0.65,
         };
         this.timeline.motionSegments.push(newSeg);
