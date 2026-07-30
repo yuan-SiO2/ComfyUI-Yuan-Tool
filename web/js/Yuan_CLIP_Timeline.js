@@ -1038,7 +1038,6 @@ class TimelineEditor {
         fileName: img.filename,
         description: charDesc,
         subjectNum: i + 1,
-        videoAttentionStrength: 0.65,
       };
       newMotionSegs.push(seg);
       this._loadMotionImage(seg);
@@ -3196,36 +3195,6 @@ class TimelineEditor {
     }
     addField("裁剪起始", trimInput);
 
-    // --- 注意力引导强度（IC-LoRA 通道放大信号区） ---
-    const attnLabel = document.createElement("label");
-    attnLabel.textContent = "注意力引导强度";
-    attnLabel.title = "控制 IC-LoRA 引导注意力信号的强度，值越高对应主体特征越强（默认 0.65）";
-    const attnInput = document.createElement("input");
-    attnInput.type = "range";
-    attnInput.min = "0"; attnInput.max = "2"; attnInput.step = "0.05";
-    attnInput.value = seg.videoAttentionStrength ?? 0.65;
-    attnInput.disabled = this.promptLocked;
-    const attnVal = document.createElement("span");
-    attnVal.className = "yuan-clip-tl-range-val";
-    attnVal.textContent = attnInput.value;
-    if (!this.promptLocked) {
-      attnInput.addEventListener("input", () => {
-        seg.videoAttentionStrength = parseFloat(attnInput.value);
-        attnVal.textContent = attnInput.value;
-        if (this._textCommitTimer) clearTimeout(this._textCommitTimer);
-        this._textCommitTimer = setTimeout(() => {
-          this._textCommitTimer = null;
-          this.commitChanges();
-        }, 200);
-      });
-    }
-    const attnRow = document.createElement("div");
-    attnRow.className = "field full";
-    attnRow.appendChild(attnLabel);
-    attnRow.appendChild(attnInput);
-    attnRow.appendChild(attnVal);
-    grid.appendChild(attnRow);
-
     return section;
   }
 
@@ -3948,7 +3917,6 @@ class TimelineEditor {
           fileName: file.name,
           // 显式绑定 @图X 编号：取当前 motionSegments 中最大 subjectNum + 1，无则 = 1
           subjectNum: this.timeline.motionSegments.reduce((mx, s) => Math.max(mx, s.subjectNum || 0), 0) + 1,
-          videoAttentionStrength: 0.65,
         };
         this.timeline.motionSegments.push(newSeg);
         this.selectedMotionIndices = new Set([this.timeline.motionSegments.length - 1]);
