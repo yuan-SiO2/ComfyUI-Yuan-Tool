@@ -13,10 +13,10 @@ ComfyUI 自定义节点工具集，提供图像处理、全景预览、画布合
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `1` ~ `4` | IMAGE (可选) | 主体图像（按 1 → 2 → 3 → 4 顺序排列） |
-| `background` | IMAGE (必填) | 背景图像，帧数与 `frame_multiplier` 一致，排在最后 |
+| `background` | IMAGE (必填) | 背景图像，固定 8 帧，排在最后 |
 | `width` | INT | 输出视频宽度 (默认 736，步长 32) |
 | `height` | INT | 输出视频高度 (默认 1280，步长 32) |
-| `frame_multiplier` | 选项 | 帧数倍率：1 / 8 / 16 / 24 / 32（背景帧数同步跟随） |
+| `frame_multiplier` | 选项 | 帧数倍率：8 / 16 / 24 / 32 |
 | `list_mode` | BOOL | 开启后使用 `image_list` 输入替代 1~4 独立端口 |
 | `image_list` | IMAGE (可选) | 批量图像输入（前 4 张有效） |
 
@@ -24,12 +24,7 @@ ComfyUI 自定义节点工具集，提供图像处理、全景预览、画布合
 
 #### 帧数计算公式
 ```
-frame_multiplier = 1:
-  总帧数 = 主体图像数量 × 1 + 1（背景）
-  （所有主体图均为 1 帧，背景也为 1 帧，不做 VAE 对齐加帧）
-
-frame_multiplier > 1 (8/16/24/32):
-  总帧数 = 主体图像数量 × frame_multiplier + 1（首图额外，VAE 8帧分组对齐） + frame_multiplier（背景）
+总帧数 = 主体图像数量 × frame_multiplier + 1（首图额外） + 8（背景）
 ```
 
 #### 图像预处理
@@ -270,4 +265,3 @@ pip install av
 
 - [ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay) — Yuan CLIP 时间轴节点的实现基础
 - [ComfyUI-Licon-MSR](https://github.com/liconstudio/ComfyUI-Licon-MSR) — 多帧参考节点的图像预处理与帧分配算法参考
-- [WhatDreamsCost/WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI) — 部分导演台机制的参考与融入

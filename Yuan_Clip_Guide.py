@@ -710,12 +710,10 @@ class YuanClipGuide:
                         nxt = segments[j]
                         if (bool(nxt.get("isStaticImage", False))
                                 and int(nxt.get("start", 0)) == int(seg.get("start", 0)) + int(seg.get("length", 0))):
-                            # 仅当 videoAttentionStrength 一致时合并（避免混淆不同强度）
-                            if float(nxt.get("videoAttentionStrength", 0.65)) == float(seg.get("videoAttentionStrength", 0.65)):
-                                batch.append(nxt)
-                                seg = nxt  # 更新尾部，用于判断下一段是否继续相邻
-                                j += 1
-                                continue
+                            batch.append(nxt)
+                            seg = nxt  # 更新尾部，用于判断下一段是否继续相邻
+                            j += 1
+                            continue
                         break
                     if len(batch) > 1:
                         # 合并为一个视频段：frameFiles 收集所有图，length 为总和
@@ -731,7 +729,6 @@ class YuanClipGuide:
                             "trimStart": 0.0,
                             "isStaticImage": True,
                             "resampleMode": batch[0].get("resampleMode", "nearest"),
-                            "videoAttentionStrength": float(batch[0].get("videoAttentionStrength", 0.65)),
                             "description": merged_desc,
                         }
                         merged_segments.append(merged_seg)
@@ -741,6 +738,15 @@ class YuanClipGuide:
                 else:
                     merged_segments.append(seg)
                     i_seg += 1
+
+            # 补帧对齐：合并段总帧数须满足 VAE 的 (N-1)%time_scale_factor==0，
+            # 否则第766行截断会丢帧。多出的1帧由 _load_motion_video_frames
+            # 最大余数法自动分配给第一张图。
+            for seg in merged_segments:
+                if seg.get("isStaticImage"):
+                    total_len = seg.get("length", 0)
+                    if total_len > 0 and (total_len - 1) % time_scale_factor != 0:
+                        seg["length"] = ((total_len - 1) // time_scale_factor + 1) * time_scale_factor + 1
 
             for seg in merged_segments:
                 try:
@@ -752,7 +758,7 @@ class YuanClipGuide:
                     length_frames = int(seg.get("length", 1))
                     trim_start = int(seg.get("trimStart", 0))
                     video_strength = float(seg.get("videoStrength", 1.0))
-                    video_attention_strength = float(seg.get("videoAttentionStrength", 0.65))
+                    video_attention_strength = 1.0
 
                     if length_frames <= 0 or video_strength <= 0.0:
                         continue

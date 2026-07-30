@@ -1775,7 +1775,6 @@ class YuanCLIPTimeline:
                         "fileName": f"motion_seg_{ts}_{i}.png",
                         "description": char_desc,
                         "subjectNum": i + 1,
-                        "videoAttentionStrength": 0.65,
                     }
                     new_motion_segs.append(seg)
                     current_start += seg_len
