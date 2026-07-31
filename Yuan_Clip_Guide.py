@@ -115,7 +115,8 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
         # 这里保持全强度注入，让 mask 机制控制段外帧对 @图X token 的 attention 权重
         effective_alpha = ref_alpha
 
-        for subject_num, token_indices in marker_token_indices.items():
+        for subject_num_str, token_indices in marker_token_indices.items():
+            subject_num = int(subject_num_str)
             # 检查 subject 是否有可用的参考特征
             has_independent_feature = (subject_ref_features is not None
                                        and subject_num in subject_ref_features)
@@ -890,7 +891,7 @@ class YuanClipGuide:
                     ref_weights = weight_grid.flatten().repeat(F_g)
                     ref_weights_expanded = ref_weights[None, :, None]
                     ref_summary = (patches * ref_weights_expanded).sum(dim=1) / ref_weights.sum().clamp_min(1e-6)
-                    subject_ref_features[subject_num] = ref_summary
+                    subject_ref_features[int(subject_num)] = ref_summary
             except Exception:
                 pass
             model = cls._apply_ref_guidance_patch(
