@@ -1611,6 +1611,7 @@ class TimelineEditor {
         this.reorder = {
           sourceIdx: block,
           startX: x,
+          startY: y,
           cursorX: x,
           active: false,
           initialLengths: this.timeline.segments.map(s => s.length),
@@ -1692,16 +1693,25 @@ class TimelineEditor {
     // 段重排拖拽（物理碰撞：实时推开相邻段）
     if (this.reorder) {
       const dx = x - this.reorder.startX;
-      if (!this.reorder.active && Math.abs(dx) > REORDER_THRESHOLD_PX) {
-        this.reorder.active = true;
-        this.canvas.style.cursor = "grabbing";
+      const dy = y - (this.reorder.startY != null ? this.reorder.startY : y);
+      if (!this.reorder.active) {
+        // 垂直移动优先 → 用户意图框选，取消 reorder
+        if (Math.abs(dy) > REORDER_THRESHOLD_PX && Math.abs(dy) > Math.abs(dx)) {
+          try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+          this.canvas.style.cursor = "default";
+          this.reorder = null;
+        } else if (Math.abs(dx) > REORDER_THRESHOLD_PX) {
+          this.reorder.active = true;
+          this.canvas.style.cursor = "grabbing";
+        }
       }
-      if (this.reorder.active) {
+      if (this.reorder && this.reorder.active) {
         this.reorder.cursorX = x;
         this._applyCenterDragPhysics();
         this.render();
+        return;
       }
-      return;
+      // reorder 仍 inactive 时，不 return，继续往下走到框选检测
     }
 
     // 运动段拖拽
@@ -2897,7 +2907,6 @@ class TimelineEditor {
     }
 
     this._updateTotalLabel();
-    this._notifyResize?.();
   }
 
   _buildSegmentProps(idx, seg) {
@@ -3490,14 +3499,12 @@ class TimelineEditor {
       const drawX = Math.floor(r.x);
       const drawW = Math.max(2, Math.floor(r.w));
 
-      ctx.fillStyle = color;
-      ctx.globalAlpha = isDragging ? 0.85 : (isSelected ? 1.0 : (isHover ? 0.9 : 0.75));
-      ctx.fillRect(drawX, blockY, drawW, blockH);
-      ctx.globalAlpha = 1.0;
-
-      ctx.strokeStyle = isDragging ? "#ffd54f" : (isSelected ? "#fff" : "rgba(0,0,0,0.4)");
-      ctx.lineWidth = isDragging || isSelected ? 2 : 1;
+      // 边框使用段颜色，填充使用轨道背景色（与空白区域一致，便于区分图像边界）
+      ctx.strokeStyle = isDragging ? "#ffd54f" : color;
+      ctx.lineWidth = isDragging || isSelected ? 3 : 2;
+      ctx.globalAlpha = isDragging || isSelected ? 1.0 : (isHover ? 1.0 : 0.7);
       ctx.strokeRect(drawX + 0.5, blockY + 0.5, drawW - 1, blockH - 1);
+      ctx.globalAlpha = 1.0;
 
       // 引导图缩略图：视频段优先绘制缩略图序列，图像段绘制单张封面
       if (seg.type === "video" && this._videoFileKey(seg)) {
@@ -3582,9 +3589,7 @@ class TimelineEditor {
       const segW = Math.max(2, seg.length * ppf);
       const isSelected = this._isSelected("motion", i);
 
-      // 段背景
-      ctx.fillStyle = isSelected ? "#6a3a2a" : "#5a2a1a";
-      ctx.fillRect(x, trackY + 2, segW, trackH - 4);
+      // 段背景使用轨道背景色（与空白区域一致，便于区分图像/视频边界）
 
       // 视频缩略图序列（优先于文件名文字）
       const drewThumb = this._drawVideoThumbnails(ctx, seg, x, trackY + 2, segW, trackH - 4);
@@ -3606,7 +3611,7 @@ class TimelineEditor {
 
       // 段边框
       ctx.strokeStyle = isSelected ? "#e8a850" : "#805030";
-      ctx.lineWidth = isSelected ? 2 : 1;
+      ctx.lineWidth = isSelected ? 3 : 2;
       ctx.strokeRect(x + 0.5, trackY + 2.5, Math.max(1, segW - 1), trackH - 5);
 
       // 顶部 "IC-LoRA" 徽章
@@ -3647,10 +3652,9 @@ class TimelineEditor {
       const segW = Math.max(2, seg.length * ppf);
       const isSelected = this._isSelected("audio", i);
 
-      ctx.fillStyle = isSelected ? "#2a4a6a" : "#1a3a5a";
-      ctx.fillRect(x, trackY + 2, segW, trackH - 4);
+      // 段背景使用轨道背景色（与空白区域一致，便于区分波形边界）
       ctx.strokeStyle = isSelected ? "#6fa0e8" : "#3a6080";
-      ctx.lineWidth = isSelected ? 2 : 1;
+      ctx.lineWidth = isSelected ? 3 : 2;
       ctx.strokeRect(x + 0.5, trackY + 2.5, Math.max(1, segW - 1), trackH - 5);
 
       // 波形：优先使用 decodeAudioData 解码的完整波形，回退到 peaks
@@ -3996,32 +4000,17 @@ app.registerExtension({
           // 创建容器 DOM
           const container = document.createElement("div");
           container.className = "yuan-clip-tl-container";
-          // 动态测量容器实际高度，保证 DOM widget 高度与编辑器内容匹配
-          const measureHeight = () => {
-            const h = container?.offsetHeight;
-            return h && h > 0 ? h : 360;
-          };
+          // 固定高度，不使用自动调节
+          const FIXED_HEIGHT = 460;
           node._timelineWidget = node.addDOMWidget("yuan_clip_timeline", "YuanCLIPTimeline", container, {
             serialize: false,
             hideOnZoom: false,
-            getMinHeight: measureHeight,
-            getHeight: measureHeight,
+            getMinHeight: () => FIXED_HEIGHT,
+            getHeight: () => FIXED_HEIGHT,
           });
 
           // 实例化编辑器
           node._timelineEditor = new TimelineEditor(node, container);
-          // 内容变化后通知 ComfyUI 重新计算节点高度
-          const _notifyResize = () => {
-            if (node._timelineWidget?.computedHeight !== undefined) {
-              node._timelineWidget.computedHeight = measureHeight();
-            }
-            node.setDirtyCanvas(true, true);
-          };
-          node._timelineEditor._notifyResize = _notifyResize;
-          // 监听容器尺寸变化
-          const ro = new ResizeObserver(() => _notifyResize());
-          ro.observe(container);
-          setTimeout(_notifyResize, 50);
 
           // 节点创建时若 segment_images / motion_images / 音频输入 端口已连接，延迟尝试实时加载（覆盖加载工作流场景）
           setTimeout(() => {
