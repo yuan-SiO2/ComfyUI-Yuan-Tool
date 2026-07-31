@@ -949,16 +949,18 @@ def _find_marker_phrase_token_indices(
                 start = char_start + marker_len
                 continue
             char_stop = char_start + marker_len
-            scan = char_stop
-            while scan < len(prompt_text):
-                if stop_at_punctuation and prompt_text[scan] in stop_chars:
-                    break
-                if stop_at_other_marker:
-                    tail = prompt_folded[scan:]
-                    if any(tail.startswith(other.casefold()) for other in all_markers if other != marker):
+            if not stop_at_equals:
+                # 仅在非 @图X 场景下扩展到后面的短语
+                scan = char_stop
+                while scan < len(prompt_text):
+                    if stop_at_punctuation and prompt_text[scan] in stop_chars:
                         break
-                scan += 1
-            char_stop = max(char_stop, scan)
+                    if stop_at_other_marker:
+                        tail = prompt_folded[scan:]
+                        if any(tail.startswith(other.casefold()) for other in all_markers if other != marker):
+                            break
+                    scan += 1
+                char_stop = max(char_stop, scan)
             covered_char_ranges.append((char_start, char_stop))
             tok_start = _token_count(raw_tokenizer, prompt_text[:char_start])
             marker_tok_end = _token_count(raw_tokenizer, prompt_text[:char_start + marker_len])
@@ -1233,7 +1235,7 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
             if indices:
                 # 按主体编号分组
                 for tag in marker_tags:
-                    num = tag[2:]
+                    num = int(tag[2:])
                     tag_indices = _find_marker_phrase_token_indices(raw_tokenizer, full_prompt, [tag])
                     if tag_indices:
                         marker_token_indices[num] = tag_indices
@@ -1880,8 +1882,8 @@ class YuanCLIPTimeline:
         # --- @图X=描述 角色解析 + marker token 定位 ---
         # @图X=描述 行保留在 global_prompt 中作为 token 标记
         # K/V 注入：定位 @图X 在 full_prompt（global+local）中的位置，注入对应主体参考帧的 K/V
-        marker_token_indices = {}  # {subject_num_str: [token_indices]}（在 _encode_relay 中填充）
-        marker_segment_refs = {}   # {subject_num_str: [seg_idx, ...]} 每个 @图X 被哪些 local 段引用
+        marker_token_indices = {}  # {subject_num(int): [token_indices]}（在 _encode_relay 中填充）
+        marker_segment_refs = {}   # {subject_num(int): [seg_idx, ...]} 每个 @图X 被哪些 local 段引用
         marker_tags = []           # [@图1, @图2, ...] 用于在 full_prompt 中定位所有 @图X token
         if global_prompt and "@图" in global_prompt:
             char_map, char_list = _parse_msr_characters(global_prompt)
@@ -1893,7 +1895,7 @@ class YuanCLIPTimeline:
                     local_list = [p.strip() for p in local_prompts.split("|") if p.strip()]
                     for seg_idx, local_text in enumerate(local_list):
                         for tag in marker_tags:
-                            num = tag[2:]
+                            num = int(tag[2:])
                             if tag in local_text:
                                 marker_segment_refs.setdefault(num, []).append(seg_idx)
                 # 替换 local_prompts 中的 @图X 引用，保留 @图X 标记并添加描述
@@ -1975,14 +1977,14 @@ class YuanCLIPTimeline:
             # 优先从 motionSegment 的 subjectNum 字段读取 @图X 编号（显式绑定），
             # 若未设置则回退到数组下标 idx+1（向后兼容旧数据）
             motion_segs = tdata.get("motionSegments", []) if tdata else []
-            subject_ref_ranges = {}  # {subject_num_str: (latent_start, latent_end)}
+            subject_ref_ranges = {}  # {subject_num(int): (latent_start, latent_end)}
             time_scale = 8  # LTXV 标准 time_scale_factor
             for idx, mseg in enumerate(motion_segs):
                 raw_num = mseg.get("subjectNum")
                 if isinstance(raw_num, int) and raw_num > 0:
-                    subject_num = str(raw_num)
+                    subject_num = raw_num
                 else:
-                    subject_num = str(idx + 1)
+                    subject_num = idx + 1
                 if subject_num not in marker_token_indices:
                     continue
                 seg_start = int(mseg.get("start", 0))

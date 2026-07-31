@@ -88,7 +88,9 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
     v = self.to_v(context)
 
     # K/V 注入：对每个主体注入参考帧视觉特征
-    if marker_token_indices and subject_ref_ranges and ref_alpha > 0.0:
+    if marker_token_indices and ref_alpha > 0.0 and (
+        subject_ref_ranges or subject_ref_features
+    ):
         # 获取帧维度信息
         grid_sizes = transformer_options.get("grid_sizes")
         T, H, W = None, None, None
@@ -115,8 +117,7 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
         # 这里保持全强度注入，让 mask 机制控制段外帧对 @图X token 的 attention 权重
         effective_alpha = ref_alpha
 
-        for subject_num_str, token_indices in marker_token_indices.items():
-            subject_num = int(subject_num_str)
+        for subject_num, token_indices in marker_token_indices.items():
             # 检查 subject 是否有可用的参考特征
             has_independent_feature = (subject_ref_features is not None
                                        and subject_num in subject_ref_features)
@@ -842,8 +843,7 @@ class YuanClipGuide:
         ref_alpha = float(guide_data.get("ref_alpha", 0.0)) if guide_data else 0.0
         marker_token_indices = guide_data.get("marker_token_indices") if guide_data else None
         subject_ref_ranges = guide_data.get("subject_ref_ranges") if guide_data else None
-        if (ref_alpha > 0.0 and model is not None and marker_token_indices
-                and subject_ref_ranges):
+        if ref_alpha > 0.0 and model is not None and marker_token_indices:
             ref_tau = float(guide_data.get("ref_tau", 5.0))
             # --- 独立视觉编码：为每个 @图X 参考图预计算 visual feature ---
             # 不依赖 video token x 中参考帧的物理位置，彻底解耦坐标系错位问题
@@ -854,9 +854,9 @@ class YuanClipGuide:
                 for idx, seg in enumerate(segments):
                     raw_num = seg.get("subjectNum")
                     if isinstance(raw_num, int) and raw_num > 0:
-                        subject_num = str(raw_num)
+                        subject_num = raw_num
                     else:
-                        subject_num = str(idx + 1)
+                        subject_num = idx + 1
                     if subject_num not in marker_token_indices:
                         continue
                     video_file = seg.get("videoFile")
