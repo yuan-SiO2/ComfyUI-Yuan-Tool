@@ -945,6 +945,11 @@ def _find_marker_phrase_token_indices(
             char_start = prompt_folded.find(marker_folded, start)
             if char_start < 0:
                 break
+            # 数字边界：@图1 不得匹配 @图10/@图11 等前缀，
+            # 否则不同主体的 marker token 范围重叠，K/V 注入会互相覆盖（特征被覆盖/人物错乱）
+            if char_start + marker_len < len(prompt_text) and prompt_text[char_start + marker_len].isdigit():
+                start = char_start + marker_len
+                continue
             if any(c_start <= char_start < c_end for c_start, c_end in covered_char_ranges):
                 start = char_start + marker_len
                 continue
@@ -1093,7 +1098,6 @@ def _make_ltx_mask_wrapper(underlying, mask_fn):
             transformer_options=transformer_options,
         )
 
-    wrapped._promptrelay_wrapper = True
     return wrapped
 
 
@@ -1896,7 +1900,8 @@ class YuanCLIPTimeline:
                     for seg_idx, local_text in enumerate(local_list):
                         for tag in marker_tags:
                             num = int(tag[2:])
-                            if tag in local_text:
+                            # 数字边界：@图1 不匹配 @图10，避免段帧范围误绑定导致主体错位
+                            if re.search(rf'@图{num}(?!\d)', local_text):
                                 marker_segment_refs.setdefault(num, []).append(seg_idx)
                 # 替换 local_prompts 中的 @图X 引用，保留 @图X 标记并添加描述
                 # 这样 K/V 注入能直接作用于 local 段中的 @图X token，关联视觉特征与行为描述
@@ -1960,43 +1965,15 @@ class YuanCLIPTimeline:
             tdata, start_frame, max_frames, float(fps), resize_method, use_custom_motion,
         )
 
-        guide_data["start_frame"] = start_frame
-        guide_data["duration_frames"] = max_frames
         guide_data["resize_method"] = resize_method
-        guide_data["inpaint_audio"] = inpaint_audio
-        guide_data["use_custom_audio"] = use_custom_audio or override_audio
 
-        # --- K/V 视觉特征注入：marker_token_indices + subject_ref_ranges ---
-        # 替换原 Ref Guidance 全局文本引导，改为 attn2 K/V 注入
-        # @图X 在 global_prompt 中的 token 位置被标记，注入对应主体参考帧的 K/V
+        # --- K/V 视觉特征注入：marker_token_indices + ref_alpha ---
+        # @图X 在 full_prompt（global + local）中的 token 位置被标记，
+        # 由下游 Yuan 引导注入节点把 motionSegments 对应主体的参考帧视觉特征注入到这些 token 的 K/V。
+        # 段外注意力抑制由 build_segments 生成的 token 级 mask（promptrelay_mask_fn）负责，ref_tau 已在此生效。
         if marker_token_indices and ref_alpha > 0.0:
             guide_data["marker_token_indices"] = marker_token_indices
             guide_data["ref_alpha"] = float(ref_alpha)
-            guide_data["ref_tau"] = float(ref_tau)
-            # 从 motionSegments 构建主体参考帧范围映射
-            # 优先从 motionSegment 的 subjectNum 字段读取 @图X 编号（显式绑定），
-            # 若未设置则回退到数组下标 idx+1（向后兼容旧数据）
-            motion_segs = tdata.get("motionSegments", []) if tdata else []
-            subject_ref_ranges = {}  # {subject_num(int): (latent_start, latent_end)}
-            time_scale = 8  # LTXV 标准 time_scale_factor
-            for idx, mseg in enumerate(motion_segs):
-                raw_num = mseg.get("subjectNum")
-                if isinstance(raw_num, int) and raw_num > 0:
-                    subject_num = raw_num
-                else:
-                    subject_num = idx + 1
-                if subject_num not in marker_token_indices:
-                    continue
-                seg_start = int(mseg.get("start", 0))
-                seg_length = int(mseg.get("length", 1))
-                if seg_length <= 0:
-                    continue
-                # 像素帧转 latent 索引（向下取整 start，向上取整 end）
-                latent_start = seg_start // time_scale
-                latent_end = (seg_start + seg_length + time_scale - 1) // time_scale
-                subject_ref_ranges[subject_num] = (latent_start, max(latent_start + 1, latent_end))
-            if subject_ref_ranges:
-                guide_data["subject_ref_ranges"] = subject_ref_ranges
         else:
             guide_data["ref_alpha"] = 0.0
 
