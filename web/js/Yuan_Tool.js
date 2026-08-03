@@ -1,7 +1,7 @@
 const { app } = window.comfyAPI.app;
 
 // ==================== YuanTool（多帧参考节点，list_mode 动态端口）====================
-function registerYuanTool(nodeType) {
+function registerYuanTool(nodeType, portMeta) {
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
         const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
@@ -21,9 +21,17 @@ function registerYuanTool(nodeType) {
         };
 
         const addOptionalImageInput = (name) => {
-            self.addInput(name, imageType, { shape: 7, optional: true });
+            const meta = portMeta[name] || {};
+            const opts = { shape: 7, optional: true };
+            if (meta.display_name) opts.display_name = meta.display_name;
+            if (meta.tooltip) opts.tooltip = meta.tooltip;
+            self.addInput(name, imageType, opts);
             const inp = self.inputs.find(inp => inp.name === name);
-            if (inp) inp.optional = true;
+            if (inp) {
+                inp.optional = true;
+                if (meta.display_name) inp.label = meta.display_name;
+                if (meta.tooltip) inp.tooltip = meta.tooltip;
+            }
         };
 
         const isConnected = (name) => {
@@ -41,7 +49,7 @@ function registerYuanTool(nodeType) {
             return true;
         };
 
-        const syncPorts = (mode) => {
+        const syncPortsReal = (mode) => {
             if (self._syncing) return;
             self._syncing = true;
             // 期望端口集合：列表模式用 image_list；单帧模式按连接状态递进显示
@@ -152,17 +160,35 @@ function registerYuanTool(nodeType) {
             app.graph.setDirtyCanvas(true, true);
         };
 
-        self._syncPorts = syncPorts;
+        // 把 syncPortsReal 调度到下一 tick，确保 graph.links 已完整恢复。
+        // 在 onNodeCreated / onConfigure / mode.callback / onConnectionsChange
+        // 等生命周期中，links 可能尚未挂到 input.link 上，立即执行会
+        // 误判递进端口、重排 slot 错位、savedLinks 为空，导致切换工作流时断开。
+        const scheduleSync = (mode) => {
+            clearTimeout(self._syncTimer);
+            self._syncTimer = setTimeout(() => syncPortsReal(mode), 0);
+        };
+
+        self._syncPorts = scheduleSync;
 
         const modeWidget = this.widgets.find(w => w.name === "list_mode");
         if (modeWidget) {
-            syncPorts(!!modeWidget.value);
+            scheduleSync(!!modeWidget.value);
 
             const origCallback = modeWidget.callback;
             modeWidget.callback = function (value) {
                 if (origCallback) origCallback.apply(this, arguments);
-                self._syncPorts(!!value);
+                scheduleSync(!!value);
             };
+        }
+
+        // 修正初始已创建端口的 label / tooltip（框架自动生成的端口可能未正确应用 display_name）
+        for (const inp of self.inputs) {
+            const meta = portMeta[inp.name];
+            if (meta) {
+                if (meta.display_name) inp.label = meta.display_name;
+                if (meta.tooltip) inp.tooltip = meta.tooltip;
+            }
         }
 
         return r;
@@ -219,7 +245,7 @@ const MINIMAX_PORT_TYPES = {
     ref_audio_1: "AUDIO", ref_audio_2: "AUDIO", ref_audio_3: "AUDIO",
 };
 
-function registerYuanMiniMaxH3Video(nodeType) {
+function registerYuanMiniMaxH3Video(nodeType, portMeta) {
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
         const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
@@ -234,7 +260,22 @@ function registerYuanMiniMaxH3Video(nodeType) {
             return !!(curInp && curInp.link != null);
         };
 
-        const syncPorts = () => {
+        const addOptionalInput = (name) => {
+            const meta = portMeta[name] || {};
+            const typ = MINIMAX_PORT_TYPES[name] || (meta.type || "*");
+            const opts = { shape: 7, optional: true };
+            if (meta.display_name) opts.display_name = meta.display_name;
+            if (meta.tooltip) opts.tooltip = meta.tooltip;
+            self.addInput(name, typ, opts);
+            const inp = self.inputs.find(inp => inp.name === name);
+            if (inp) {
+                inp.optional = true;
+                if (meta.display_name) inp.label = meta.display_name;
+                if (meta.tooltip) inp.tooltip = meta.tooltip;
+            }
+        };
+
+        const syncPortsReal = () => {
             if (self._syncing) return;
             self._syncing = true;
             try {
@@ -282,9 +323,7 @@ function registerYuanMiniMaxH3Video(nodeType) {
                 // 第三步：添加缺少的可选端口（按 desiredNames 顺序，保证排列整洁）
                 for (const name of desiredNames) {
                     if (!self.inputs.find(inp => inp.name === name)) {
-                        self.addInput(name, MINIMAX_PORT_TYPES[name], { shape: 7, optional: true });
-                        const inp = self.inputs.find(inp => inp.name === name);
-                        if (inp) inp.optional = true;
+                        addOptionalInput(name);
                     }
                 }
 
@@ -336,17 +375,35 @@ function registerYuanMiniMaxH3Video(nodeType) {
             }
         };
 
-        self._syncPorts = syncPorts;
+        // 把 syncPortsReal 调度到下一 tick，确保 graph.links 已完整恢复（与 YuanTool 同源 BUG 修复）。
+        // 在 onNodeCreated / onConfigure / mode.callback / onConnectionsChange
+        // 等生命周期中，links 可能尚未挂到 input.link 上，立即执行会
+        // 误判递进端口、重排 slot 错位、savedLinks 为空，导致切换工作流时断开。
+        const scheduleSync = () => {
+            clearTimeout(self._syncTimer);
+            self._syncTimer = setTimeout(syncPortsReal, 0);
+        };
+
+        self._syncPorts = scheduleSync;
 
         const modeWidget = self.widgets.find(w => w.name === "mode");
         if (modeWidget) {
-            syncPorts();
+            scheduleSync();
 
             const origCallback = modeWidget.callback;
             modeWidget.callback = function () {
                 if (origCallback) origCallback.apply(this, arguments);
-                self._syncPorts();
+                scheduleSync();
             };
+        }
+
+        // 修正初始已创建端口的 label / tooltip（框架自动生成的端口可能未正确应用 display_name）
+        for (const inp of self.inputs) {
+            const meta = portMeta[inp.name];
+            if (meta) {
+                if (meta.display_name) inp.label = meta.display_name;
+                if (meta.tooltip) inp.tooltip = meta.tooltip;
+            }
         }
 
         return r;
@@ -373,10 +430,30 @@ function registerYuanMiniMaxH3Video(nodeType) {
 app.registerExtension({
     name: "ComfyUI-Yuan-Tool",
     async beforeRegisterNodeDef(nodeType, nodeData) {
+        // 从后端注册的 nodeData.input 提取每个可选端口的 display_name / tooltip 元数据
+        // 前端动态 addInput 时会用这份元数据，避免删建后汉化名丢失。
+        const buildPortMeta = () => {
+            const meta = {};
+            const input = nodeData.input || {};
+            for (const sect of ["required", "optional"]) {
+                const grp = input[sect] || {};
+                for (const [name, def] of Object.entries(grp)) {
+                    if (def && Array.isArray(def) && def.length >= 2 && def[1] && typeof def[1] === "object") {
+                        const opts = def[1];
+                        meta[name] = {
+                            type: def[0],
+                            display_name: opts.display_name,
+                            tooltip: opts.tooltip,
+                        };
+                    }
+                }
+            }
+            return meta;
+        };
         if (nodeData.name === "YuanTool") {
-            registerYuanTool(nodeType);
+            registerYuanTool(nodeType, buildPortMeta());
         } else if (nodeData.name === "Yuan_MiniMaxH3Video") {
-            registerYuanMiniMaxH3Video(nodeType);
+            registerYuanMiniMaxH3Video(nodeType, buildPortMeta());
         }
     },
 });
