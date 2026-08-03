@@ -1,4 +1,3 @@
-import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,37 +7,40 @@ try:
 except ImportError:
     cv2 = None
 
-log = logging.getLogger(__name__)
-
 
 class YuanTool:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "width": ("INT", {"default": 736, "min": 32, "max": 8192, "step": 32}),
-                "height": ("INT", {"default": 1280, "min": 32, "max": 8192, "step": 32}),
-                "frame_multiplier": ([1, 8, 16, 24, 32], {"default": 16}),
-                "list_mode": ("BOOLEAN", {"default": False, "label_on": "true", "label_off": "false"}),
+                "width": ("INT", {"default": 736, "min": 32, "max": 8192, "step": 32, "display_name": "宽度", "tooltip": "生成视频宽度（32 的倍数）"}),
+                "height": ("INT", {"default": 1280, "min": 32, "max": 8192, "step": 32, "display_name": "高度", "tooltip": "生成视频高度（32 的倍数）"}),
+                "frame_multiplier": ([1, 8, 16, 24, 32], {"default": 16, "display_name": "每图帧数", "tooltip": "每张图像持续的帧数；16 帧≈每图 0.67 秒。第一组会额外多 1 帧用于 VAE 8 帧分组对齐"}),
+                "list_mode": ("BOOLEAN", {"default": False, "label_on": "列表模式", "label_off": "单帧模式", "display_name": "输入模式", "tooltip": "开启：通过单个 image_list 端口接收多张图像（最多 8 张，超出自动截断）；关闭：端口 1-8 逐张输入（1、2 常显，前置连满后依次出现后续端口）"}),
             },
             "optional": {
-                "background": ("IMAGE",),
-                "1": ("IMAGE",),
-                "2": ("IMAGE",),
-                "3": ("IMAGE",),
-                "4": ("IMAGE",),
-                "5": ("IMAGE",),
-                "6": ("IMAGE",),
-                "7": ("IMAGE",),
-                "8": ("IMAGE",),
-                "image_list": ("IMAGE",),
+                "background": ("IMAGE", {"display_name": "背景", "tooltip": "视频背景图像（可留空），尾部附加 frame_multiplier 帧"}),
+                "1": ("IMAGE", {"display_name": "图像1", "tooltip": "第 1 张主体图像"}),
+                "2": ("IMAGE", {"display_name": "图像2", "tooltip": "第 2 张主体图像"}),
+                "3": ("IMAGE", {"display_name": "图像3", "tooltip": "第 3 张主体图像（1、2 连满后显示）"}),
+                "4": ("IMAGE", {"display_name": "图像4", "tooltip": "第 4 张主体图像（前 3 张连满后显示）"}),
+                "5": ("IMAGE", {"display_name": "图像5", "tooltip": "第 5 张主体图像（前 4 张连满后显示）"}),
+                "6": ("IMAGE", {"display_name": "图像6", "tooltip": "第 6 张主体图像（前 5 张连满后显示）"}),
+                "7": ("IMAGE", {"display_name": "图像7", "tooltip": "第 7 张主体图像（前 6 张连满后显示）"}),
+                "8": ("IMAGE", {"display_name": "图像8", "tooltip": "第 8 张主体图像（前 7 张连满后显示）"}),
+                "image_list": ("IMAGE", {"display_name": "图像列表", "tooltip": "批量图像端口（列表模式下显示），最多 8 张，超出自动截断"}),
             },
         }
 
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("output",)
+    RETURN_NAMES = ("视频帧",)
+    OUTPUT_TOOLTIPS = ("按图像顺序拼接并乘以每图帧数生成的视频帧 batch（0..1 float），可直接送入 VAE 编码或下一个节点。",)
     FUNCTION = "create_video"
     CATEGORY = "Yuan Tool/图像"
+    DESCRIPTION = (
+        "多帧参考节点：将多张主体图像按顺序展开为视频帧（每图帧数固定），"
+        "可选附加背景帧。支持端口 1-8 逐张输入（端口递进显示）或 image_list 批量输入（最多 8 张）。"
+    )
 
     def create_video(self, width, height, frame_multiplier, list_mode, **kwargs):
         background = kwargs.get("background")
@@ -185,16 +187,18 @@ class YuanTool:
 class GetImage:
 
     RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("筛选图像",)
+    OUTPUT_TOOLTIPS = ("按指定索引从批量图像中筛选出的帧（顺序保持）。",)
     FUNCTION = "indexedimagesfrombatch"
     CATEGORY = "Yuan Tool/图像"
-    DESCRIPTION = "从批量中筛选一张或者多张图像。"
+    DESCRIPTION = "从批量中筛选一张或者多张图像。用逗号分隔索引（从 0 起），支持多行；无效索引会被自动忽略，全无效时回退到第 0 张。"
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "indexes": ("STRING", {"default": "0, 1, 2", "multiline": True}),
+                "images": ("IMAGE", {"display_name": "输入图像", "tooltip": "要筛选的图像批次（batch）"}),
+                "indexes": ("STRING", {"default": "0, 1, 2", "multiline": True, "display_name": "索引列表", "tooltip": "逗号分隔的索引（从 0 起），如 0,2,5；也支持多行。超出范围的索引会被忽略。"}),
             },
         }
 
@@ -204,7 +208,6 @@ class GetImage:
         valid_indices = [i for i in index_list if 0 <= i < batch_size]
         if not valid_indices:
             valid_indices = [0]
-        log.info("[GetImage] 请求索引 %s，批次大小 %d，有效索引 %s", index_list, batch_size, valid_indices)
         indices_tensor = torch.tensor(valid_indices, dtype=torch.long)
         chosen_images = images[indices_tensor]
         return (chosen_images,)

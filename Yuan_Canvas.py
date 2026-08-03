@@ -102,15 +102,15 @@ class Yuan_Canvas:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "bg_image": ("IMAGE",),
-                "fabricData": ("STRING", {"default": "{}"}),
-                "imageName": ("STRING", {"default": "new.png"}),
-                "width": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 32}),
-                "height": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 32}),
-                "padding": ("INT", {"default": 100, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
+                "bg_image": ("IMAGE", {"display_name": "背景图像", "tooltip": "画布背景图像，作为底层填充"}),
+                "fabricData": ("STRING", {"default": "{}", "display_name": "画布配置", "tooltip": "前端画布引擎使用的图层配置 JSON"}),
+                "imageName": ("STRING", {"default": "new.png", "display_name": "合成文件名", "tooltip": "上传到 ComfyUI 的合成结果文件名；默认 new.png 表示尚未合成"}),
+                "width": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 32, "display_name": "宽度", "tooltip": "画布输出宽度（32 的倍数）"}),
+                "height": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 32, "display_name": "高度", "tooltip": "画布输出高度（32 的倍数）"}),
+                "padding": ("INT", {"default": 100, "min": 0, "max": MAX_RESOLUTION, "step": 1, "display_name": "暂存边距", "tooltip": "画布边缘暂存区大小（用于不想导出的素材停靠区）"}),
             },
             "optional": {
-                "images": ("IMAGE",),
+                "images": ("IMAGE", {"display_name": "图层图像", "tooltip": "作为独立图层的图像批次（batch）"}),
             },
             "hidden": {
                 "extra_pnginfo": "EXTRA_PNGINFO",
@@ -119,7 +119,8 @@ class Yuan_Canvas:
         }
 
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_NAMES = ("合成图像",)
+    OUTPUT_TOOLTIPS = ("前端合成完成后导出的最终图像（PNG）。配置变化时节点会阻塞等待合成。",)
     FUNCTION = "composite"
     CATEGORY = "Yuan Tool/画布"
 

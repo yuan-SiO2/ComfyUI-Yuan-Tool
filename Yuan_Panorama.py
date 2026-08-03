@@ -20,8 +20,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-log = logging.getLogger(__name__)
-
 # ComfyUI 内部模块（可选导入，便于在测试环境独立运行）
 try:
     import folder_paths
@@ -127,7 +125,8 @@ def _save_preview_images(images, key: str = "pano_input_images") -> dict:
         if isinstance(res, dict) and "ui" in res and "images" in res["ui"]:
             return {key: res["ui"]["images"]}
     except Exception:
-        log.exception("[YuanPanorama] 保存预览图失败")
+        # 预览图保存失败时静默，不中断主流程，返回空 UI
+        pass
     return {}
 
 
@@ -285,24 +284,26 @@ class YuanPanoramaPreview:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ERP_image": ("IMAGE",),
-                "Coverage": (["360", "180"], {"default": "360"}),
-                "output_current_view": ("BOOLEAN", {"default": True, "display_name": "全景模式"}),
-                "view_width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8, "display_name": "裁剪宽度"}),
-                "view_height": ("INT", {"default": 512, "min": 64, "max": 8192, "step": 8, "display_name": "裁剪高度"}),
+                "ERP_image": ("IMAGE", {"display_name": "全景图像", "tooltip": "ERP 格式的全景图像/视频批次（等距柱状投影，宽高比 2:1）"}),
+                "Coverage": (["360", "180"], {"default": "360", "display_name": "视场", "tooltip": "360° 全屏全景或 180° 半景。前端交互预览读取该值。"}),
+                "output_current_view": ("BOOLEAN", {"default": True, "display_name": "全景模式",
+                    "tooltip": "开启：输出完整 ERP 全景；关闭：按 3D 视角裁剪结果，输出当前画面"}),
+                "view_width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8, "display_name": "裁剪宽度", "tooltip": "裁剪模式下输出画面宽度"}),
+                "view_height": ("INT", {"default": 512, "min": 64, "max": 8192, "step": 8, "display_name": "裁剪高度", "tooltip": "裁剪模式下输出画面高度"}),
             },
             "optional": {
-                "current_view_data": ("STRING", {"default": "", "multiline": False, "hidden": True, "display": "hidden"}),
+                "current_view_data": ("STRING", {"default": "", "multiline": False, "hidden": True, "display": "hidden",
+                    "display_name": "当前视角数据", "tooltip": "前端写入的当前 3D 视角 data URL（裁剪模式下使用，内部字段）"}),
             },
         }
 
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("输出",)
-    OUTPUT_TOOLTIPS = ("当前节点预览画面：开启全景模式输出完整 ERP 全景图；关闭则按 view_width/view_height 输出 3D 裁剪截图。",)
+    RETURN_NAMES = ("输出图像",)
+    OUTPUT_TOOLTIPS = ("全景模式输出完整 ERP 全景图；裁剪模式输出当前 3D 视角截图。",)
     FUNCTION = "execute"
     CATEGORY = "Yuan Tool/图像"
     OUTPUT_NODE = True
-    DESCRIPTION = "交互式预览 ERP 全景图（360°/180°），支持视频批次输入；可输出当前 3D 裁剪画面。"
+    DESCRIPTION = "交互式预览 ERP 全景图（360°/180°），支持视频批次输入；可切换全景/裁剪模式输出当前画面。"
 
     def execute(self, ERP_image, Coverage="360", output_current_view=False, view_width=1024, view_height=512, current_view_data=""):
         ui_ret = {}
@@ -369,21 +370,25 @@ class YuanPanoramaSeamPrep:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image": ("IMAGE",),
-                "seam_width_px": ("INT", {"default": 64, "min": 1, "max": 2048, "step": 1}),
-                "seam_center_offset_px": ("INT", {"default": 0, "min": -2048, "max": 2048, "step": 1}),
-                "mask_blur_px": ("INT", {"default": 10, "min": 0, "max": 256, "step": 1}),
+                "image": ("IMAGE", {"display_name": "输入图像", "tooltip": "ERP 全景图像 [B,H,W,C]，将把接缝平移到画面中部便于修补"}),
+                "seam_width_px": ("INT", {"default": 64, "min": 1, "max": 2048, "step": 1, "display_name": "接缝宽度", "tooltip": "接缝带掩码的宽度（像素），决定参与修复的区域"}),
+                "seam_center_offset_px": ("INT", {"default": 0, "min": -2048, "max": 2048, "step": 1, "display_name": "接缝偏移", "tooltip": "接缝中心的水平偏移（像素），正向右移，负向左移"}),
+                "mask_blur_px": ("INT", {"default": 10, "min": 0, "max": 256, "step": 1, "display_name": "掩码模糊", "tooltip": "接缝掩码的高斯模糊半径（像素），0 为不模糊"}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "MASK")
-    RETURN_NAMES = ("image", "mask", "mask_blurred")
+    RETURN_NAMES = ("平移后图像", "接缝掩码", "模糊掩码")
+    OUTPUT_TOOLTIPS = (
+        "接缝平移到画面中部后的 ERP 图像 [B,H,W,C]，可直接输入修复模型。",
+        "接缝带硬掩码 [B,H,W]，对应 seam_width_px 宽度。",
+        "高斯模糊后的接缝掩码 [B,H,W]，可作为修复 mask 混合强度。",
+    )
     FUNCTION = "execute"
     CATEGORY = "Yuan Tool/图像"
     DESCRIPTION = (
-        "为接缝修复准备 ERP 图像。输入 IMAGE 形状 [B,H,W,C]，"
-        "输出 image [B,H,W,C]、mask [B,H,W]、mask_blurred [B,H,W]。"
-        "seam_center_offset_px 为正时接缝带右移，为负时左移。"
+        "为接缝修复（seam-focused inpainting）准备 ERP 图像。"
+        "将全景左右接缝平移到画面中心，输出平移后图像与接缝掩码（硬掩码 + 模糊掩码）。"
     )
 
     @staticmethod

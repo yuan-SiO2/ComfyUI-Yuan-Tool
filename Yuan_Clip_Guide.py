@@ -817,7 +817,7 @@ class YuanClipGuide:
                 patchify_proj = None
 
             if patchify_proj is None:
-                print("[Yuan Guide] 未找到 patchify_proj，@图X K/V 视觉特征注入被禁用")
+                pass  # patchify_proj 缺失时禁用 @图X K/V 视觉特征注入，不打印
             else:
                 for idx, seg in enumerate(segments):
                     raw_num = seg.get("subjectNum")
@@ -861,8 +861,9 @@ class YuanClipGuide:
                         ref_weights_expanded = ref_weights[None, :, None]
                         ref_summary = (patches * ref_weights_expanded).sum(dim=1) / ref_weights.sum().clamp_min(1e-6)
                         subject_ref_features[int(subject_num)] = ref_summary
-                    except Exception as e:
-                        print(f"[Yuan Guide] 主体 @图{subject_num} 参考特征编码失败，跳过该主体 K/V 注入: {e}")
+                    except Exception:
+                        # 单个主体编码失败时跳过，不中断整体执行
+                        continue
             if subject_ref_features:
                 model = cls._apply_ref_guidance_patch(
                     model, marker_token_indices, ref_alpha,

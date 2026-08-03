@@ -136,7 +136,7 @@ class YuanMiniMaxH3Video:
             # ---- 参考图生视频模式 ----
             "audio_vae": ("VAE", {"optional": True, "display_name": "音频VAE",
                                   "tooltip": "用于编码参考音频的音频 VAE 模型"}),
-            "ref_image_size": (["match", "max"], {"default": "match", "display_name": "参考图尺寸",
+            "ref_image_size": (["匹配", "最大"], {"default": "匹配", "display_name": "参考图尺寸",
                 "tooltip": "参考图像尺寸策略。'匹配'：将每张参考图（仅缩小、保持宽高比）缩放到生成画面的像素面积；'最大'：使用参考管线的 2048px 短边以获得最佳主体保真度。参考标记会贯穿每个采样步，'最大' 模式可能慢数倍。"}),
             # 参考图像列表端口：可连接多张图像（batch），最多 REF_IMAGE_PORTS 张，超出自动切断
             "ref_images": image_port(
@@ -144,13 +144,13 @@ class YuanMiniMaxH3Video:
         }
         for i in range(1, REF_VIDEO_PORTS + 1):
             optional[f"ref_video_{i}"] = image_port(
-                f"ref_video_{i}", "参考视频", "24fps 的参考视频帧（2-15 秒）")
+                f"ref_video_{i}", f"参考视频{i}", f"24fps 的参考视频帧（2-15 秒），第 {i} 路参考视频")
         for i in range(1, REF_AUDIO_PORTS + 1):
             optional[f"ref_video_audio_{i}"] = audio_port(
-                f"ref_video_audio_{i}", "参考视频音频", "与同编号参考视频对应的音轨")
+                f"ref_video_audio_{i}", f"参考视频音频{i}", f"与参考视频{i} 对应的音轨")
         for i in range(1, REF_AUDIO_PORTS + 1):
             optional[f"ref_audio_{i}"] = audio_port(
-                f"ref_audio_{i}", "参考音频", "独立的参考音频")
+                f"ref_audio_{i}", f"参考音频{i}", f"独立的参考音频，第 {i} 路")
 
         return {
             "required": {
@@ -222,13 +222,15 @@ class YuanMiniMaxH3Video:
 
         ref_items = []   # 供分词器按请求顺序呈现
         ref_blocks = []  # 供 DiT 负载，顺序一致
+        # 参考图尺寸下拉框选项已汉化（见 INPUT_TYPES），这里还原为内部处理用的英文 key
+        _match_mode = "match" if ref_image_size in ("匹配", "match") else "max"
 
         # 1. 参考图像：ref_images 列表端口（batch 多图，最多 REF_IMAGE_PORTS 张，超出自动切断）
         if ref_images is not None:
             for img in ref_images[:REF_IMAGE_PORTS]:
                 img = img.unsqueeze(0)  # 单张 [1, H, W, C]
                 h, w = img.shape[1], img.shape[2]
-                if ref_image_size == "match":
+                if _match_mode == "match":
                     # 保持宽高比的缩放（仅缩小）到生成画面的像素面积
                     scale = min(1.0, math.sqrt((width * height) / (w * h)))
                 else:
