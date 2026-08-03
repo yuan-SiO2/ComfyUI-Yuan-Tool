@@ -27,6 +27,10 @@ class YuanTool:
                 "2": ("IMAGE",),
                 "3": ("IMAGE",),
                 "4": ("IMAGE",),
+                "5": ("IMAGE",),
+                "6": ("IMAGE",),
+                "7": ("IMAGE",),
+                "8": ("IMAGE",),
                 "image_list": ("IMAGE",),
             },
         }
@@ -45,15 +49,15 @@ class YuanTool:
             if image_list is not None:
                 if isinstance(image_list, torch.Tensor):
                     batch = image_list.shape[0] if image_list.ndim == 4 else 1
-                    batch = min(batch, 4)
+                    batch = min(batch, 8)
                     for i in range(batch):
                         img = image_list[i] if image_list.ndim == 4 else image_list
                         subjects.append(self._prepare_image(img, (width, height), preserve_full=True))
                 elif isinstance(image_list, list):
-                    for idx, img in enumerate(image_list[:4]):
+                    for idx, img in enumerate(image_list[:8]):
                         subjects.append(self._prepare_image(img, (width, height), preserve_full=True))
         else:
-            for name in ("1", "2", "3", "4"):
+            for name in ("1", "2", "3", "4", "5", "6", "7", "8"):
                 image = kwargs.get(name)
                 if image is not None:
                     subjects.append(self._prepare_image(image, (width, height), preserve_full=True))
