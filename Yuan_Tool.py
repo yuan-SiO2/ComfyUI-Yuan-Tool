@@ -11,12 +11,27 @@ except ImportError:
 class YuanTool:
     @classmethod
     def INPUT_TYPES(cls):
+        list_inputs = {}
+        for i in range(1, 9):
+            prev = f"图像列表{i - 1}、图像列表{i - 2}" if i >= 3 else "常显"
+            list_inputs[f"image_list_{i}"] = (
+                "IMAGE",
+                {
+                    "display_name": f"图像列表{i}",
+                    "tooltip": (
+                        f"第 {i} 路批量图像（列表模式下使用），最多 8 张，超出自动截断。"
+                        if i <= 2
+                        else f"第 {i} 路批量图像（列表模式下使用），最多 8 张，超出自动截断。仅当 {prev} 都已接入后自动出现，最多 8 路。"
+                    ),
+                },
+            )
+
         return {
             "required": {
                 "width": ("INT", {"default": 736, "min": 32, "max": 8192, "step": 32, "display_name": "宽度", "tooltip": "生成视频宽度（32 的倍数）"}),
                 "height": ("INT", {"default": 1280, "min": 32, "max": 8192, "step": 32, "display_name": "高度", "tooltip": "生成视频高度（32 的倍数）"}),
                 "frame_multiplier": ([1, 8, 16, 24, 32], {"default": 16, "display_name": "每图帧数", "tooltip": "每张图像持续的帧数；16 帧≈每图 0.67 秒。第一组会额外多 1 帧用于 VAE 8 帧分组对齐"}),
-                "list_mode": ("BOOLEAN", {"default": False, "label_on": "列表模式", "label_off": "单帧模式", "display_name": "输入模式", "tooltip": "开启：通过单个 image_list 端口接收多张图像（最多 8 张，超出自动截断）；关闭：端口 1-8 逐张输入（1、2 常显，前置连满后依次出现后续端口）"}),
+                "list_mode": ("BOOLEAN", {"default": False, "label_on": "列表模式", "label_off": "单帧模式", "display_name": "输入模式", "tooltip": "开启：通过图像列表1..8端口多路批量输入（1、2常显，接满后依次出现后续端口，每路最多 8 张，总共最多 8 张）；关闭：端口 1-8 逐张输入（1、2 常显，前置连满后依次出现后续端口）"}),
             },
             "optional": {
                 "background": ("IMAGE", {"display_name": "背景", "tooltip": "视频背景图像（可留空），尾部附加 frame_multiplier 帧"}),
@@ -28,7 +43,7 @@ class YuanTool:
                 "6": ("IMAGE", {"display_name": "图像6", "tooltip": "第 6 张主体图像（前 5 张连满后显示）"}),
                 "7": ("IMAGE", {"display_name": "图像7", "tooltip": "第 7 张主体图像（前 6 张连满后显示）"}),
                 "8": ("IMAGE", {"display_name": "图像8", "tooltip": "第 8 张主体图像（前 7 张连满后显示）"}),
-                "image_list": ("IMAGE", {"display_name": "图像列表", "tooltip": "批量图像端口（列表模式下显示），最多 8 张，超出自动截断"}),
+                **list_inputs,
             },
         }
 
@@ -39,42 +54,106 @@ class YuanTool:
     CATEGORY = "Yuan Tool/图像"
     DESCRIPTION = (
         "多帧参考节点：将多张主体图像按顺序展开为视频帧（每图帧数固定），"
-        "可选附加背景帧。支持端口 1-8 逐张输入（端口递进显示）或 image_list 批量输入（最多 8 张）。"
+        "可选附加背景帧。支持端口 1-8 逐张输入（端口递进显示）或"
+        "图像列表1..8 多路批量输入（每路最多 8 张、总共最多 8 张，端口递进显示）。"
+        "图像列表端口若接收到上游「筛选图像」节点的 64×64 空兜底图，将视为该端口未接入。"
     )
+
+    @staticmethod
+    def _is_empty_fallback_image(image):
+        """判断是否为「筛选图像」节点的空兜底图：形状 (1,64,64,3) 且全为 0。"""
+        if image is None:
+            return True
+        t = image
+        if isinstance(t, torch.Tensor):
+            if t.ndim == 4 and t.shape[0] == 1 and t.shape[1] == 64 and t.shape[2] == 64 and t.shape[3] == 3:
+                try:
+                    return bool(torch.allclose(t.float(), torch.zeros_like(t.float()), atol=1e-6))
+                except Exception:
+                    return False
+            return False
+        if isinstance(t, (list, tuple)) and len(t) == 1:
+            return YuanTool._is_empty_fallback_image(t[0])
+        # 其他情况（非张量，或形状不符）按非空处理
+        return False
+
+    def _iter_tensor_images(self, image_list, limit_per_list, prepare, target_size):
+        """从一个 image_list（tensor 或 list）中按上限取出最多 limit_per_list 张图像，经 prepare 后 yield。"""
+        if image_list is None:
+            return
+        n = 0
+        if isinstance(image_list, torch.Tensor):
+            batch = image_list.shape[0] if image_list.ndim == 4 else 1
+            take = min(batch, limit_per_list)
+            for i in range(take):
+                img = image_list[i] if image_list.ndim == 4 else image_list
+                yield prepare(img, target_size, preserve_full=True)
+                n += 1
+                if n >= limit_per_list:
+                    return
+        elif isinstance(image_list, (list, tuple)):
+            for img in image_list:
+                if n >= limit_per_list:
+                    return
+                yield prepare(img, target_size, preserve_full=True)
+                n += 1
 
     def create_video(self, width, height, frame_multiplier, list_mode, **kwargs):
         background = kwargs.get("background")
+        prepare = self._prepare_image
+        target_size = (width, height)
 
         subjects = []
+        TOTAL_LIMIT = 8
+        LIMIT_PER_LIST = 8
+
         if list_mode:
-            image_list = kwargs.get("image_list")
-            if image_list is not None:
-                if isinstance(image_list, torch.Tensor):
-                    batch = image_list.shape[0] if image_list.ndim == 4 else 1
-                    batch = min(batch, 8)
-                    for i in range(batch):
-                        img = image_list[i] if image_list.ndim == 4 else image_list
-                        subjects.append(self._prepare_image(img, (width, height), preserve_full=True))
-                elif isinstance(image_list, list):
-                    for idx, img in enumerate(image_list[:8]):
-                        subjects.append(self._prepare_image(img, (width, height), preserve_full=True))
+            # 按 1..8 顺序取每个 image_list 端口；过滤空兜底端口；收集至总上限 8 张
+            for i in range(1, 9):
+                if len(subjects) >= TOTAL_LIMIT:
+                    break
+                key = f"image_list_{i}"
+                img_list = kwargs.get(key)
+                if YuanTool._is_empty_fallback_image(img_list):
+                    continue
+                for prepared in self._iter_tensor_images(img_list, LIMIT_PER_LIST, prepare, target_size):
+                    subjects.append(prepared)
+                    if len(subjects) >= TOTAL_LIMIT:
+                        break
         else:
             for name in ("1", "2", "3", "4", "5", "6", "7", "8"):
                 image = kwargs.get(name)
-                if image is not None:
-                    subjects.append(self._prepare_image(image, (width, height), preserve_full=True))
+                if image is None:
+                    continue
+                # 单图端口也遵循空兜底识别：接收到「筛选图像」的 (1,64,64,3) 全零图，
+                # 视为该端口未接入——不参与帧计数，不输出该图图像
+                if YuanTool._is_empty_fallback_image(image):
+                    continue
+                subjects.append(prepare(image, target_size, preserve_full=True))
 
-        background_image = self._prepare_image(background, (width, height), preserve_full=False) if background is not None else None
+        # 背景：空兜底图(筛选节点空输出)视为未接入——不产出背景帧，也不作为填充背景
+        bg_is_empty = YuanTool._is_empty_fallback_image(background)
+        background_image = None if bg_is_empty else (
+            prepare(background, target_size, preserve_full=False) if background is not None else None
+        )
 
-        # 背景帧数：有背景图时与 frame_multiplier 一致，无背景时为 0
+        # 背景帧数：有有效背景图时与 frame_multiplier 一致，否则 0
         bg_frame_count = frame_multiplier if background_image is not None else 0
-        # slot1 多1帧用于 VAE 8帧分组对齐；frame_multiplier=1 时无对齐意义，不加
-        first_slot_extra = 1 if frame_multiplier > 1 else 0
+        # slot1 多1帧用于 VAE 8帧分组对齐；仅当存在主体且 frame_multiplier>1 时加；否则无意义
+        first_slot_extra = 1 if (subjects and frame_multiplier > 1) else 0
         frame_count = len(subjects) * frame_multiplier + first_slot_extra + bg_frame_count
         frames = self._expand_frames_with_info(
             subjects, background_image, frame_multiplier, frame_count
         )
-        output = torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0)
+
+        # 最终输出：
+        # - 有帧：正常展开
+        # - 完全无有效输入（主体空 + 背景也空/兜底/None）：输出 1 张 64×64 空图(全黑)，与 GetImage 兜底保持一致
+        # - 主体空但背景有效：_expand_frames_with_info 会产出 bg_frame_count 张背景帧
+        if frames:
+            output = torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0)
+        else:
+            output = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
 
         return (output,)
 
@@ -203,13 +282,27 @@ class GetImage:
         }
 
     def indexedimagesfrombatch(self, images, indexes):
-        batch_size = images.shape[0]
-        index_list = [int(index.strip()) for index in indexes.split(',')]
-        valid_indices = [i for i in index_list if 0 <= i < batch_size]
-        if not valid_indices:
-            valid_indices = [0]
-        indices_tensor = torch.tensor(valid_indices, dtype=torch.long)
-        chosen_images = images[indices_tensor]
+        batch_size = images.shape[0] if images is not None and images.ndim >= 1 else 0
+
+        valid_indices = []
+        if batch_size > 0:
+            for token in indexes.split(','):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    idx = int(token)
+                except ValueError:
+                    continue
+                if 0 <= idx < batch_size:
+                    valid_indices.append(idx)
+
+        if valid_indices:
+            indices_tensor = torch.tensor(valid_indices, dtype=torch.long)
+            chosen_images = images[indices_tensor]
+        else:
+            chosen_images = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+
         return (chosen_images,)
 
 

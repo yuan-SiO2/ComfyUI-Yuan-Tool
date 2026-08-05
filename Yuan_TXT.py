@@ -185,6 +185,18 @@ class YUAN_TXTListNumber:
 
 class YUAN_TXTReplace:
 
+    # 台词（说话）引号对：按顺序匹配，遇到 opening 标记进入"台词内部"，遇到同类型的 closing 标记退出
+    # 包含 ASCII 半角、中文全角、弯引号（""/''）、中文直角引号「」/『』、书名号《》
+    QUOTE_PAIRS = [
+        # opening, closing, rank（秩：同秩才能配成一对，用于避免不同引号互配）
+        ('"',  '"',  1),
+        ("'",  "'",  2),
+        ("“",  "”",  3),
+        ("‘",  "’",  4),
+        ("「", "」", 5),
+        ("『", "』", 6),
+    ]
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -204,6 +216,17 @@ class YUAN_TXTReplace:
                     "placeholder": "每行一个要替换的文本...",
                     "tooltip": "要替换的文本列表，每行对应一组。\n第1行对应查找文本第1行，第2行对应查找文本第2行，以此类推。"
                 }),
+                "台词开关": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "保护台词",
+                    "label_off": "正常替换",
+                    "display_name": "台词保护",
+                    "tooltip": "【台词保护】\n开启后，被以下引号包裹的「人物说话内容」不进行替换，原文保留：\n"
+                               "● 半角双引号 / 单引号：\"...\"  '...'\n"
+                               "● 中文弯引号：“...”  ‘...’\n"
+                               "● 中文直角引号：「...」 『...』\n"
+                               "关闭时，整段文本正常执行批量替换。",
+                }),
             },
         }
 
@@ -213,17 +236,119 @@ class YUAN_TXTReplace:
     CATEGORY = "Yuan Tool/文本"
     OUTPUT_NODE = True
 
-    def replace_text(self, text, 查找文本, 替换文本):
+    @staticmethod
+    def _build_protect_mask(text):
+        """返回与 text 等长的 bool 列表：True 表示该位置在引号对内部（台词保护，不替换）；False 表示可替换。"""
+        n = len(text)
+        mask = [False] * n
+        if n == 0:
+            return mask
+
+        # opening_map['"'] = [(closing, rank)]
+        opening_map = {}
+        closing_map = {}
+        for op, cl, rk in YUAN_TXTReplace.QUOTE_PAIRS:
+            opening_map.setdefault(op, []).append((cl, rk))
+            closing_map.setdefault(cl, []).append((op, rk))
+
+        # 栈：存 (rank, closing_char, start_idx)
+        stack = []
+        i = 0
+        while i < n:
+            ch = text[i]
+            # 尝试作为 opening：只匹配一种（取列表第一个，即秩最高的映射；QUOTE_PAIRS 已按用户期望序唯一定义，每个 opening 唯一）
+            if ch in opening_map:
+                # 半角引号 ASCII " / ' 既可开也可关，采用「智能判断」：
+                #   - 当前存在同 rank 的未闭合栈顶 → 作为 closing（优先关闭未闭合）
+                #   - 否则，作为 opening
+                # 注意：栈三元组是 (rank, closing_char, start_idx)
+                if ch in ('"', "'"):
+                    expected_rank = 1 if ch == '"' else 2
+                    if stack and stack[-1][0] == expected_rank:
+                        _rank, _cl, start = stack.pop()
+                        # 把 [start, i] 全部标记为台词内部（含引号自身）
+                        for k in range(start, i + 1):
+                            mask[k] = True
+                        i += 1
+                        continue
+                # 其他引号：直接开
+                (closing_char, rank) = opening_map[ch][0]
+                stack.append((rank, closing_char, i))
+                i += 1
+                continue
+            # 尝试作为 closing
+            if ch in closing_map:
+                found = None
+                # 匹配最近未闭合、同 rank 的 opening
+                for si in range(len(stack) - 1, -1, -1):
+                    if stack[si][1] == ch:
+                        found = si
+                        break
+                if found is not None:
+                    _rank, _cl, start = stack.pop(found)
+                    for k in range(start, i + 1):
+                        mask[k] = True
+                    i += 1
+                    continue
+                # 找不到对应开引号的闭引号：普通字符，跳过
+                i += 1
+                continue
+            i += 1
+        # 文本结束后仍留在栈中的未闭合开引号：不标记（保持 False，按正常文本处理）
+
+        return mask
+
+    @staticmethod
+    def _replace_with_protect(text, find_str, replace_str, mask):
+        """仅在 mask[i]==False 的位置允许替换 find_str -> replace_str；find_str 任一字符被保护则整段跳过。"""
+        if not find_str:
+            return text
+        m = len(find_str)
+        n = len(text)
+        if m == 0 or m > n:
+            return text
+        out = []
+        i = 0
+        while i <= n - m:
+            # 先快速判断窗口内是否存在任何被保护字符；无则再做字符串全等比较（避免含中文大窗口时重复切片）
+            window_protected = False
+            for k in range(m):
+                if mask[i + k]:
+                    window_protected = True
+                    break
+            if not window_protected and text[i:i + m] == find_str:
+                out.append(replace_str)
+                i += m
+                continue
+            out.append(text[i])
+            i += 1
+        # 末尾剩余字符
+        while i < n:
+            out.append(text[i])
+            i += 1
+        return "".join(out)
+
+    def replace_text(self, text, 查找文本, 替换文本, 台词开关):
         find_lines = 查找文本.split("\n")
         replace_lines = 替换文本.split("\n")
+
+        # 台词开关：先构建保护掩码（所有引号对内部标记为 True）
+        mask = None
+        if 台词开关:
+            mask = YUAN_TXTReplace._build_protect_mask(text)
 
         result = text
         count = min(len(find_lines), len(replace_lines))
 
         for i in range(count):
             find_str = find_lines[i]
-            replace_str = replace_lines[i]
-            if find_str:
+            replace_str = replace_lines[i] if i < len(replace_lines) else ""
+            if not find_str:
+                continue
+            if mask is not None:
+                result = YUAN_TXTReplace._replace_with_protect(result, find_str, replace_str,
+                                                                YUAN_TXTReplace._build_protect_mask(result))
+            else:
                 result = result.replace(find_str, replace_str)
 
         return (result,)
@@ -273,9 +398,9 @@ class YUAN_TXTParagraphSplitter:
                     "display": "number",
                     "tooltip": "【动态扩展输入】\n设置节点左侧[any_x]输入端口的数量。\n用于将多个文本源（如多个加载文本节点）按顺序拼合在一起进行统一分段处理。\n(注意：修改数值后需点击节点上的「更新端口」按钮生效)"}),
                 "选取段落": ("STRING", {
-                    "default": "",
-                    "placeholder": "输入要选取的段落，用逗号分隔，如1,3,5",
-                    "tooltip": "【分割后段落选取】\n决定选取哪些段落输出。\n● 留空：输出所有段落。\n● 0 为第一段、1 为第二段，以此类推。\n● 输入 1,3,5：输出第2、4、6段，丢弃其他。\n此设置会改变[总段]和[段落x]端口的内容。"
+                    "default": "-1",
+                    "placeholder": "输入要选取的段落，用逗号分隔，如0,2,4；填 -1 输出所有；留空总段输出为空",
+                    "tooltip": "【分割后段落选取】\n决定选取哪些段落输出。\n● -1（默认）：输出所有段落。\n● 留空：不选取任何段落，总段输出为空。\n● 0 为第一段、1 为第二段，以此类推。\n● 输入 0,2,4：输出第1、3、5段，丢弃其他。\n此设置会改变[总段]和[段落x]端口的内容。"
                 }),
             },
             "optional": {
@@ -450,15 +575,22 @@ class YUAN_TXTParagraphSplitter:
                 if pl:
                     paras.append(pl)
 
-        if 选取段落.strip() == "":
+        sel = 选取段落.strip() if 选取段落 is not None else ""
+        if sel == "-1":
+            # -1：输出所有段落（默认行为）
             to = paras.copy()
-        else:
+        elif sel == "":
+            # 留空：总段输出为空（不选取任何段落）
             to = []
-            si = re.split(r'[。,，./\\]', 选取段落)
+        else:
+            # 数字索引组合：按 0/1/2... 索引选取，支持 。,，./\ 等分隔
+            to = []
+            si = re.split(r'[。,，./\\]', sel)
             for i in si:
                 try:
                     idx = int(i.strip())
-                    if 0 <= idx < len(paras): to.append(paras[idx])
+                    if 0 <= idx < len(paras):
+                        to.append(paras[idx])
                 except:
                     continue
 
@@ -473,12 +605,113 @@ class YUAN_TXTParagraphSplitter:
         return (cnt, to,) + tuple(po)
 
 
+# ==============================================================================
+# 长度
+# ==============================================================================
+
+class YUAN_TXTLength:
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": (AnyType("*"), {
+                    "tooltip": "要计算长度的文本。支持直接输入文本或从其他节点接入任意类型值；非字符串会自动转为字符串。"
+                }),
+                "长度模式": (["字符串", "段落", "空行", "列表"], {
+                    "default": "字符串",
+                    "tooltip":
+                        "选择长度计数方式：\n"
+                        "● 字符串：直接输出文本的字符总数（空文本为 0）。\n"
+                        "● 段落：每一行算一个段落，统计行数（空行也单独算一行）。\n"
+                        "● 空行：按空行（连续换行，段间空白行）分割文本，统计分割后的段落块数量。\n"
+                        "● 列表：若上游输出为列表（如文本处理节点的「输出分段列表」），统计列表元素个数；不是列表则按整个文本整体视为 1。\n"
+                        "任何模式下，空文本（无内容）均输出 0。",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("长度",)
+    OUTPUT_TOOLTIPS = ("根据所选长度模式统计得到的数量。",)
+    FUNCTION = "count_length"
+    CATEGORY = "Yuan Tool/文本"
+    DESCRIPTION = (
+        "统计接入文本的长度：字符串长度 / 段落（行数） / 空行分段块数 / 列表元素个数。"
+        "空文本（无内容）在任意模式下均输出 0。"
+    )
+
+    @staticmethod
+    def _to_plain_text(val):
+        """把任意 ComfyUI 输入统一转成纯字符串（list 用换行拼接，其他走 str）。"""
+        if val is None:
+            return ""
+        if isinstance(val, list):
+            parts = []
+            for v in val:
+                parts.append("" if v is None else str(v))
+            return "\n".join(parts)
+        if isinstance(val, (dict, tuple)):
+            return str(val)
+        if isinstance(val, (int, float, bool)):
+            return str(val)
+        return "" if val is None else str(val)
+
+    def count_length(self, text, 长度模式):
+        # 列表模式：优先判断上游真实传入的是否就是 list（例如 文本处理-输出分段列表），不做 str(list) 干扰
+        if 长度模式 == "列表":
+            if isinstance(text, list):
+                return (len(text),)
+            # 上游不是列表（普通字符串/其他）：当做"一个整体"处理。空文本输出 0
+            plain = self._to_plain_text(text)
+            return (0 if plain == "" else 1,)
+
+        # 其余三种模式：都基于纯文本内容
+        plain = self._to_plain_text(text)
+
+        if 长度模式 == "字符串":
+            return (len(plain),)
+
+        if 长度模式 == "段落":
+            # 每一行（包括空行）算一个段落；空文本（无内容）输出 0
+            if plain == "":
+                return (0,)
+            return (len(plain.splitlines()),)
+
+        if 长度模式 == "空行":
+            # 按空行（段落之间的空白行）分割：
+            #   - 先 strip 去掉首尾空行/空白
+            #   - 按 \n\s*\n（两个换行中间可有任意空白）分割
+            #   - 过滤空片段
+            #   - 统计片段数
+            stripped = plain.strip()
+            if stripped == "":
+                return (0,)
+            # 拆分为行，累计非空段；遇到连续空段则产生分隔
+            blocks = []
+            curr = []
+            for line in stripped.splitlines():
+                if line.strip() == "":
+                    if curr:
+                        blocks.append("\n".join(curr))
+                        curr = []
+                else:
+                    curr.append(line)
+            if curr:
+                blocks.append("\n".join(curr))
+            return (len(blocks),)
+
+        # 兜底（未知模式按字符串）
+        return (len(plain),)
+
+
 NODE_CLASS_MAPPINGS = {
     "YUAN_TXTAppearanceOrder": YUAN_TXTAppearanceOrder,
     "YUAN_TXTConvertAny": YUAN_TXTConvertAny,
     "YUAN_TXTListNumber": YUAN_TXTListNumber,
     "YUAN_TXTReplace": YUAN_TXTReplace,
     "YUAN_TXTParagraphSplitter": YUAN_TXTParagraphSplitter,
+    "YUAN_TXTLength": YUAN_TXTLength,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -487,4 +720,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "YUAN_TXTListNumber": "列表编号",
     "YUAN_TXTReplace": "文本批量替换",
     "YUAN_TXTParagraphSplitter": "文本处理",
+    "YUAN_TXTLength": "长度",
 }
