@@ -7,7 +7,8 @@ function registerYuanTool(nodeType, portMeta) {
         const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
 
         const singleNames = ["1", "2", "3", "4", "5", "6", "7", "8"];
-        const listName = "image_list";
+        const listNames = ["image_list_1", "image_list_2", "image_list_3", "image_list_4",
+                           "image_list_5", "image_list_6", "image_list_7", "image_list_8"];
         const imageType = "IMAGE";
         const bgName = "background";
 
@@ -49,19 +50,33 @@ function registerYuanTool(nodeType, portMeta) {
             return true;
         };
 
+        // 列表端口可见性：1、2 总是显示；第 k 个（k>=3）在前 k-1 个列表端口全部连接或自身已连接时显示
+        const listVisible = (idx) => {
+            if (idx < 2) return true;
+            if (isConnected(listNames[idx])) return true;
+            for (let i = 0; i < idx; i++) {
+                if (!isConnected(listNames[i])) return false;
+            }
+            return true;
+        };
+
         const syncPortsReal = (mode) => {
             if (self._syncing) return;
             self._syncing = true;
-            // 期望端口集合：列表模式用 image_list；单帧模式按连接状态递进显示
+            // 期望端口集合（有序）：
+            // - 列表模式：按 listVisible 递进显示 image_list_1..8
+            // - 单帧模式：按 singleVisible 递进显示 1..8
             const desiredNames = [];
             if (mode) {
-                desiredNames.push(listName);
+                for (let i = 0; i < listNames.length; i++) {
+                    if (listVisible(i)) desiredNames.push(listNames[i]);
+                }
             } else {
                 for (let i = 0; i < singleNames.length; i++) {
                     if (singleVisible(i)) desiredNames.push(singleNames[i]);
                 }
             }
-            const allOptional = [...singleNames, listName];
+            const allOptional = [...singleNames, ...listNames];
 
             // 第一步：保存所有端口的连接信息（从 graph 层面，防止被 ComfyUI 内部清除）
             const savedLinks = [];
@@ -84,16 +99,17 @@ function registerYuanTool(nodeType, portMeta) {
                 }
             }
 
-            // 第二步：删除不需要的可选端口
+            // 第二步：删除不需要的可选端口（含已弃用的老 image_list 名称，兼容旧工作流加载）
             for (let i = self.inputs.length - 1; i >= 0; i--) {
                 const inp = self.inputs[i];
                 const name = inp.name;
-                if (allOptional.includes(name) && !desiredNames.includes(name)) {
+                const isOptionalOld = (allOptional.includes(name) || name === "image_list");
+                if (isOptionalOld && !desiredNames.includes(name)) {
                     removeInputAndWidget(name);
                 }
             }
 
-            // 第三步：添加缺少的可选端口
+            // 第三步：添加缺少的可选端口（按 desiredNames 顺序，保证排列整洁）
             for (const name of desiredNames) {
                 if (!self.inputs.find(inp => inp.name === name)) {
                     addOptionalImageInput(name);
