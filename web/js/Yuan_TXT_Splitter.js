@@ -46,15 +46,21 @@ app.registerExtension({
                 const updateFn = () => {
                     const targetCount = Math.max(1, inputCountWidget.value);
                     this.inputs = this.inputs || [];
-                    
+
                     // 获取所有动态输入 (any_X)
                     let dynamicInputs = this.inputs.filter(i => i.name.startsWith("any_"));
                     let currentCount = dynamicInputs.length;
 
+                    // 保险：把已有 any_X 端口统一标记为 optional（避免历史节点/自动生成端口实心圆点）
+                    for (const inp of dynamicInputs) {
+                        if (!inp.extra) inp.extra = {};
+                        inp.extra.optional = true;
+                    }
+
                     if (targetCount > currentCount) {
-                        // 增加端口
+                        // 增加端口（optional:true 与后端 INPUT_TYPES.optional 对齐，显示为空心圆点）
                         for (let i = currentCount + 1; i <= targetCount; i++) {
-                            this.addInput("any_" + i, "*");
+                            this.addInput("any_" + i, "*", { optional: true });
                         }
                     } else if (targetCount < currentCount) {
                         // 减少端口 (从后往前删)
