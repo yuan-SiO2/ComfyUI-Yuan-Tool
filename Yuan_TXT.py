@@ -159,7 +159,11 @@ class YUAN_TXTListNumber:
 
     def number_list(self, 文本, 起始编号, 编号前缀, 编号后缀, 输出模式, 合并间隔符):
         if not 文本 or not 文本.strip():
-            return ([], 起始编号)
+            # OUTPUT_IS_LIST=True 的输出必须返回长度 ≥1 的列表，
+            # 否则 ComfyUI 在展开空列表给下游普通输入时会中断执行（或报错）。
+            # 空输入时统一返回 [""]：下游（如文本处理 any_x 端口）经 strip() 判空后会跳过该段，语义等价于"无文本"，
+            # 但链路不中断。
+            return ([""], 起始编号)
 
         lines = [line for line in 文本.split('\n') if line.strip()]
         count = len(lines)
@@ -170,6 +174,9 @@ class YUAN_TXTListNumber:
             num = 起始编号 + i
             numbered = f"{编号前缀}{num}{编号后缀}{line}"
             results.append(numbered)
+
+        if not results:
+            return ([""], next_num)
 
         if 输出模式 == "合并文本":
             separator = 合并间隔符.replace("\\n", "\n")
@@ -434,17 +441,50 @@ class YUAN_TXTParagraphSplitter:
         return False
 
     def _convert_to_str(self, val):
-        if isinstance(val, (str, int, float, bool)):
+        """把任意 ComfyUI 输入统一转成纯字符串。
+        - None → ""（视为无内容）
+        - str/int/float/bool → str(val)
+        - bytes → utf-8 解码（失败则 latin-1 兜底）
+        - list/tuple/set/frozenset → 逐元素 str() 后用换行拼接（空容器 → ""）
+        - dict → str(dict)
+        - 其他（含 torch.Tensor、numpy.ndarray 等）→ 尝试 str()，异常返回 ""
+        """
+        if val is None:
+            return ""
+        if isinstance(val, bool):
+            # bool 是 int 的子类，需要先判断
             return str(val)
-        elif isinstance(val, dict):
+        if isinstance(val, (int, float, str)):
             return str(val)
-        elif isinstance(val, list):
-            return "\n".join([str(x) for x in val])
-        else:
+        if isinstance(val, bytes):
+            try:
+                return val.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    return val.decode("latin-1")
+                except Exception:
+                    return ""
+        if isinstance(val, (list, tuple, set, frozenset)):
+            parts = []
+            for x in val:
+                if x is None:
+                    continue
+                try:
+                    s = str(x)
+                except Exception:
+                    continue
+                if s:
+                    parts.append(s)
+            return "\n".join(parts)
+        if isinstance(val, dict):
             try:
                 return str(val)
-            except:
+            except Exception:
                 return ""
+        try:
+            return str(val)
+        except Exception:
+            return ""
 
     def split_paragraphs(self, text, 分段方式, 段落优化, 输出模式, 输出段落, 选取段落, 输入端口,
                          **kwargs):
