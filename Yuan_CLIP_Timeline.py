@@ -1561,7 +1561,6 @@ class YuanCLIPTimeline:
         img_compression = 图像压缩
         use_custom_audio = 使用自定义音频
         use_custom_motion = 使用自定义运动
-        inpaint_audio = 音频修复
         override_audio = 覆盖音频
         segment_images = 段落图像
         motion_images = 运动图像

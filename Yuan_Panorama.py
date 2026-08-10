@@ -9,7 +9,6 @@
 
 import base64
 import io
-import logging
 import uuid
 import tempfile
 from fractions import Fraction
@@ -41,11 +40,6 @@ except Exception:  # pragma: no cover
 # --------------------------------------------------------------------------- #
 # 通用工具
 # --------------------------------------------------------------------------- #
-def _normalize_Coverage(value):
-    text = str(value or "360").strip()
-    return 180 if text in ("180", 180, 180.0) else 360
-
-
 def _decode_data_url_image(data_url: str):
     """将前端截取的 base64 data URL 解码为 [1,H,W,C] 的 torch.Tensor（0..1）。"""
     text = str(data_url or "").strip()
@@ -309,8 +303,6 @@ class YuanPanoramaPreview:
         ui_ret = {}
         warnings = []
         fps_value = 24.0
-        # Coverage 由前端读取 widget 决定，这里仅确保合法
-        _normalize_Coverage(Coverage)
         # output_current_view = True  → 全景模式（输出完整 ERP 全景图）
         # output_current_view = False → 裁剪模式（输出当前 3D 裁剪截图）
         panorama_mode = bool(output_current_view)

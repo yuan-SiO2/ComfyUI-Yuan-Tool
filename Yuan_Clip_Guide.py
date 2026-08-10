@@ -196,12 +196,12 @@ class _LTXVCrossAttentionRefPatch:
 
 # --- 辅助函数 ---
 
-def _append_guide_attention_entry(positive, negative, pre_filter_count, latent_shape, strength=1.0, attention_mask=None):
+def _append_guide_attention_entry(positive, negative, pre_filter_count, latent_shape, strength=1.0):
     """向 positive 和 negative conditioning 各自追加一条 guide_attention_entry。"""
     new_entry = {
         "pre_filter_count": pre_filter_count,
         "strength": strength,
-        "pixel_mask": attention_mask.unsqueeze(0).unsqueeze(0) if attention_mask is not None else None,
+        "pixel_mask": None,
         "latent_shape": latent_shape,
     }
     results = []

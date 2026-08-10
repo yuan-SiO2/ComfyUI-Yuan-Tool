@@ -170,7 +170,6 @@ class Yuan_Canvas:
         bg_entries = _save_images_batch_with_sig(bg_image)
 
         ui = {
-            "test": ("value",),
             "padding": [padding],
             "width": [width],
             "height": [height],

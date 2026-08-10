@@ -120,19 +120,19 @@ class YuanMiniMaxH3Video:
 
     @classmethod
     def INPUT_TYPES(cls):
-        def image_port(name, display, tip, extra=None):
+        def image_port(display, tip, extra=None):
             cfg = {"optional": True, "display_name": display, "tooltip": tip}
             if extra:
                 cfg.update(extra)
             return ("IMAGE", cfg)
 
-        def audio_port(name, display, tip):
+        def audio_port(display, tip):
             return ("AUDIO", {"optional": True, "display_name": display, "tooltip": tip})
 
         optional = {
             # ---- 图生视频模式 ----
-            "first_frame": image_port("first_frame", "首帧图像", "视频首帧图像，作为几何锚点"),
-            "last_frame": image_port("last_frame", "尾帧图像", "视频尾帧图像"),
+            "first_frame": image_port("首帧图像", "视频首帧图像，作为几何锚点"),
+            "last_frame": image_port("尾帧图像", "视频尾帧图像"),
             # ---- 参考图生视频模式 ----
             "audio_vae": ("VAE", {"optional": True, "display_name": "音频VAE",
                                   "tooltip": "用于编码参考音频的音频 VAE 模型"}),
@@ -140,17 +140,17 @@ class YuanMiniMaxH3Video:
                 "tooltip": "参考图像尺寸策略。'匹配'：将每张参考图（仅缩小、保持宽高比）缩放到生成画面的像素面积；'最大'：使用参考管线的 2048px 短边以获得最佳主体保真度。参考标记会贯穿每个采样步，'最大' 模式可能慢数倍。"}),
             # 参考图像列表端口：可连接多张图像（batch），最多 REF_IMAGE_PORTS 张，超出自动切断
             "ref_images": image_port(
-                "ref_images", "参考图像", f"参考图像列表（可连接多张图像，最多 {REF_IMAGE_PORTS} 张，超出自动切断）"),
+                "参考图像", f"参考图像列表（可连接多张图像，最多 {REF_IMAGE_PORTS} 张，超出自动切断）"),
         }
         for i in range(1, REF_VIDEO_PORTS + 1):
             optional[f"ref_video_{i}"] = image_port(
-                f"ref_video_{i}", f"参考视频{i}", f"24fps 的参考视频帧（2-15 秒），第 {i} 路参考视频")
+                f"参考视频{i}", f"24fps 的参考视频帧（2-15 秒），第 {i} 路参考视频")
         for i in range(1, REF_AUDIO_PORTS + 1):
             optional[f"ref_video_audio_{i}"] = audio_port(
-                f"ref_video_audio_{i}", f"参考视频音频{i}", f"与参考视频{i} 对应的音轨")
+                f"参考视频音频{i}", f"与参考视频{i} 对应的音轨")
         for i in range(1, REF_AUDIO_PORTS + 1):
             optional[f"ref_audio_{i}"] = audio_port(
-                f"ref_audio_{i}", f"参考音频{i}", f"独立的参考音频，第 {i} 路")
+                f"参考音频{i}", f"独立的参考音频，第 {i} 路")
 
         return {
             "required": {

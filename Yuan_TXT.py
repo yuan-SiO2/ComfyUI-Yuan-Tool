@@ -1,9 +1,302 @@
 import re
+import json as _json
 
 
 class AnyType(str):
     def __ne__(self, __value):
         return False
+
+
+# ==============================================================================
+# JSON提取（按端口名作为键提取对应字段，全部输出字符串）
+# ==============================================================================
+
+class YUAN_TXTJsonExtractor:
+    # 输出端口名
+    OUTPUT_NAMES = ("整体风格", "角色档案", "道具档案", "场景档案", "分镜序列", "场景索引", "角色索引", "道具索引", "索引时长")
+
+    # 台词保护引号对（与文本批量替换节点一致）
+    QUOTE_PAIRS = [
+        ('"',  '"',  1),
+        ("'",  "'",  2),
+        ("“",  "”",  3),
+        ("‘",  "’",  4),
+        ("「", "」", 5),
+        ("『", "』", 6),
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "json": (AnyType("*"), {
+                    "forceInput": True,
+                    "tooltip": "JSON 数据输入，支持 JSON 字符串或对象。"
+                }),
+                "索引": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "step": 1,
+                    "tooltip": "对应分镜序列中的「编号」值，选择该编号的分镜。分镜序列端口输出该分镜的时间段内容；场景索引端口根据该分镜标题智能匹配场景档案；角色索引和道具索引端口在时间段内容中智能匹配角色和道具。"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "FLOAT")
+    RETURN_NAMES = OUTPUT_NAMES
+    FUNCTION = "extract_json"
+    CATEGORY = "Yuan Tool/文本"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _list_to_lines(val):
+        """列表/元组：每元素转字符串后逐行拼接。"""
+        if isinstance(val, (list, tuple)):
+            lines = []
+            for item in val:
+                if item is None:
+                    continue
+                try:
+                    s = str(item)
+                except Exception:
+                    continue
+                if s:
+                    lines.append(s)
+            return "\n".join(lines)
+        try:
+            return str(val)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_name(entry):
+        """从档案条目中提取名称（第一个逗号前的部分）。"""
+        s = str(entry) if entry is not None else ""
+        for sep in ("，", ","):
+            if sep in s:
+                return s.split(sep)[0].strip()
+        return s.strip()
+
+    @staticmethod
+    def _build_protect_mask(text):
+        """构建台词保护掩码：引号对内部标记为 True（不参与索引匹配）。"""
+        n = len(text)
+        mask = [False] * n
+        if n == 0:
+            return mask
+
+        opening_map = {}
+        closing_map = {}
+        for op, cl, rk in YUAN_TXTJsonExtractor.QUOTE_PAIRS:
+            opening_map.setdefault(op, []).append((cl, rk))
+            closing_map.setdefault(cl, []).append((op, rk))
+
+        stack = []
+        i = 0
+        while i < n:
+            ch = text[i]
+            if ch in opening_map:
+                if ch in ('"', "'"):
+                    expected_rank = 1 if ch == '"' else 2
+                    if stack and stack[-1][0] == expected_rank:
+                        _rank, _cl, start = stack.pop()
+                        for k in range(start, i + 1):
+                            mask[k] = True
+                        i += 1
+                        continue
+                (closing_char, rank) = opening_map[ch][0]
+                stack.append((rank, closing_char, i))
+                i += 1
+                continue
+            if ch in closing_map:
+                found = None
+                for si in range(len(stack) - 1, -1, -1):
+                    if stack[si][1] == ch:
+                        found = si
+                        break
+                if found is not None:
+                    _rank, _cl, start = stack.pop(found)
+                    for k in range(start, i + 1):
+                        mask[k] = True
+                    i += 1
+                    continue
+                i += 1
+                continue
+            i += 1
+        return mask
+
+    @staticmethod
+    def _find_appearing_indices(text, char_names, prop_names):
+        """在非保护区域查找出现的角色和道具，使用最长匹配优先避免冲突。
+        例如道具「林夏的手机」会先消费其位置，角色「林夏」不会在该位置误匹配。
+        返回 (角色索引列表, 道具索引列表)，均按首次出现位置排序。
+        """
+        if not text:
+            return [], []
+
+        mask = YUAN_TXTJsonExtractor._build_protect_mask(text)
+        n = len(text)
+
+        # 收集所有名称：(name, type, index, length)
+        all_names = []
+        for i, name in enumerate(char_names):
+            if name:
+                all_names.append((name, 'char', i, len(name)))
+        for i, name in enumerate(prop_names):
+            if name:
+                all_names.append((name, 'prop', i, len(name)))
+
+        # 按长度降序排序（最长优先匹配，避免子串冲突）
+        all_names.sort(key=lambda x: -x[3])
+
+        consumed = [False] * n
+        char_found = {}   # index -> first_pos
+        prop_found = {}   # index -> first_pos
+
+        for name, ntype, idx, m in all_names:
+            if m == 0 or m > n:
+                continue
+            i = 0
+            while i <= n - m:
+                # 窗口内有保护或已消费位置则跳过
+                blocked = False
+                for k in range(m):
+                    if mask[i + k] or consumed[i + k]:
+                        blocked = True
+                        break
+                if not blocked and text[i:i + m] == name:
+                    pos = i
+                    if ntype == 'char':
+                        if idx not in char_found:
+                            char_found[idx] = pos
+                    else:
+                        if idx not in prop_found:
+                            prop_found[idx] = pos
+                    for k in range(m):
+                        consumed[i + k] = True
+                    i += m
+                else:
+                    i += 1
+
+        char_indices = [idx for idx, _ in sorted(char_found.items(), key=lambda x: x[1])]
+        prop_indices = [idx for idx, _ in sorted(prop_found.items(), key=lambda x: x[1])]
+        return char_indices, prop_indices
+
+    @staticmethod
+    def _max_duration_seconds(text):
+        """从时间段文本中提取最大时长（秒）。
+        仅匹配每行开头的时段标记，支持以下格式：
+        - 0-7s / 0-7秒 / 0-7（s、秒、无单位）
+        - 5-12.5s / 5-12.5秒 / 5-12.5（支持小数）
+        时间段标记位于行首（允许前置空白），避免误匹配文本中的其他数字。
+        例如文本「0-7s，中近景...」会匹配，而「24寸行李箱」不会匹配。
+        """
+        if not text:
+            return 0.0
+        # 仅匹配行首位置（^ 或 \n 后），避免误判文本中间的数字
+        # 支持单位：s、秒、或无单位；数字可为小数
+        pattern = r'(?:^|\n)\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*(?:s|秒)?'
+        matches = re.findall(pattern, text)
+        if not matches:
+            return 0.0
+        # 取每段的结束时间（第二个数字），返回最大值
+        end_times = [float(m[1]) for m in matches]
+        return max(end_times) if end_times else 0.0
+
+    @staticmethod
+    def _match_scene_index(title, scenes):
+        """根据分镜标题智能匹配场景档案索引。
+        标题形如「江海大学方向街道-林夏安慰」，取「-」前部分作为场景关键词；
+        场景档案项形如「江海大学方向街道，九月...」，取「，」前部分作为场景名；
+        双向包含匹配，匹配不到返回 0。
+        """
+        if not title or not isinstance(scenes, list) or not scenes:
+            return 0
+        prefix = title
+        for sep in ("—", "-"):
+            if sep in prefix:
+                prefix = prefix.split(sep)[0]
+                break
+        prefix = prefix.strip()
+        if not prefix:
+            return 0
+        for idx, scene in enumerate(scenes):
+            scene_str = str(scene) if scene is not None else ""
+            scene_name = scene_str
+            for sep in ("，", ","):
+                if sep in scene_name:
+                    scene_name = scene_name.split(sep)[0]
+                    break
+            scene_name = scene_name.strip()
+            if not scene_name:
+                continue
+            if prefix in scene_name or scene_name in prefix:
+                return idx
+        return 0
+
+    def extract_json(self, json=None, 索引=1):
+        # 形参名必须与输入端口名一致（ComfyUI 按关键字传参）
+        data = json
+
+        # 字符串自动解析为 dict
+        if isinstance(data, str):
+            try:
+                data = _json.loads(data)
+            except Exception:
+                data = {}
+
+        if not isinstance(data, dict):
+            data = {}
+
+        # 整体风格
+        整体风格 = self._list_to_lines(data.get("整体风格", ""))
+        # 角色档案
+        角色档案数据 = data.get("角色档案", [])
+        角色档案 = self._list_to_lines(角色档案数据)
+        # 道具档案
+        道具档案数据 = data.get("道具档案", [])
+        道具档案 = self._list_to_lines(道具档案数据)
+        # 场景档案
+        场景档案数据 = data.get("场景档案", [])
+        场景档案 = self._list_to_lines(场景档案数据)
+
+        # 分镜序列：按索引(编号)选取对应分镜，输出其时间段内容
+        分镜序列数据 = data.get("分镜序列", [])
+        分镜序列文本 = ""
+        matched_title = ""
+        found_shot = False
+        if isinstance(分镜序列数据, list):
+            for item in 分镜序列数据:
+                if isinstance(item, dict) and item.get("编号") == 索引:
+                    时间段 = item.get("时间段", [])
+                    分镜序列文本 = self._list_to_lines(时间段)
+                    matched_title = str(item.get("标题", ""))
+                    found_shot = True
+                    break
+
+        # 场景索引：未找到对应分镜输出空；否则智能匹配，匹配不到也输出空
+        if not found_shot:
+            场景索引 = ""
+            角色索引 = ""
+            道具索引 = ""
+            索引时长 = 0.0
+        else:
+            idx = self._match_scene_index(matched_title, 场景档案数据)
+            场景索引 = str(idx) if idx >= 0 else ""
+
+            # 角色索引、道具索引：在分镜时间段文本中智能匹配
+            char_names = [self._extract_name(e) for e in (角色档案数据 if isinstance(角色档案数据, list) else [])]
+            prop_names = [self._extract_name(e) for e in (道具档案数据 if isinstance(道具档案数据, list) else [])]
+            char_indices, prop_indices = self._find_appearing_indices(分镜序列文本, char_names, prop_names)
+            角色索引 = ",".join(str(i) for i in char_indices)
+            道具索引 = ",".join(str(i) for i in prop_indices)
+
+            # 索引时长：从分镜时间段文本中提取最大结束时间（秒）
+            索引时长 = self._max_duration_seconds(分镜序列文本)
+
+        return {
+            "result": [整体风格, 角色档案, 道具档案, 场景档案, 分镜序列文本, 场景索引, 角色索引, 道具索引, 索引时长]
+        }
 
 
 # ==============================================================================
@@ -193,7 +486,7 @@ class YUAN_TXTListNumber:
 class YUAN_TXTReplace:
 
     # 台词（说话）引号对：按顺序匹配，遇到 opening 标记进入"台词内部"，遇到同类型的 closing 标记退出
-    # 包含 ASCII 半角、中文全角、弯引号（""/''）、中文直角引号「」/『』、书名号《》
+    # 包含 ASCII 半角引号、中文弯引号（""/''）、中文直角引号「」/『』
     QUOTE_PAIRS = [
         # opening, closing, rank（秩：同秩才能配成一对，用于避免不同引号互配）
         ('"',  '"',  1),
@@ -339,19 +632,26 @@ class YUAN_TXTReplace:
         find_lines = 查找文本.split("\n")
         replace_lines = 替换文本.split("\n")
 
-        # 台词开关：先构建保护掩码（所有引号对内部标记为 True）
+        # 台词开关：mask 作为开关标志（替换过程中每次重建掩码）
         mask = None
         if 台词开关:
             mask = YUAN_TXTReplace._build_protect_mask(text)
 
-        result = text
+        # 配对查找/替换，过滤空查找串
+        pairs = []
         count = min(len(find_lines), len(replace_lines))
-
         for i in range(count):
             find_str = find_lines[i]
             replace_str = replace_lines[i] if i < len(replace_lines) else ""
-            if not find_str:
-                continue
+            if find_str:
+                pairs.append((find_str, replace_str))
+
+        # 按查找文本长度降序排序（最长匹配优先，避免短名误替换长名中的子串）
+        # 例如「林夏的手机」先替换，「林夏」不会在其位置被误匹配
+        pairs.sort(key=lambda x: -len(x[0]))
+
+        result = text
+        for find_str, replace_str in pairs:
             if mask is not None:
                 result = YUAN_TXTReplace._replace_with_protect(result, find_str, replace_str,
                                                                 YUAN_TXTReplace._build_protect_mask(result))
@@ -429,10 +729,11 @@ class YUAN_TXTParagraphSplitter:
         if len(line_stripped) > 20: return False
         last_char = line_stripped[-1] if line_stripped else ''
         forbidden_punctuation = (
-        ',', '，', '.', '。', '!', '！', '?', '？', ';', '；', '"', '"', "'", "'", '（', '）', '()', '[]', '{}', '、', '…', '—')
+            ',', '，', '.', '。', '!', '！', '?', '？', ';', '；',
+            '"', "'", '（', '）', '、', '…', '—')
         if last_char in forbidden_punctuation: return False
-        bracket_patterns = [(r'^【.+】$', '【】'), (r'^《.+》$', '《》'), (r'^<.+>$', '<>')]
-        for pattern, bracket_type in bracket_patterns:
+        bracket_patterns = [r'^【.+】$', r'^《.+》$', r'^<.+>$']
+        for pattern in bracket_patterns:
             if re.match(pattern, line_stripped): return True
         num_title_pattern = r'^(?:[一二三四五六七八九十百千万]+、|\d+\. |[a-zA-Z]+\. )'
         if re.match(num_title_pattern, line_stripped): return True
@@ -695,7 +996,7 @@ class YUAN_TXTLength:
             return str(val)
         if isinstance(val, (int, float, bool)):
             return str(val)
-        return "" if val is None else str(val)
+        return str(val)
 
     def count_length(self, text, 长度模式):
         # 列表模式：优先判断上游真实传入的是否就是 list（例如 文本处理-输出分段列表），不做 str(list) 干扰
@@ -746,6 +1047,7 @@ class YUAN_TXTLength:
 
 
 NODE_CLASS_MAPPINGS = {
+    "YUAN_TXTJsonExtractor": YUAN_TXTJsonExtractor,
     "YUAN_TXTAppearanceOrder": YUAN_TXTAppearanceOrder,
     "YUAN_TXTConvertAny": YUAN_TXTConvertAny,
     "YUAN_TXTListNumber": YUAN_TXTListNumber,
@@ -755,6 +1057,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "YUAN_TXTJsonExtractor": "JSON提取",
     "YUAN_TXTAppearanceOrder": "出场排序",
     "YUAN_TXTConvertAny": "格式转换",
     "YUAN_TXTListNumber": "列表编号",
