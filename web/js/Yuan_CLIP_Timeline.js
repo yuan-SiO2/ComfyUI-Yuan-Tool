@@ -182,6 +182,45 @@ function hideWidget(w) {
   w.computeSize = () => [0, -4];
 }
 
+// ── V3 (Nodes 2.0) 端口占位处理 ──
+// V3 前端下 widget 与输入端口"共存"（convertWidgetToInput 已废弃），
+// 被编辑器隐藏管理的参数会显示为空端口占位，把节点拉长。
+// 该函数在 V3 下移除这些参数对应的输入端口（保留真实可连接的 IMAGE 端口）。
+
+function isV3Node(node) {
+  if (node._yuanIsV3Checked) return !!node._yuanIsV3;
+  node._yuanIsV3Checked = true;
+  try {
+    const el = node._timelineWidget?.element ||
+      node.widgets?.find(w => w.element)?.element;
+    let n = el;
+    while (n) {
+      if ((n.tagName && n.tagName.toLowerCase().includes('comfy-node')) ||
+          (n.classList && n.classList.contains('comfy-node'))) {
+        node._yuanIsV3 = true;
+        break;
+      }
+      n = n.parentElement || (n.getRootNode ? n.getRootNode().host : null);
+    }
+  } catch (_) {}
+  return !!node._yuanIsV3;
+}
+
+function hideManagedWidgetPorts(node) {
+  if (!node || !Array.isArray(node.inputs) || !isV3Node(node)) return;
+  for (let i = node.inputs.length - 1; i >= 0; i--) {
+    const inp = node.inputs[i];
+    if (!inp) continue;
+    // 段落图像/运动图像 是真实图像输入端口（保留可连接），
+    // 其余由编辑器隐藏管理的参数端口在 V3 下移除
+    if (HIDDEN_WIDGET_NAMES.includes(inp.name) &&
+        inp.name !== "段落图像" && inp.name !== "运动图像") {
+      if (inp.link != null) continue; // 已有连线时保留端口，避免破坏连接
+      try { node.removeInput(i); } catch (_) {}
+    }
+  }
+}
+
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 
 function pickColor(existingColors) {
@@ -2289,24 +2328,19 @@ class TimelineEditor {
   // 返回 { start, length }，length 可能被截断以适应总长度
   _findFreeSlot(segments, desiredLength, max) {
     if (!Array.isArray(segments)) segments = [];
-    const sorted = [...segments].filter(s => s && s.type !== "temp")
+    const sorted = [...segments].filter(Boolean)
       .map(s => ({ start: s.start || 0, length: s.length || 0 }))
       .sort((a, b) => a.start - b.start);
 
     // 期望长度不超过总长度
     let newLength = Math.max(MIN_SEGMENT_LENGTH, Math.min(desiredLength, max));
     let newStart = 0;
-    let placed = false;
 
     // 遍历已有段找第一个能放下 newLength 的空隙
     for (let i = 0; i < sorted.length; i++) {
       const s = sorted[i];
-      if (newStart + newLength <= s.start) { placed = true; break; }
+      if (newStart + newLength <= s.start) break;
       newStart = Math.max(newStart, s.start + s.length);
-    }
-    if (!placed) {
-      // 检查最后一段之后是否有空间
-      // newStart 已被推进到最后一段末尾
     }
 
     // 若超出总长度，截断长度并紧贴末尾
@@ -2321,14 +2355,6 @@ class TimelineEditor {
       }
     }
     return { start: newStart, length: newLength };
-  }
-
-  // 将段长度限制在 [start, max] 范围内，避免溢出
-  _clampSegmentLength(start, length, max) {
-    if (!Number.isFinite(start) || start < 0) start = 0;
-    if (start >= max) return MIN_SEGMENT_LENGTH;
-    const room = max - start;
-    return Math.max(MIN_SEGMENT_LENGTH, Math.min(length, room));
   }
 
   // 拖动段时的碰撞避让：基于"缝隙法"保证绝不与其他段重叠
@@ -2450,7 +2476,7 @@ class TimelineEditor {
     this.selectedAudioIndices.clear();
     this.audioPeaksCache.clear();
     this._imageCache.clear();
-    // 清理磁盘上的 segimg_*.png 文件，避免切换工作流后 fetchSegmentImages 自动重载
+    // 清理磁盘上残留的 segimg_*.png 文件
     fetch("/yuan_clip_timeline_clear_seg_images", { method: "POST" }).catch(() => {});
     this.commitChanges();
     this.updateUIFromSelection();
@@ -4009,6 +4035,69 @@ app.registerExtension({
             getHeight: () => FIXED_HEIGHT,
           });
 
+          // ── V3 (Nodes 2.0) 尺寸适配：使 DOM 渲染尺寸与 V1 设计保持一致 ──
+          (function adaptTimelineV3() {
+            try {
+              // 查找 V3 前端的 comfy-node 祖先元素（V1 前端不存在，直接跳过）
+              let v3NodeEl = null;
+              let el = container.parentElement;
+              while (el) {
+                if ((el.tagName && el.tagName.toLowerCase().includes('comfy-node')) ||
+                    (el.classList && el.classList.contains('comfy-node'))) {
+                  v3NodeEl = el;
+                  break;
+                }
+                el = el.parentElement || (el.getRootNode ? el.getRootNode().host : null);
+              }
+              if (!v3NodeEl) return;
+
+              // 移除被编辑器隐藏管理参数的空端口占位（避免节点被拉长）
+              node._yuanIsV3 = true;
+              hideManagedWidgetPorts(node);
+
+              // 与 V1 一致的最小尺寸：宽=画布520+容器内边距，高=固定设计高度
+              const MIN_W = 540;
+              const MIN_H = FIXED_HEIGHT;
+
+              node.min_size = [MIN_W, MIN_H];
+              if (node.size[0] < MIN_W) node.size[0] = MIN_W;
+              if (node.size[1] < MIN_H) node.size[1] = MIN_H;
+
+              // 在 V3 DOM 元素上强制最小尺寸
+              v3NodeEl.style.removeProperty("min-width");
+              v3NodeEl.style.setProperty("min-width", MIN_W + "px", "important");
+              v3NodeEl.style.setProperty("min-height", MIN_H + "px", "important");
+
+              // 容器保底高度，与 V1 的固定 widget 高度一致
+              container.style.minHeight = MIN_H + "px";
+
+              // V3 专用：告知布局系统该 DOM widget 的最小尺寸
+              const widget = node._timelineWidget;
+              if (widget) {
+                const prev = typeof widget.computeLayoutSize === "function"
+                  ? widget.computeLayoutSize.bind(widget) : null;
+                widget.computeLayoutSize = (targetNode) => {
+                  const p = prev ? (prev(targetNode) || {}) : {};
+                  return {
+                    ...p,
+                    minWidth: Math.max(MIN_W, Number(p.minWidth || 0)),
+                    minHeight: Math.max(MIN_H, Number(p.minHeight || 0)),
+                  };
+                };
+              }
+
+              // 用户缩放节点时保持最小尺寸
+              const origSetSize = node.setSize;
+              node.setSize = function (size) {
+                if (Array.isArray(size)) {
+                  size[0] = Math.max(size[0], MIN_W);
+                  size[1] = Math.max(size[1], MIN_H);
+                }
+                if (origSetSize) origSetSize.call(this, size); else this.size = size;
+              };
+            } catch (_) {}
+          })();
+
           // 实例化编辑器
           node._timelineEditor = new TimelineEditor(node, container);
 
@@ -4100,6 +4189,8 @@ app.registerExtension({
       for (const name of HIDDEN_WIDGET_NAMES) {
         hideWidget(this.widgets?.find(w => w.name === name));
       }
+      // V3 下再次移除被隐藏管理参数的空端口占位（加载工作流后端口可能重建）
+      hideManagedWidgetPorts(this);
       setTimeout(() => {
         if (this._timelineEditor) {
           this._timelineEditor._updateLockState();
@@ -4208,10 +4299,6 @@ app.registerExtension({
                             return node;
                         }
                     }
-                }
-                // 策略2: 匹配时间轴编辑器的自定义 textarea
-                if (node._timelineEditor && node._timelineEditor.textarea === textEl) {
-                    return node;
                 }
             }
             // 策略3: 只有一个 Timeline 节点时直接使用
@@ -4639,8 +4726,8 @@ app.registerExtension({
     // ── 初始化 ──
     function init() {
         scanTextareas();
-        setInterval(scanTextareas, 2000);
 
+        // 新 textarea 出现时由 MutationObserver 响应式触发，不再使用 setInterval 轮询
         if (window.MutationObserver) {
             const observer = new MutationObserver(() => {
                 const all = document.querySelectorAll('textarea');

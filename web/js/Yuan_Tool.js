@@ -234,7 +234,6 @@ function registerYuanTool(nodeType, portMeta) {
 
 // ==================== Yuan_MiniMaxH3Video（模式切换 + 递进显示动态端口）====================
 // 与后端 MiniMax_H3.py 中的常量保持一致
-const MINIMAX_MODE_I2V = "图生视频";
 const MINIMAX_MODE_REF = "参考图生视频";
 
 const MINIMAX_I2V_INPUTS = ["first_frame", "last_frame"];
@@ -443,6 +442,55 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
     };
 }
 
+// ==================== YuanRTXVideoUpscaleH3（RTX 视频放大，resize_type 条件参数）====================
+function registerYuanRTXVideoUpscaleH3(nodeType) {
+    const UPSCALE_BY = "按倍数缩放";
+
+    // 根据 resize_type 切换 scale / width / height 的显隐
+    // 只隐藏不删除，避免 widgets_values 索引错位（与 MiniMax H3 ref_image_size 同源惯例）
+    const syncResizeWidgets = (self) => {
+        const resizeWidget = self.widgets.find(w => w.name === "resize_type");
+        if (!resizeWidget) return;
+        const isByScale = resizeWidget.value === UPSCALE_BY;
+        const scaleWidget = self.widgets.find(w => w.name === "scale");
+        const widthWidget = self.widgets.find(w => w.name === "width");
+        const heightWidget = self.widgets.find(w => w.name === "height");
+        if (scaleWidget) scaleWidget.hidden = !isByScale;
+        if (widthWidget) widthWidget.hidden = isByScale;
+        if (heightWidget) heightWidget.hidden = isByScale;
+        // 保持当前宽度不变，只更新高度
+        const currentWidth = self.size ? self.size[0] : self.computeSize()[0];
+        self.setSize([currentWidth, self.computeSize()[1]]);
+        app.graph.setDirtyCanvas(true, true);
+    };
+
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+        const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+        const self = this;
+        const resizeWidget = self.widgets.find(w => w.name === "resize_type");
+        if (resizeWidget) {
+            // 初始化显隐
+            syncResizeWidgets(self);
+            // 监听切换
+            const origCallback = resizeWidget.callback;
+            resizeWidget.callback = function () {
+                if (origCallback) origCallback.apply(this, arguments);
+                syncResizeWidgets(self);
+            };
+        }
+        return r;
+    };
+
+    // 工作流加载时同步一次显隐
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function (info) {
+        const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+        syncResizeWidgets(this);
+        return r;
+    };
+}
+
 app.registerExtension({
     name: "ComfyUI-Yuan-Tool",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -470,6 +518,8 @@ app.registerExtension({
             registerYuanTool(nodeType, buildPortMeta());
         } else if (nodeData.name === "Yuan_MiniMaxH3Video") {
             registerYuanMiniMaxH3Video(nodeType, buildPortMeta());
+        } else if (nodeData.name === "Yuan_RTXVideoUpscaleH3") {
+            registerYuanRTXVideoUpscaleH3(nodeType);
         }
     },
 });

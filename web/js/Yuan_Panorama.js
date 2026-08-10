@@ -35,8 +35,6 @@
     const PREVIEW_MIN_WIDTH = 240;
 
     const DEG2RAD = Math.PI / 180;
-    const TWO_PI = Math.PI * 2;
-    const PI = Math.PI;
 
     // 交互参数（复刻 GJJ 360 全景浏览器的操作手感）
     const DRAG_SENSITIVITY = 0.34;   // deg / px（≈ GJJ 的 0.006 rad/px，固定灵敏度）
@@ -64,17 +62,6 @@
         const w = node?.widgets?.find?.((x) => x?.name === "Coverage");
         const v = String(w?.value ?? "360").trim();
         return v === "180" ? 180 : 360;
-    }
-
-    function setWidgetValue(node, name, value) {
-        const widget = node?.widgets?.find?.((w) => w?.name === name);
-        if (!widget) return;
-        widget.value = value;
-        const index = node.widgets.indexOf(widget);
-        if (Array.isArray(node.widgets_values) && index >= 0) node.widgets_values[index] = value;
-        try { widget.callback?.(value); } catch (_) {}
-        // 仅刷新背景，避免在拖拽过程中触发整图重绘造成卡顿
-        app.graph?.setDirtyCanvas?.(false, true);
     }
 
     function comfyImageEntryToUrl(entry) {
@@ -438,26 +425,6 @@
             gl.drawArrays(gl.TRIANGLES, 0, 6);
         }
 
-        screenshot(media, view, CoverageDeg, outWidth = 0, outHeight = 0) {
-            if (!media || !this.hasTexture) return "";
-            const w = Math.max(1, Math.round(Number(outWidth) || 0));
-            const h = Math.max(1, Math.round(Number(outHeight) || 0));
-            const out = document.createElement("canvas");
-            out.width = w;
-            out.height = h;
-            let renderer = null;
-            try {
-                renderer = new PanoRenderer(out);
-                renderer.upload(media);
-                renderer.render(view, CoverageDeg);
-                return out.toDataURL("image/png");
-            } catch (_) {
-                return "";
-            } finally {
-                renderer?.dispose?.();
-            }
-        }
-
         dispose() {
             const gl = this.gl;
             try {
@@ -591,6 +558,7 @@
                         };
                     };
                 }
+                this._applyV3MinSize();
 
                 try {
                     this.renderer = new PanoRenderer(this.canvas);
@@ -610,6 +578,33 @@
                 this.root = null;
                 this._installLegacyForeground();
             }
+        }
+
+        /**
+         * V3 (Nodes 2.0) 尺寸适配：在 comfy-node 元素上强制节点最小尺寸，
+         * 使 DOM 渲染尺寸与 V1 设计保持一致。V1 前端不存在该元素，直接跳过。
+         * 同时移除被编辑器隐藏管理的参数（current_view_data）占位端口。
+         */
+        _applyV3MinSize() {
+            try {
+                let el = this.root?.parentElement;
+                while (el) {
+                    if ((el.tagName && el.tagName.toLowerCase().includes('comfy-node')) ||
+                        (el.classList && el.classList.contains('comfy-node'))) break;
+                    el = el.parentElement || (el.getRootNode ? el.getRootNode().host : null);
+                }
+                if (!el || !this.node) return;
+                this.node.min_size = [PREVIEW_MIN_WIDTH, PREVIEW_MIN_HEIGHT];
+                el.style.removeProperty("min-width");
+                el.style.setProperty("min-width", PREVIEW_MIN_WIDTH + "px", "important");
+                el.style.setProperty("min-height", PREVIEW_MIN_HEIGHT + "px", "important");
+
+                // V3 下 widget 与输入端口共存，移除隐藏管理参数的占位端口
+                const slot = this.node.findInputSlot("current_view_data");
+                if (slot >= 0 && !this.node.inputs[slot].link) {
+                    this.node.removeInput(slot);
+                }
+            } catch (_) {}
         }
 
         screenshotDataUrl() {

@@ -151,8 +151,9 @@ function getUpstreamImageUrls(node, inputName) {
                         file = file.substring(slashIdx + 1);
                     }
                 }
-                const url = apiUrl(`/view?filename=${encodeURIComponent(file)}&type=${type}&subfolder=${encodeURIComponent(subfolder)}`);
-                if (url) urls.push(url);
+                const url = `/view?filename=${encodeURIComponent(file)}&type=${type}&subfolder=${encodeURIComponent(subfolder)}`;
+                const viewUrl = api ? api.apiURL(url) : url;
+                if (viewUrl) urls.push(viewUrl);
                 return urls;
             }
         }
@@ -244,36 +245,6 @@ function computeFabricImageSig(fabricImg) {
     }
 }
 
-function handleTogglePreciseSelection(e, currentNode) {
-    const optionValue = e.data.value;
-    currentNode.compositorInstance.preciseSelection = optionValue;
-    const c = currentNode.compositorInstance.fcanvas;
-    c.getObjects().map(function (i) {
-        return i.set('perPixelTargetFind', optionValue);
-    });
-}
-
-function handleResetOldTransform(e, currentNode) {
-    const optionValue = e.data.value;
-    const instance = currentNode.compositorInstance;
-
-    for (const sig in instance.inputImages) {
-        instance.resetOldTransform(sig);
-    }
-}
-
-function centerSelected(e, currentNode) {
-    const optionValue = e.data.value;
-    const instance = currentNode.compositorInstance;
-
-    const c = instance.fcanvas;
-    // 获取选中对象并居中
-    instance.needsUpload = true;
-    c.getActiveObjects().forEach((o)=>o.center());
-    c.renderAll();
-    instance.uploadIfNeeded(instance);
-}
-
 /**
  * 注册扩展，可介入生命周期方法。
  * 以下是文档中的调用顺序：
@@ -346,39 +317,13 @@ app.registerExtension({
     async setup(app) {
         Editor.addCompositorSettings();
 
-        /**
-         * @deprecated
-         * 节点在 python 中处理后，最终从事件中得知连接的图像。
-         * 它们以 base64 编码传递，或未连接时为 null，以及节点的唯一名称 id。
-         * @param event
-         */
-        function imageMessageHandler(event) {
-        }
-
-        function hook(nodeId) {
-            return app.graph.getNodeById(nodeId);
-        }
-
-
         /** 任意消息示例
          * PromptServer.instance.send_sync("my.custom.message", {"node": node_id, "other_things": etc})
          * 在 api.ts 中搜索 "case 'executing'": 可找到所有发出的事件，或 "new CustomEvent('executing'"
          * 内置事件示例，这应是节点即将开始（在后端）处理时
          */
         function executingMessageHandler(event) {
-            //console.log("executingMessageHandler", event, arguments);
-            const current = app.graph.getNodeById(event.detail);
-
-            // 这里可能太晚了，因为它已经在后台运行
-            // if (current && current.type == "Yuan_Canvas") {
-            //     const instance = current.compositorInstance;
-            //     if (instance.captureOnQueue.value) {
-            //         //instance.capture();
-            //         instance.grabUploadAndSetOutput.bind(instance);
-            //     }
-            // }
-
-            // }
+            // 节点已在后台开始处理，此处无需前端干预
         }
 
         /**
@@ -386,26 +331,17 @@ app.registerExtension({
          */
         function progressHandler() {
             // 需按 node id 过滤
-            // console.log(arguments);
         }
 
         /** 当节点"返回"一个 ui 元素时，通常在处理末尾 */
         function executedMessageHandler(event, a, b) {
-            //console.log("executedMessageHandler", event, a, b);
-
-            // Litegraph 文档
-            // https://github.com/jagenjo/litegraph.js/blob/master/guides/README.md
-            // 也要关注连接到此 config 的东西...当心 GUI...
-
             const e = event.detail.output;
             const nodeId = event.detail.node;
             const node = Editor.hook(nodeId);
             if (!node || node.type != "Yuan_Canvas") {
-                // console.log(node.type);
                 return;
             }
             const instance = node.compositorInstance;
-            // console.log("hasResult,awaitedResult", e.hasResult[0], e.awaited[0]);
 
             // 仅在 w/h/p 实际变化时才调整尺寸，否则点击"继续"
             // 每次都会不必要地重置节点尺寸
@@ -431,7 +367,6 @@ app.registerExtension({
             if (wWidget) wWidget.value = newW;
             if (hWidget) hWidget.value = newH;
             if (pWidget) pWidget.value = newP;
-            // node.compositorInstance.onCaptureOnQueueChange(e.captureOnQueue[0]);
 
             instance.configChanged = e.configChanged[0];
 
@@ -529,15 +464,12 @@ app.registerExtension({
         /** 重要消息考量  https://docs.comfy.org/essentials/comms_messages */
 
         function configureHandler() {
-            //console.log("configurehanlder", arguments);
         }
 
         function executionStartHandler() {
-            //console.log("executionStartHandler", arguments);
         }
 
         function executionCachedHandler() {
-            //console.log("executionCachedHandler", arguments);
         }
 
         function graphChangedHandler() {
@@ -545,7 +477,6 @@ app.registerExtension({
         }
 
         function changeWorkflowHandler() {
-            //console.log("changeWorkflowHandler", arguments);
         }
 
 
@@ -568,7 +499,6 @@ app.registerExtension({
          * 测试 .py 执行期间收到的 "progress"
          */
         api.addEventListener("progress", progressHandler);
-        /** ? */
         api.addEventListener("configure", configureHandler);
 
 
@@ -580,83 +510,16 @@ app.registerExtension({
      * 这在 Comfy Objects 中进一步讨论。
      */
     async init(args) {
-        // console.log("init", args)
     },
     /**
      * 对每个节点类型（AddNode 菜单中可用的节点列表）调用一次，
      * 用于修改节点行为。
-     *
-     * async beforeRegisterNodeDef(nodeType, nodeData, app)
-     * 传入的 nodeType 参数作为该类型所有待创建节点的模板。
      * 对 "nodeType.prototype" 的修改会应用于该类型的所有节点。
-     * nodeData 封装了 Python 代码中定义的节点信息，
-     * 如分类、输入、输出。
-     * app 是主 Comfy app 对象的引用（反正你已经 import 了！）
-     ```
-     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-
-        if (nodeType.comfyClass == 'Compositor') {
-          //  console.log("beforeRegisterNodeDef", nodeType, nodeData, app);
-
-            const orig_nodeCreated = nodeType.prototype.onNodeCreated;
-            nodeType.prototype.onNodeCreated = async function () {
-                // console.log("onNodeCreated", this);
-                orig_nodeCreated?.apply(this, arguments)
-                this.setSize([this.stuff.v.getWidth() + 100, this.stuff.v.getHeight() + 556])
-            }
-
-            const onExecuted = nodeType.prototype.onExecuted;
-            nodeType.prototype.onExecuted = function (message) {
-                // console.log("onExecuted", this, message);
-                const r = onExecuted?.apply?.(this, arguments)
-                return r;
-            }
-        }
-    },
-     ```
      */
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        // chainCallback(nodeType.prototype, "onNodeCreate, createdCallback(){
-        // 这里就是节点本身，可添加 widget、隐藏它们、加按钮、给 widget 加属性
-        // 这里他加了整个编辑器，或在节点有/无某些属性（如 points）时重置
-        // onConfigure 和 onExecuted 也在这里
-        //}
-        // console.log("beforeRegisterNodeDef",nodeType,nodeData);
-        // KJ 在这里初始化节点
-        // 带一个 onNodeCreated 回调
-        // nodeType.prototype.capture = ()=>{
-        //     console.log(this,arguments);
-        // }
     },
-    /** loadedGraphNode，在 nodeCreated 之后
-     *  ```
-     if(node.type == "Compositor" && console.log("loadedGraphNode", node, app, node.stuff)){
-         const ns = node.stuff;
-
-         ns.safeArea.setHeight(ns.h.value);
-         ns.safeArea.setWidth(ns.w.value);
-         ns.safeArea.setLeft(ns.p.value);
-         ns.safeArea.setTop(ns.p.value);
-
-         ns.compositionBorder.setHeight(ns.h.value + ns.stuff.COMPOSITION_BORDER_SIZE*2);
-         ns.compositionBorder.setWidth(ns.w.value  + ns.stuff.COMPOSITION_BORDER_SIZE*2);
-         ns.compositionBorder.setLeft(ns.p.value - ns.stuff.COMPOSITION_BORDER_SIZE);
-         ns.compositionBorder.setTop(ns.p.value - ns.stuff.COMPOSITION_BORDER_SIZE*2);
-         ns.compositionBorder.set("strokeWidth", ns.stuff.COMPOSITION_BORDER_SIZE);
-         ns.compositionBorder.set("stroke", ns.stuff.COMPOSITION_BORDER_COLOR);
-         ns.compositionBorder.bringToFront()
-
-         canvas.bringToFront(ns.compositionBorder);
-
-         //console.log(v.getWidth(), v.getHeight(), value);
-         ns.canvas.setHeight(ns.safeArea.getHeight() + (ns.p.value * 2));
-         ns.canvas.setWidth(ns.safeArea.getWidth() + (ns.p.value * 2));
-         ns.canvas.renderAll();
-         ns.node.setSize(calculateNodeSize(v));
-
-         ns.capture();
-         }
-     ```
+    /**
+     * loadedGraphNode，在 nodeCreated 之后调用，此时 widget 值已从工作流 JSON 恢复。
      */
     async loadedGraphNode(node, app) {
         if (!isYuan_Canvas(node)) return;
@@ -738,16 +601,12 @@ app.registerExtension({
         if (!isYuan_Canvas(node)) return;
 
         /** 我们的输出合成图像 */
-        //node.compositionChangedWidget = getCompositorWidget(node, "compositionChanged");
         node.imageNameWidget = getCompositorWidget(node, "imageName");
         const originalCallback = node.imageNameWidget.callback;
         node.imageNameWidget.callback = () => {
-            //debugger;
-            //console.log("callback of imageNameWidget with ", arguments);
             originalCallback(arguments);
         }
         node.imageNameWidget.computeSize = () => [0, 0];
-        // imageName.computeSize = () => [0, 0];
         hideWidgetForGood(node, node.imageNameWidget);
 
         node.fabricDataWidget = getCompositorWidget(node, "fabricData");
@@ -817,21 +676,42 @@ app.registerExtension({
         compositorInstance.onHeightChange(compositorInstance.h.value);
         compositorInstance.onPaddingChange(compositorInstance.p.value);
 
+        // ── V3 (Nodes 2.0) 尺寸适配：使 DOM 渲染尺寸与 V1 设计保持一致 ──
+        // V3 专用：告知布局系统该 DOM widget 的最小尺寸（随画布尺寸变化）
+        if (node.editorWidget) {
+            const widget = node.editorWidget;
+            const prevCLS = typeof widget.computeLayoutSize === "function"
+                ? widget.computeLayoutSize.bind(widget) : null;
+            widget.computeLayoutSize = (targetNode) => {
+                const p = prevCLS ? (prevCLS(targetNode) || {}) : {};
+                const size = compositorInstance.calculateNodeSize();
+                return {
+                    ...p,
+                    minWidth: Math.max(size[0], Number(p.minWidth || 0)),
+                    minHeight: Math.max(size[1], Number(p.minHeight || 0)),
+                };
+            };
+            compositorInstance.enforceV3Size();
+        }
+
+        // V3 (Nodes 2.0)：widget 与输入端口共存，
+        // 移除 fabricData / imageName 的占位端口（避免节点被端口拉长）
+        if (compositorInstance.v3NodeElement) {
+            for (const name of ["fabricData", "imageName"]) {
+                const slot = node.findInputSlot(name);
+                if (slot >= 0 && !node.inputs[slot].link) {
+                    node.removeInput(slot);
+                }
+            }
+        }
+
 
 
         /**
          * grabUploadAndSetOutput 回调不能是 async，所以在 upload image 中传入 widget
          * addWidget(type, name, value, callback, options)
          */
-        //node.capture = node.addWidget("button", "capture", "capture", compositorInstance.grabUploadAndSetOutput.bind(compositorInstance));
         node.continue = node.addWidget("button", "continue", "continue", compositorInstance.continue.bind(compositorInstance));
-
-        node.onMouseOut = function (e, pos, canvas) {
-            // console.log("mouseout")
-            const original_onMouseDown = node.onMouseOut;
-            return original_onMouseDown?.apply(this, arguments);
-        }
-        //node.compositorInstance = compositorInstance;
     },
 });
 
@@ -843,14 +723,6 @@ function hideWidgetForGood(node, widget, suffix = '') {
     widget.origSerializeValue = widget.serializeValue
     widget.computeSize = () => [0, -4] // -4 是因为 litegraph 会在 widget 间自动加间隙
     widget.type = "converted-widget" + suffix
-    // widget.serializeValue = () => {
-    //     // 若无输入连接，则阻止序列化该 widget
-    //     const w = node.inputs?.find((i) => i.widget?.name === widget.name);
-    //     if (w?.link == null) {
-    //         return undefined;
-    //     }
-    //     return widget.origSerializeValue ? widget.origSerializeValue() : widget.value;
-    // };
 
     // 隐藏关联的 widget，例如 seed+seedControl
     if (widget.linkedWidgets) {
@@ -870,12 +742,6 @@ class Editor {
     containerDiv;
     /** 上一张图像，可能只需要其哈希 */
     cblob;
-    /** 当前 blob 中图像的哈希 */
-    c1;
-    /** 待检查的新 blob 的哈希 */
-    c2;
-    /** 若 c1 === c2 */
-    sameHash;
     /** fcanvas 中选中的对象，用于操作事件 */
     selected;
 
@@ -893,22 +759,16 @@ class Editor {
     layerToolbar;
     /** 当前选中的输入图像（工具栏操作的目标） */
     selectedLayerImage;
-    preciseSelection = false;
 
     /** （widget）引用 / 配置参数 */
     p;
     w;
     h;
 
-    /** capture on queue widget 值的引用 */
-        //captureOnQueue;
-
     /** 以图像内容签名(sig)为 key 存储输入图像图层，调换 batch 顺序时 transforms 仍能正确对应 */
     inputImages = {};
     fabricDataWidget;
     needsUpload = false;
-
-    configurationNode;
 
     static hook(nodeId) {
         return app.graph.getNodeById(nodeId);
@@ -966,7 +826,6 @@ class Editor {
             type: "text",
             defaultValue: "#00b300b0",
             onChange: (newVal, oldVal) => {
-                // console.log(newVal, this);
             },
         });
     }
@@ -979,7 +838,6 @@ class Editor {
             tooltip: "give hex code with alpha eg.: #00b300b0, this will help identifying what is withing the output",
             defaultValue: "#00b300b0",
             onChange: (newVal, oldVal) => {
-                // console.log(newVal, this);
             },
         });
     }
@@ -998,7 +856,6 @@ class Editor {
             tooltip: "Border size, 0 for invisible, overlayed and unselectable, not part of the node ouptut",
 
             onChange: (newVal, oldVal) => {
-                // console.log(newVal, this);
             },
         });
     }
@@ -1011,7 +868,6 @@ class Editor {
             tooltip: "give hex code with alpha eg.: #00b300b0, this will help identifying what is withing the output",
             defaultValue: "rgba(0,0,0,0.2)",
             onChange: (newVal, oldVal) => {
-                // console.log(newVal, this);
             },
         });
     }
@@ -1024,10 +880,6 @@ class Editor {
     }
 
     getCompositorSettings() {
-        // this.CANVAS_BORDER_COLOR = app.extensionManager.setting.get("Yuan_Canvas.Canvas.BORDER_COLOR");
-        // this.COMPOSITION_BORDER_COLOR = app.extensionManager.setting.get("Yuan_Canvas.Composition.BORDER_COLOR");
-        // this.COMPOSITION_BORDER_SIZE = app.extensionManager.setting.get("Yuan_Canvas.Composition.BORDER_SIZE");
-        // this.COMPOSITION_BACKGROUND_COLOR = app.extensionManager.setting.get("Yuan_Canvas.Composition.BACKGROUND_COLOR");
     }
 
     static getRandomCompositorUniqueId() {
@@ -1045,15 +897,6 @@ class Editor {
         return container;
     }
 
-    // static CreateIframe() {
-    //     const container = document.createElement("iframe");
-    //     container.style.backgroundColor = "rgba(15,0,25,0.25)";
-    //     container.style.zIndex = 3000;
-    //     container.style.textAlign = "center";
-    //     container.src = "https://comfy.org/";
-    //     return container;
-    // }
-
     static createCanvasElement() {
         const canvas = document.createElement("canvas");
         canvas.id = Editor.getRandomCompositorUniqueId();
@@ -1061,7 +904,6 @@ class Editor {
     }
 
     onHeightChange(value) {
-        // console.log("h callback");
         this.fcanvas.setHeight(value + (this.p.value * 2));
         this.compositionArea.setHeight(value);
         this.compositionBorder.setHeight(value + this.COMPOSITION_BORDER_SIZE * 2);
@@ -1073,7 +915,6 @@ class Editor {
     }
 
     onWidthChange(value) {
-        // console.log("h callback");
         this.fcanvas.setWidth(value + (this.p.value * 2));
         this.compositionArea.setWidth(value);
         this.compositionBorder.setWidth(value + this.COMPOSITION_BORDER_SIZE * 2);
@@ -1086,7 +927,6 @@ class Editor {
 
     onPaddingChange(padding) {
 
-        // console.log("p callback")
         // value 即 padding 值
         this.compositionArea.setHeight(this.h.value);
         this.compositionArea.setWidth(this.w.value);
@@ -1118,6 +958,30 @@ class Editor {
         const h = this.fcanvas.getHeight();
         this.containerDiv.style.width = w + "px";
         this.containerDiv.style.height = h + "px";
+        this.enforceV3Size();
+    }
+
+    /**
+     * V3 (Nodes 2.0) 前端尺寸适配：在 comfy-node 元素上同步节点最小尺寸，
+     * 使 DOM 渲染尺寸与 V1 设计保持一致。
+     * V1 前端不存在 comfy-node 元素，直接跳过。
+     */
+    enforceV3Size() {
+        try {
+            const size = this.calculateNodeSize();
+            let el = this.containerDiv?.parentElement;
+            while (el) {
+                if ((el.tagName && el.tagName.toLowerCase().includes('comfy-node')) ||
+                    (el.classList && el.classList.contains('comfy-node'))) break;
+                el = el.parentElement || (el.getRootNode ? el.getRootNode().host : null);
+            }
+            if (!el || !this.node) return;
+            this.v3NodeElement = el;
+            this.node.min_size = size;
+            el.style.removeProperty("min-width");
+            el.style.setProperty("min-width", size[0] + "px", "important");
+            el.style.setProperty("min-height", size[1] + "px", "important");
+        } catch (_) {}
     }
 
     getOldTransform(sig) {
@@ -1164,27 +1028,6 @@ class Editor {
         theImage.setCoords();
     }
 
-    resetOldTransform(sig) {
-        const img = this.inputImages[sig];
-        if (!img) return;
-        img.left = 0;
-        img.top = 0;
-        img.scaleX = 1;
-        img.scaleY = 1;
-        img.angle = 0;
-        img.flipX = false;
-        img.flipY = false;
-        img.originX = "left";
-        img.originY = "top";
-        img.skewY = 0;
-        img.skewX = 0;
-        img.perPixelTargetFind = this.preciseSelection;
-        this.fcanvas.renderAll();
-    }
-
-
-
-
     /**
      * 检查 sig 处的图像引用是否不为 null
      * 引用存储在 "inputImages" 中（以 sig 为 key）
@@ -1213,14 +1056,6 @@ class Editor {
         this.inputImages = {};
         // 隐藏可能存在的工具栏（选中对象已被移除）
         this.hideLayerToolbar();
-    }
-
-    /**
-     * 返回第 index 张图层的显示名（从 1 开始计数）。
-     * 现在仅用于日志/调试，存储 key 已改为整数 index。
-     */
-    imageNameAt(index) {
-        return 'image' + (index + 1);
     }
 
     addImage(sig, theImage, index) {
@@ -1300,7 +1135,6 @@ class Editor {
                     theImage.set({ opacity: isHidden ? 0 : 1, visible: true });
                 }
             } catch (e) {
-                // console.log(e);
             }
         }
 
@@ -1644,7 +1478,6 @@ class Editor {
         }
         return new Blob([new Uint8Array(array)], {type: mime});
     }
-    // #addDrawNodeHandler in code
     static uploadImage = (blob, imageNameWidget, node_id, setDone, callback) => {
         const node = app.graph.getNodeById(node_id);
 
@@ -1652,7 +1485,6 @@ class Editor {
         node.compositorInstance.fcanvas.renderAll();
 
         const UPLOAD_ENDPOINT = "/upload/image";
-        //const name = `composition.png`;
         const name = `${+new Date()}.png`;
         const file = new File([blob], name);
         const body = new FormData();
@@ -1665,9 +1497,7 @@ class Editor {
             method: "POST",
             body,
         }).then((value) => {
-            // debugger;
             const outputValue = `compositor/${name} [temp]`;
-            //imageNameWidget.value = Math.random() > 0.5 ? outputValue : "mask.png"
             imageNameWidget.value = outputValue;
 
             const body = new FormData();
@@ -1699,13 +1529,8 @@ class Editor {
      * @params callback  会传给 uploadImage，上传完成时调用
      * */
     grabUploadAndSetOutput(instance, setDone, callback) {
-        // console.log("capture");
-        // console.log("grap upload and set output")
         // 准备图像
         const img = new Image();
-        // 通过 view api 加载已有图像，用于测试
-        // api/view?filename=R.jpg&type=input&subfolder=&rand=0.6726800041773884
-        // img.src = "/api/view?filename=R.jpg&type=input&subfolder=&rand=0.6726800041773884";
         this.fcanvas.discardActiveObject().renderAll();
         const data = this.fcanvas.toDataURL({
             format: 'jpeg',
@@ -1720,11 +1545,6 @@ class Editor {
         // 完成后，导出图像，用临时名上传以模拟合成
         // 并更新输出名值
         img.onload = (e) => {
-
-            // 测试用 widget 调整 fcanvas 尺寸
-            // cmp.setSize([1600/3,(1200/3)+123])
-            // cmp.setDirtyCanvas(true, true)
-
 
             const blob = Editor.dataURLToBlob(data);
 
@@ -1778,8 +1598,7 @@ class Editor {
                 top: activeObject.top + direction[1] * STEP,
             });
             this.fcanvas.renderAll();
-            instance.fcanvas.bringToFront(instance.compositionBorder);
-            // console.log("selected objects are moved");
+            this.fcanvas.bringToFront(this.compositionBorder);
         }
     }
 
@@ -1850,7 +1669,6 @@ class Editor {
         });
 
         this.fcanvas.on('mouse:out', function (opt) {
-            // console.log("mouseout")
             // 移出编辑器，根据画布满载程度，此事件可能无法被拦截
             if (opt.target === null || opt.target === undefined || opt.target && opt.nextTarget === undefined) {
                 compositorInstance.uploadIfNeeded(compositorInstance);
@@ -1858,7 +1676,6 @@ class Editor {
         });
 
         this.fcanvas.on('object:modified', function (opt) {
-            // console.log(this, compositorInstance);
             // 标记需要上传，这样鼠标移出时再上传并重置
             // mouse out 不可靠，有时不触发
             compositorInstance.needsUpload = true;
@@ -1868,7 +1685,6 @@ class Editor {
         });
 
         this.fcanvas.on('mouse:wheel', function (opt) {
-            //console.log(opt);
             try {
                 if (opt.target.cacheKey !== this.selected[0].cacheKey) return;
                 if (!this.selected) return
@@ -2035,8 +1851,6 @@ class Editor {
 
         this.fcanvas.add(this.compositionArea)
         this.fcanvas.add(this.compositionBorder)
-        //this.fcanvas.bringToFront(this.compositionBorder);
-
 
         this.setupfCanvasEvents(this);
 
@@ -2053,39 +1867,11 @@ class Editor {
 
         this.node.setSize(this.calculateNodeSize())
         this.node.setDirtyCanvas(true, true);
-
-        // 使节点不可调整尺寸
-        // this.node.resizable = false;
     }
 
     constructor(context, container) {
         this.node = context;
         this.containerDiv = container;
         this.node["compositorInstance"] = this;
-
-
-        // 也在此获取设置
-        // WIDGET 回调
-        this.reference = context.widgets.find(w => w.name === "widgetName");
-        // this.reference.callback = () => {
-        //     this.someVariable = this.reference.value
-        //     context.setSize...
-        //     this.updateSomething()
-        // }
-
-        // 初始化库并设置事件
-        // 定义回调和其他函数
     }
-}
-
-
-async function interrupt() {
-    const response = await fetch('/interrupt', {
-        method: 'POST',
-        cache: 'no-cache',
-        headers: {
-            'Content-Type': 'text/html'
-        },
-    });
-    return await response.json();
 }
