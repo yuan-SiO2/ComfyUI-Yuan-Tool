@@ -13,7 +13,7 @@ class AnyType(str):
 
 class YUAN_TXTJsonExtractor:
     # 输出端口名
-    OUTPUT_NAMES = ("整体风格", "角色档案", "道具档案", "场景档案", "分镜序列", "场景索引", "角色索引", "道具索引", "索引时长")
+    OUTPUT_NAMES = ("整体风格", "角色档案", "道具档案", "场景档案", "分镜序列", "场景索引", "角色索引", "道具索引", "索引时长", "场景判断")
 
     # 台词保护引号对（与文本批量替换节点一致）
     QUOTE_PAIRS = [
@@ -42,7 +42,7 @@ class YUAN_TXTJsonExtractor:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "FLOAT")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "FLOAT", "BOOLEAN")
     RETURN_NAMES = OUTPUT_NAMES
     FUNCTION = "extract_json"
     CATEGORY = "Yuan Tool/文本"
@@ -204,6 +204,20 @@ class YUAN_TXTJsonExtractor:
         return max(end_times) if end_times else 0.0
 
     @staticmethod
+    def _extract_scene_prefix(title):
+        """从分镜标题中提取场景关键词（取「—」或「-」前部分）。
+        例如「韩家土屋卧房-深夜未眠」→「韩家土屋卧房」。
+        """
+        if not title:
+            return ""
+        prefix = title
+        for sep in ("—", "-"):
+            if sep in prefix:
+                prefix = prefix.split(sep)[0]
+                break
+        return prefix.strip()
+
+    @staticmethod
     def _match_scene_index(title, scenes):
         """根据分镜标题智能匹配场景档案索引。
         标题形如「江海大学方向街道-林夏安慰」，取「-」前部分作为场景关键词；
@@ -212,12 +226,7 @@ class YUAN_TXTJsonExtractor:
         """
         if not title or not isinstance(scenes, list) or not scenes:
             return 0
-        prefix = title
-        for sep in ("—", "-"):
-            if sep in prefix:
-                prefix = prefix.split(sep)[0]
-                break
-        prefix = prefix.strip()
+        prefix = YUAN_TXTJsonExtractor._extract_scene_prefix(title)
         if not prefix:
             return 0
         for idx, scene in enumerate(scenes):
@@ -294,8 +303,26 @@ class YUAN_TXTJsonExtractor:
             # 索引时长：从分镜时间段文本中提取最大结束时间（秒）
             索引时长 = self._max_duration_seconds(分镜序列文本)
 
+        # 场景判断：当前索引与后一个索引（索引+1）对应分镜的场景是否相同
+        # 标题形如「韩家土屋卧房-深夜未眠」，取「-」前部分作为场景关键词比较
+        # 最后一个编号（找不到后一索引）默认输出 False；找不到当前索引也输出 False
+        场景判断 = False
+        if found_shot and isinstance(分镜序列数据, list):
+            next_title = ""
+            next_found = False
+            for item in 分镜序列数据:
+                if isinstance(item, dict) and item.get("编号") == 索引 + 1:
+                    next_title = str(item.get("标题", ""))
+                    next_found = True
+                    break
+            if next_found:
+                curr_prefix = self._extract_scene_prefix(matched_title)
+                next_prefix = self._extract_scene_prefix(next_title)
+                if curr_prefix and next_prefix and curr_prefix == next_prefix:
+                    场景判断 = True
+
         return {
-            "result": [整体风格, 角色档案, 道具档案, 场景档案, 分镜序列文本, 场景索引, 角色索引, 道具索引, 索引时长]
+            "result": [整体风格, 角色档案, 道具档案, 场景档案, 分镜序列文本, 场景索引, 角色索引, 道具索引, 索引时长, 场景判断]
         }
 
 

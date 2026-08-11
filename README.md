@@ -40,13 +40,17 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 | **长度** | 统计文本长度与行数，支持多行合并为整体 |
 | **出场排序** | 按验证对象在文本中的**首次出现位置**升序排序输出（去重、未出现跳过） |
 | **文本批量替换** | 支持正则/通配符，多组查找替换。采用**最长匹配优先**避免子串误替换；开启**台词保护**后引号内（`"` `'` `“”` `‘’` `「」` `『』`）的说话内容不参与替换 |
-| **JSON提取** | 从 JSON 提取剧本信息。输入：JSON、索引；输出：整体风格、角色档案、道具档案、场景档案、分镜序列、场景索引、角色索引、道具索引、索引时长。场景/角色/道具索引在所选分镜的时间段内容中**最长匹配优先**识别，并排除引号内台词内容 |
+| **JSON提取** | 从 JSON 提取剧本信息。输入：JSON、索引；输出：整体风格、角色档案、道具档案、场景档案、分镜序列、场景索引、角色索引、道具索引、索引时长、场景判断。场景/角色/道具索引在所选分镜的时间段内容中**最长匹配优先**识别，并排除引号内台词内容；场景判断输出布尔值，比较当前索引与后一索引分镜标题的场景关键词（如「韩家土屋卧房-深夜未眠」取「-」前部分）是否相同，最后一个编号默认输出假 |
 
 ### MiniMax（Yuan Tool/MiniMax）
 
 | 节点 | 说明 |
 |---|---|
 | **MiniMax-H3 视频生成** | 调用 MiniMax H3 生成视频，支持官方九大视频生成技能（产品广告、3D 动画短片、品牌宣传、游戏片头、手绘实拍、歌词 MV 等） |
+| **H3 运动上下文** | 将上一片段尾部的连续帧作为不可去噪的条件行固定下来，画面和声音直接从上一片段的潜空间切片获取，跳过解码重编码过程，实现片段无缝衔接 |
+| **H3 运动裁剪** | 从已解码的 H3 片段中移除头部固定的帧，同时按相同时长裁剪画面和声音，保持声画同步；可选尾部对齐消除 H3 音频网格向上取整累积的偏差 |
+| **H3 保存潜空间** | 保存采样器的 AV 潜空间到磁盘（视频+音频双流），供下一次运行的运动上下文节点加载使用 |
+| **H3 加载潜空间** | 加载由「H3 保存潜空间」节点保存的 AV 潜空间，仅用于运动上下文节点的「上下文潜空间」输入 |
 
 ### CLIP（Yuan Tool/CLIP）
 
@@ -97,6 +101,7 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 
 ## 更新记录
 
+- **2026-08-11**：新增「H3 运动上下文」「H3 运动裁剪」「H3 保存潜空间」「H3 加载潜空间」4 个节点：实现 MiniMax H3 片段衔接，画面与声音直接从上一片段潜空间切片获取，跳过解码重编码过程；包含布局补丁（解除仅首/末帧关键帧锚点限制）与载荷补丁（关键帧与引用共存），首次运行时自测安装
 - **2026-08-10**：新增「RTX 视频放大 (H3)」节点：整合 RTX 超分辨率与 H3 联合 AV Latent 解码合并，支持图像直连或 AV latent 输入，内置缓存；缩放方式按倍数/目标尺寸切换时参数跟随显隐
 - **2026-08-09**：新增「加载批量图像」「JSON提取」「Yuan 引导注入」节点；JSON提取/文本批量替换采用最长匹配优先避免子串误替换
 - **2026-08-07**：列表编号/格式转换空输入兜底 `[""]`；any_X 输入端口标记为 optional（未连线不报错）
@@ -109,8 +114,9 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 
 本项目部分节点复刻/参考自以下开源项目，感谢原作者的贡献：
 
-- [WhatDreamsCost/ComfyUI-MultiImage-Loader](https://github.com/WhatDreamsCost/ComfyUI-MultiImage-Loader) 
+- [WhatDreamsCost/ComfyUI-MultiImage-Loader](https://github.com/WhatDreamsCost/ComfyUI-MultiImage-Loader)
 - [kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)
 - [yolain/ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use)
 - [Comfy-Org/Nvidia_RTX_Nodes_ComfyUI](https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI)
-- [comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI) 
+- [NikoDemon80/ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
+- [comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI)
