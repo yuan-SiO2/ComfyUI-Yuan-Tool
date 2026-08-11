@@ -491,6 +491,62 @@ function registerYuanRTXVideoUpscaleH3(nodeType) {
     };
 }
 
+// ==================== Yuan_H3MotionContext（H3 运动上下文，节点下方提示）====================
+function registerYuanH3MotionContext(nodeType) {
+    const HINT_HEIGHT = 20; // 提示行预留高度
+
+    const origOnExecuted = nodeType.prototype.onExecuted;
+    nodeType.prototype.onExecuted = function (data) {
+        // onExecuted 接收的 data 就是后端返回的 ui 字典本身
+        // （ComfyUI 前端调用 node.onExecuted(e.output)，e.output 即 ui 字典）
+        // 先在默认处理之前提取，避免数据被修改
+        let hint = null;
+        if (data && data.h3_hint != null) {
+            const raw = data.h3_hint;
+            hint = Array.isArray(raw) ? raw.join("") : String(raw);
+        }
+        // 调用 ComfyUI 默认处理
+        if (origOnExecuted) origOnExecuted.apply(this, arguments);
+        // 保存提示（在默认处理之后赋值，避免被覆盖）
+        this._h3Hint = hint;
+        // 重新计算大小以容纳/移除提示行
+        const curW = this.size ? this.size[0] : 200;
+        this.setSize([curW, this.computeSize()[1]]);
+        this.setDirtyCanvas(true, true);
+    };
+
+    // 让节点高度包含提示行（仅在存在提示时增高）
+    const origComputeSize = nodeType.prototype.computeSize;
+    nodeType.prototype.computeSize = function () {
+        const size = origComputeSize ? origComputeSize.apply(this, arguments) : [200, 100];
+        if (this._h3Hint) size[1] += HINT_HEIGHT;
+        return size;
+    };
+
+    // 在节点底部绘制单行提示（不可编辑）
+    const origOnDrawForeground = nodeType.prototype.onDrawForeground;
+    nodeType.prototype.onDrawForeground = function (ctx) {
+        if (origOnDrawForeground) origOnDrawForeground.apply(this, arguments);
+        if (!this._h3Hint) return;
+        ctx.save();
+        ctx.fillStyle = "#cccccc";
+        ctx.font = "12px Arial";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        const y = this.size[1] - HINT_HEIGHT / 2;
+        ctx.fillText(this._h3Hint, 10, y);
+        ctx.restore();
+    };
+
+    // 工作流加载时清除提示（提示由运行时生成，不随工作流保存）
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function (info) {
+        const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+        this._h3Hint = null;
+        return r;
+    };
+}
+
 app.registerExtension({
     name: "ComfyUI-Yuan-Tool",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -520,6 +576,8 @@ app.registerExtension({
             registerYuanMiniMaxH3Video(nodeType, buildPortMeta());
         } else if (nodeData.name === "Yuan_RTXVideoUpscaleH3") {
             registerYuanRTXVideoUpscaleH3(nodeType);
+        } else if (nodeData.name === "Yuan_H3MotionContext") {
+            registerYuanH3MotionContext(nodeType);
         }
     },
 });
