@@ -1,10 +1,10 @@
 """H3 运动上下文相关节点（Yuan Tool 本地化版）.
 
-复刻自 "C:\\My Xiangmu\\Yuan Tool" 的 nodes.py，包含 4 个节点：
+复刻自 "C:\\My Xiangmu\\Yuan Tool" 的 nodes.py，包含 3 个节点：
   - H3 加载潜空间 (Yuan_H3MotionContextLoadLatent)
   - H3 运动上下文 (Yuan_H3MotionContext)
-  - H3 保存潜空间 (Yuan_H3MotionContextSaveLatent)
-  - H3 运动裁剪 (Yuan_H3MotionContextTrim)
+  - H3 运动裁剪 (Yuan_H3MotionContextTrim)，合并了原「H3 保存潜空间」
+    的保存功能：先裁剪 AV 潜空间，再按需保存到磁盘，输出为裁剪结果
 
 节点分类: "Yuan Tool/MiniMax"
 
@@ -31,13 +31,15 @@ H3 图也保持与原版逐位一致。
 出错误的结果。
 """
 
-import logging
+import hashlib
+import math
 import os
 
 import folder_paths
 import node_helpers
 import torch
 
+from comfy.nested_tensor import NestedTensor
 import comfy.ldm.minimax.model as mm
 import comfy.model_base as model_base
 
@@ -45,8 +47,6 @@ try:
     from safetensors.torch import load_file as _st_load, save_file as _st_save
 except ImportError:  # ComfyUI always ships safetensors; belt and braces
     _st_load = _st_save = None
-
-_LOG = logging.getLogger("h3_motion_context")
 
 
 # ============================================================================
@@ -527,56 +527,22 @@ def _apply_layout_patch():
         return True
     who = _layout_already_patched()
     if who == "foreign":
-        _LOG.warning(
-            "h3_motion_context: another pack has already patched H3's "
-            "layout (PackedLayout.__init__ now comes from %r). Several "
-            "ComfyUI packs lift the same first/last keyframe restriction "
-            "independently and they cannot both own it, so this one is "
-            "refusing rather than wrapping a wrapper and producing joins "
-            "neither pack intended. Disable one of them and restart.",
-            getattr(getattr(getattr(mm, "PackedLayout", None), "__init__",
-                            None), "__module__", "?"))
         return False
     if who:
-        # report success: the patch IS active, just not ours, and the
-        # calling pack's nodes check is_applied() before they will run
+        # the patch IS active, just not ours, and the calling pack's nodes
+        # check is_applied() before they will run
         _layout_applied = True
-        if who == "same":
-            _LOG.info("h3_motion_context: interior keyframe anchors already "
-                      "enabled by another pack, standing down")
-        else:
-            _LOG.warning(
-                "h3_motion_context: the H3 layout patch is already installed "
-                "by a DIFFERENT copy of this code (another version, or a "
-                "fork). Standing down; that copy decides what the patch "
-                "supports, so features added since it may be unavailable. "
-                "If you have more than one H3 Motion Context folder in "
-                "custom_nodes, keep one and remove the rest. Renaming a "
-                "folder does not stop ComfyUI loading it.")
         return True
     if not hasattr(mm, "PackedLayout") or not hasattr(mm, "FRAME_RESCALE"):
-        _LOG.warning("h3_motion_context: MiniMax H3 model module missing expected "
-                     "attributes, patch not applied")
         return False
     _layout_orig_init = mm.PackedLayout.__init__
     try:
         _layout_self_test()
-    except Exception as exc:
+    except Exception:
         _layout_orig_init = None
-        _LOG.warning("h3_motion_context: self-test failed (%s), patch not "
-                     "applied. Interior keyframe anchors unavailable.", exc)
-        _LOG.warning(
-            "h3_motion_context: if you have more than one H3 Motion Context "
-            "folder in custom_nodes (a fork, a backup, a manual clone "
-            "alongside a Manager install), that is the usual cause: each "
-            "copy self-tests against whichever one loaded first. Keep one "
-            "and remove the rest. Renaming a folder does not stop ComfyUI "
-            "loading it. Otherwise this is an upstream ComfyUI change and "
-            "the message above says what moved.")
         return False
     mm.PackedLayout.__init__ = _patched_init
     _layout_applied = True
-    _LOG.info("h3_motion_context: interior keyframe anchors enabled")
     return True
 
 
@@ -615,8 +581,6 @@ def _patched_extra_conds(self, **kwargs):
     cond = out.get("minimax_payload", None)
     payload = getattr(cond, "cond", None) if cond is not None else None
     if not isinstance(payload, dict):
-        _LOG.warning("h3_motion_context: could not reach the H3 payload, "
-                     "keyframe latents may have been overwritten by refs")
         return out
 
     kf_video = [kf["latent"] for kf in keyframes if "latent" in kf]
@@ -671,38 +635,18 @@ def _apply_payload_patch():
         return True
     cls = getattr(model_base, "MiniMaxH3", None)
     if cls is None or not hasattr(cls, "extra_conds"):
-        _LOG.warning("h3_motion_context: MiniMaxH3.extra_conds not found, "
-                     "keyframes and refs cannot be combined")
         return False
     who = _payload_already_patched(cls)
     if who == "foreign":
-        _LOG.warning(
-            "h3_motion_context: another pack has already patched "
-            "MiniMaxH3.extra_conds (it now comes from %r). Both packs are "
-            "solving the same keyframe/ref collision and they cannot both "
-            "own it, so this one is refusing. Disable one of them and "
-            "restart.",
-            getattr(getattr(cls, "extra_conds", None), "__module__", "?"))
         return False
     if who:
-        # report success: the patch IS active, just not ours, and the
-        # calling pack's nodes check is_applied() before they will run
+        # the patch IS active, just not ours, and the calling pack's nodes
+        # check is_applied() before they will run
         _payload_applied = True
-        if who == "same":
-            _LOG.info("h3_motion_context: keyframe/ref coexistence already "
-                      "enabled by another pack, standing down")
-        else:
-            _LOG.warning(
-                "h3_motion_context: the H3 payload patch is already "
-                "installed by a DIFFERENT copy of this code (another "
-                "version, or a fork). Standing down. If you have more than "
-                "one H3 Motion Context folder in custom_nodes, keep one and "
-                "remove the rest.")
         return True
     _payload_orig_extra_conds = cls.extra_conds
     cls.extra_conds = _patched_extra_conds
     _payload_applied = True
-    _LOG.info("h3_motion_context: keyframe/ref coexistence enabled")
     return True
 
 
@@ -761,18 +705,17 @@ FPS = 24  # H3's native rate; audio latents run at 40 Hz, hence FRAME_RESCALE 5/
 FRAME_RESCALE = 5.0 / 3.0
 AUDIO_HZ = 40.0
 
-# Run lengths the video VAE's downscale formula max(1, (n - 5) // 17 * 5 + 2)
-# actually distinguishes. Anything between two grid points encodes to the same
-# number of latent steps as the lower one, but the steps then cover the FIRST
-# `covered` frames of the input rather than the last: encoding 10 frames yields
-# the same 2 steps as encoding 5, representing frames [-10..-6] of the source
-# clip instead of [-5..-1]. The pinned run would end five frames early and the
-# delivered clip would continue from the wrong instant. So off-grid requests
-# are snapped DOWN before slicing, keeping content and coverage in agreement.
-# The grid is 17m+5 and continues upward; the node only offers up to 56,
-# but the snap-down logic knows the higher points so an out-of-range
-# request lands on the nearest real one instead of being clamped to 39.
-VIDEO_RUN_GRID = (124, 107, 90, 73, 56, 39, 22, 5, 1)
+# Whole-group window lengths the VRF structure can cut cleanly. One group is
+# 5 latent steps covering 17 pixel frames (1+4+4+4+4), so a whole-group window
+# is 17m frames = 5m steps. A window that is NOT a whole group slices fine but
+# can never be trimmed back off the head phase-aligned: the trim removes whole
+# latent steps, and unless the count is a multiple of 5 the surviving latent
+# starts mid-cycle, where the VAE decoder reads the first token at the wrong
+# frame count and the picture flickers. The offered options are therefore all
+# multiples of 17, and anything else (a stale saved value) is snapped DOWN to
+# the nearest whole group below so the pinned run and the trim stay in
+# agreement. 5 remains as the floor for degenerate sub-group clips.
+VIDEO_RUN_GRID = (68, 51, 34, 17, 5)
 
 # Settings that used to be widgets. Each had exactly one right answer, so
 # offering the wrong one was noise. The losing branches are still in the
@@ -842,9 +785,8 @@ def _steps_for_frames(n):
 
     Returns None when no whole number of steps covers n. The video VAE's
     steps alternate 1, 4, 4, 4, 4 pixel frames, so only certain totals are
-    reachable: 1, 5, 9, ... and of the windows this node offers, 5, 22 and
-    39 land on 2, 7 and 12 steps. The 1-frame window does not, because the
-    last step of a clip spans 4 frames, not 1.
+    reachable: 1, 5, 9, 13, 17, 18, ... and of the windows this node offers,
+    17, 34, 51 and 68 land on 5, 10, 15 and 20 steps.
     """
     k, covered = 0, 0
     while covered < n:
@@ -860,14 +802,14 @@ def _video_tail_from_latent(latent, n):
     Returns (blocks, offsets, covered) in the same shape the encode path
     produces, so everything downstream is unchanged.
 
-    This is only sound because the tail window always starts at cycle
-    position 0. A clip is 17g+5 frames, which is 5g+2 latent steps; the
-    windows are 2, 7 and 12 steps; and 5g+2 minus any of those is a
-    multiple of 5. So the sliced run has the same 1, 4, 4, 4, 4 phase as a
-    freshly encoded one and _step_offsets applies unchanged. Asserted
-    below rather than assumed, because if it ever stopped holding the
-    pinned content would silently disagree with the positions written for
-    it and the join would land at the wrong instant.
+    The window does not need to start at cycle position 0: the offsets
+    returned are each block's TRUE frame start inside the window, read off
+    the block's actual position in the source latent. A window that starts
+    on a group boundary yields the plain 1, 4, 4, 4, 4 cumulative positions
+    (_step_offsets); one that starts mid-cycle yields the 4, 4, 4, 1, 4 ...
+    offsets its content really occupies, so the pinned latents and the
+    positions written for them always agree. The nodes only offer whole
+    groups, whose tail windows land mid-cycle, so this matters.
     """
     video = _video_from_latent(latent)
     total = int(video.shape[2])
@@ -875,28 +817,23 @@ def _video_tail_from_latent(latent, n):
     if steps is None:
         raise ValueError(
             "h3_motion_context: a %d frame window is not a whole number of "
-            "latent steps, so it cannot be sliced from a latent. Use 5, 22 "
-            "or 39, or unwire context_latent to encode pixels." % n)
+            "latent steps, so it cannot be sliced from a latent. Use 17, 34, "
+            "51 or 68, or unwire context_latent to encode pixels." % n)
     if steps > total:
         raise ValueError(
             "h3_motion_context: asked for %d latent steps, context_latent "
             "has %d." % (steps, total))
     start = total - steps
-    if start % 5 != 0:
-        raise RuntimeError(
-            "h3_motion_context: the %d step tail of a %d step latent starts "
-            "at cycle position %d, not 0, so its frame spans would not match "
-            "the positions written for them. Clip lengths are meant to make "
-            "this impossible; refusing rather than rendering a shifted join."
-            % (steps, total, start % 5))
     covered = _pixel_frames(steps)
     if covered != n:
         raise RuntimeError(
             "h3_motion_context: %d steps cover %d frames, expected %d."
             % (steps, covered, n))
+    base = _pixel_frames(start)
+    offsets = [_pixel_frames(start + k) - base for k in range(steps)]
     blocks = [video[:1, :, start + k:start + k + 1].clone()
               for k in range(steps)]
-    return blocks, _step_offsets(steps), covered
+    return blocks, offsets, covered
 
 
 def _audio_tail_from_latent(latent, a_frames):
@@ -929,14 +866,9 @@ def _audio_tail_from_latent(latent, a_frames):
     frames = _pixel_frames(int(video.shape[2]))
     overhang = total_t - FRAME_RESCALE * frames
     if not (0.0 <= overhang < 1.0):
-        _LOG.warning(
-            "h3_motion_context: context_latent audio grid is unexpected "
-            "(%d steps for %d frames); assuming no overhang.", total_t, frames)
         overhang = 0.0
     rt = int(round(a_frames / float(FPS) * AUDIO_HZ))
     if rt > total_t:
-        _LOG.warning("h3_motion_context: asked for %d audio steps, the latent "
-                     "has %d. Pinning all of it.", rt, total_t)
         rt = total_t
     if rt < 1:
         raise ValueError("h3_motion_context: audio window is empty")
@@ -965,20 +897,21 @@ class Yuan_H3MotionContext:
                                "链条的第一个片段无前序上下文时，将「H3 加载"
                                "潜空间」节点的片段序号设为 0，本端口接收其空"
                                "标记后条件化直通、裁剪帧数为 0。"}),
-                "上下文长度": (["5", "22", "39", "56"], {
-                    "default": "22",
-                    "tooltip": "从前一片段延续的画面帧数。只有这些长度是完整的"
-                               "潜空间步数，因此只提供这些选项。5 帧仅勉强流畅，"
-                               "22 帧近乎无缝。更长的窗口固定更多运动，但会从"
-                               "交付片段的头部扣除，因此 56 帧会浪费 2.3 秒的"
-                               "渲染在你要丢弃的帧上。"}),
-                "音频上下文长度": (["5", "22", "39", "56"], {
-                    "default": "22",
+                "上下文长度": (["17", "34", "51", "68"], {
+                    "default": "17",
+                    "tooltip": "从前一片段延续的画面帧数。每 17 帧是 H3 潜空间"
+                               "的一整个 VRF 组（5 个潜空间步），只有整组长度"
+                               "才能从尾部切片、又被「运动裁剪」整组切回，"
+                               "衔接处像素与时间完全对齐；非整组长度会在裁剪后"
+                               "打乱剩余潜空间的时序相位，导致画面闪烁。"
+                               "17 帧仅勉强流畅，34 帧近乎无缝。更长的窗口"
+                               "固定更多运动，但会从交付片段的头部扣除。"}),
+                "音频上下文长度": (["17", "34", "51", "68"], {
+                    "default": "17",
                     "tooltip": "尾部音频的固定帧数，独立于画面窗口。"
-                               "该窗口与固定的视频尾端对齐，"
-                               "因此 22 帧对应 22 帧画面窗口时完全重叠；更长"
-                               "的窗口会进一步延伸到已腾空的坐标空间"
-                               "（未测试）。"}),
+                               "该窗口与固定的视频尾端对齐。音频潜空间按 "
+                               "40Hz 连续采样，没有 VRF 分组，帧数按 24fps "
+                               "画面换算（40/24 ≈ 5/3）。"}),
             },
         }
 
@@ -991,7 +924,7 @@ class Yuan_H3MotionContext:
                    "都直接从上一片段的潜空间中切片获取，跳过每次链接都会"
                    "损失少许质量的解码和重编码过程。")
 
-    def apply(self, 条件化, 潜空间, 上下文潜空间, 上下文长度, 音频上下文长度="22"):
+    def apply(self, 条件化, 潜空间, 上下文潜空间, 上下文长度, 音频上下文长度="17"):
         # 第一个片段：上下文潜空间来自「H3 加载潜空间」片段序号 0 的空标记，
         # 或文件未找到时的回退空标记。无前序上下文，条件化直通、裁剪 0，
         # 不安装补丁、不做任何切片，并通过 ui.h3_hint 在节点下方显示简短提示
@@ -1042,16 +975,9 @@ class Yuan_H3MotionContext:
         n = min(int(上下文长度), available)
         if n < 1:
             raise ValueError("h3_motion_context: no frames available to pin")
-        if n < 上下文长度:
-            _LOG.warning("h3_motion_context: only %d frames available, pinning %d",
-                         available, n)
 
-        # 在切片前对齐到 VAE 网格，使切片的帧正好是潜空间步数覆盖的帧
+        # 在切片前对齐到整组网格，使切片的帧正好是整 VRF 组覆盖的帧
         run = next(g for g in VIDEO_RUN_GRID if g <= n)
-        if run != n:
-            _LOG.warning(
-                "h3_motion_context: %d frames is off the VAE grid; pinning "
-                "the last %d instead (usable runs: 1, 5, 22, 39)", n, run)
         n = run
 
         if n >= frame_count:
@@ -1131,112 +1057,132 @@ class Yuan_H3MotionContext:
 
 
 class Yuan_H3MotionContextTrim:
-    """Drop the pinned head off a decoded clip, picture and sound together.
+    """直接在 H3 的 AV 潜空间上裁切头部固定的画面与声音，并可选保存。
 
-    The pinned frames occupy the start of the delivered timeline, so they
-    have to come off before concatenating. Trimming only the images would
-    leave the audio a full trim_frames longer than the video, and muxing
-    those puts the whole soundtrack ahead of the picture by trim_frames/24
-    seconds. At 5 frames that is 208ms, silent on ambience but squarely
-    offbeat on anything with a pulse.
-
-    So this takes both streams and removes the same span from each: whole
-    frames from the images, the matching number of samples from the
-    waveform. Wire trim_frames from the motion context node so the count
-    follows whatever the encoder actually produced.
-
-    The tail needs the same treatment for a different reason. H3's audio
-    latent runs at 40 Hz against 24 fps picture, and FRAME_RESCALE is 5/3,
-    so a 124 frame clip wants 206.67 audio steps and the layout rounds up
-    to 207. Every clip therefore ships about 8.3 ms more sound than
-    picture. Concatenate two and the second seam is out by 16.7 ms, three
-    and it is 25 ms, and the error grows without bound down a chain. It
-    reads as a faint dampening at the first join and a short click at
-    later ones. Truncating the tail to exactly frames/fps stops it
-    accumulating.
+    解码路径先把潜空间解成像素帧与波形再裁切，每次衔接都多一次解码和
+    重编码；本节点改为直接对 AV 潜空间切片：视频流裁掉覆盖前 n 帧的
+    latent 步，音频流按 40Hz/24fps = 5/3 同步裁掉对应步数，输出仍是
+    含视频流和音频流的 AV 潜空间，不经过解码/转码。裁剪后的潜空间可
+    同时保存到磁盘，供下一次运行的运动上下文节点加载——即合并了原
+    「H3 保存潜空间」节点的功能，潜空间输出以本节点的裁剪结果为主。
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "图像": ("IMAGE",),
-                "裁剪帧数": ("INT", {"default": 0, "min": 0, "max": 4096}),
-            },
-            "optional": {
-                "音频": ("AUDIO", {
-                    "tooltip": "同一片段的已解码音频。按匹配的时长裁剪以保持"
-                               "声画同步。静音片段可不连接。"}),
-                "帧率": ("FLOAT", {
-                    "default": 24.0, "min": 1.0, "max": 240.0, "step": 0.001,
-                    "tooltip": "用于将裁剪帧数转换为音频时长的帧率。必须与你"
-                               "输入到 Create Video 节点的帧率一致。"}),
-                "尾部对齐": ("BOOLEAN", {
+                "潜空间": ("LATENT", {
+                    "tooltip": "H3 采样器的 AV 潜空间（同时含视频流与音频流），"
+                               "直接在其上裁切。"}),
+                "裁剪帧数": ("INT", {"default": 0, "min": 0, "max": 4096,
+                                "tooltip": "从头部裁掉的画面帧数。非 17 的倍数"
+                                           "会自动向下吸附到最近的整 VRF 组"
+                                           "（17/34/51…），保证剩余潜空间的"
+                                           "时序相位不错位、画面不闪烁；小于"
+                                           "17 时吸附为 0（不裁剪）。"}),
+                "片段序号": ("INT", {
+                    "default": 1, "min": 1, "max": 9999,
+                    "tooltip": "本片段在链条中的序号。设为 2 时保存到"
+                               "latent_00002_.safetensors，重复生成会覆盖原文件。"
+                               "「加载潜空间」节点设相同序号即可对应加载。"}),
+                "保存到本地": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "截断音频使其时长精确等于 帧数/帧率。H3 的"
-                               "音频网格向上取整，因此每个片段携带约 8ms 额外"
-                               "声音，在链条的每个衔接处累积。"}),
+                    "tooltip": "开启时将裁剪后的潜空间保存到本地文件，关闭时"
+                               "仅输出不生成文件。不影响潜空间输出端口。"}),
+                "存储位置": ("STRING", {
+                    "default": "H3-Mubu",
+                    "tooltip": "保存在 ComfyUI 输出文件夹下的子目录名。"
+                               "「加载潜空间」节点使用相同的存储位置即可"
+                               "对应加载。"}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("图像", "音频")
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("潜空间",)
     FUNCTION = "trim"
+    OUTPUT_NODE = True
     CATEGORY = "Yuan Tool/MiniMax"
-    DESCRIPTION = ("从已解码的 H3 片段中移除头部固定的帧，同时按相同时长"
-                   "裁剪画面和声音。")
+    DESCRIPTION = ("直接在 H3 的 AV 潜空间上裁掉头部固定的帧：视频流与音频流"
+                   "同步裁切，输出仍是含视频和音频两流的 AV 潜空间，跳过解码"
+                   "再编码的往返。裁剪后的潜空间可同时保存到磁盘，供下一次"
+                   "运行的运动上下文节点加载。")
 
-    def trim(self, 图像, 裁剪帧数, 音频=None, 帧率=24.0, 尾部对齐=True):
+    def trim(self, 潜空间, 裁剪帧数, 片段序号=1, 保存到本地=True, 存储位置="H3-Mubu"):
         n = max(0, int(裁剪帧数))
-        total = int(图像.shape[0])
+        # 吸附到最近的整组（17 的倍数）：非整组裁切会把剩余潜空间的
+        # VRF 相位打乱导致闪烁，向下吸附保证新起点恒落在组边界上。
+        # 小于 17 时吸附为 0（不裁剪，原样直通）
+        n -= n % 17
+        parts = _streams_from_latent(潜空间)
+        if len(parts) < 2:
+            raise ValueError(
+                "h3_motion_context: 裁剪需要含视频和音频两流的 AV 潜空间，"
+                "得到 %d 个流。请连接 H3 采样器（或加载潜空间）的输出。"
+                % len(parts))
+        video, audio = parts[0], parts[1]
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        if audio.ndim == 3:
+            audio = audio.unsqueeze(0)
+        total = _pixel_frames(int(video.shape[2]))
         if n >= total:
             raise ValueError(
                 "h3_motion_context: asked to trim %d frames from a %d frame clip"
                 % (n, total))
-        out_images = 图像[n:] if n else 图像
+        # 前 n 帧覆盖的视频 latent 步数（每步覆盖 1/4/4/4/4 帧交替）
+        k, removed = 0, 0
+        while removed < n:
+            removed += FRAME_PER_TOKEN[k % 5]
+            k += 1
+        video = video[:, :, k:].clone()
+        # 音频流按 40Hz/24fps = 5/3 同步裁掉头部步数
+        audio_cut = int(round(removed * FRAME_RESCALE))
+        audio = audio[..., audio_cut:].clone()
+        # 尾部对齐固定开启：把音频潜空间截断到恰好等于剩余帧数 × 5/3 步，
+        # 消除 H3 音频网格向上取整在每个衔接处累积的约 8ms 额外声音
+        rem_frames = total - removed
+        want = int(math.ceil(rem_frames * FRAME_RESCALE))
+        have = int(audio.shape[-1])
+        if have > want:
+            audio = audio[..., :want]
+        # 保持输入的流容器类型：NestedTensor 或普通 list
+        samples = 潜空间["samples"]
+        new_samples = (NestedTensor([video, audio])
+                       if getattr(samples, "is_nested", False)
+                       else [video, audio])
+        out = dict(潜空间)
+        out["samples"] = new_samples
+        # 保存裁剪后的潜空间（关闭时跳过，不影响输出端口）
+        if 保存到本地:
+            _save_av_latent(out, 存储位置, 片段序号)
+        return (out,)
 
-        out_audio = 音频
-        if 音频 is not None:
-            waveform = 音频["waveform"]
-            sr = int(音频["sample_rate"])
-            seconds = n / float(帧率)
-            cut = int(round(seconds * sr))
-            length = int(waveform.shape[-1])
-            if cut >= length:
-                raise ValueError(
-                    "h3_motion_context: trimming %.3fs from %.3fs of audio would "
-                    "leave nothing. Check that fps matches the clip."
-                    % (seconds, length / sr))
-            waveform = waveform[..., cut:]
 
-            if 尾部对齐:
-                frames_left = total - n
-                want = int(round(frames_left / float(帧率) * sr))
-                have = int(waveform.shape[-1])
-                if have > want:
-                    over = have - want
-                    waveform = waveform[..., :want]
-                    _LOG.info("h3_motion_context: tail trimmed %d samples "
-                              "(%.2fms) so audio matches %d frames exactly",
-                              over, over / sr * 1000.0, frames_left)
-                elif have < want:
-                    _LOG.warning("h3_motion_context: audio is %.2fms shorter than "
-                                 "%d frames; leaving the tail alone",
-                                 (want - have) / sr * 1000.0, frames_left)
+def _save_av_latent(latent, 存储位置, 片段序号):
+    """将 AV 潜空间保存为 {存储位置}/latent_%05d_.safetensors。
 
-            out_audio = {"waveform": waveform, "sample_rate": sr}
-            _LOG.info("h3_motion_context: %d frames / %.4fs picture, %.4fs sound, "
-                      "drift %.2fms",
-                      total - n, (total - n) / float(帧率),
-                      int(waveform.shape[-1]) / sr,
-                      abs((total - n) / float(帧率) - int(waveform.shape[-1]) / sr) * 1000.0)
-        elif n:
-            _LOG.info("h3_motion_context: trimmed %d leading frames, %d remain. "
-                      "No audio wired; if this clip has sound, mux it through "
-                      "this node or it will run %.3fs ahead of the picture.",
-                      n, total - n, n / float(帧率))
-
-        return (out_images, out_audio)
+    重新生成同一片段会覆盖自身的废弃文件，不会堆叠新文件。
+    """
+    if _st_save is None:
+        raise RuntimeError("h3_motion_context: safetensors is not "
+                           "available; cannot save latents.")
+    parts = _streams_from_latent(latent)
+    if len(parts) < 2:
+        raise ValueError(
+            "h3_motion_context: latent has no audio stream; wire the "
+            "sampler output of an H3 AV graph.")
+    video = parts[0].cpu().contiguous()
+    audio = parts[1].cpu().contiguous()
+    # 文件前缀固定为 latent，用户只能设置存储目录
+    full_prefix = os.path.join(存储位置, "latent")
+    folder, filename, _, _, _ = folder_paths.get_save_image_path(
+        full_prefix, folder_paths.get_output_directory())
+    os.makedirs(folder, exist_ok=True)  # 确保子目录存在
+    # 片段序号 2 -> latent_00002_.safetensors
+    path = os.path.join(folder, "%s_%05d_.safetensors"
+                        % (filename, int(片段序号)))
+    _st_save({"video": video, "audio": audio}, path,
+             metadata={"format": "h3_motion_context_av_v1"})
 
 
 def _build_load_path(存储位置):
@@ -1300,77 +1246,42 @@ def _resolve_prefix(dir_part, prefix, idx):
     return max(files, key=os.path.getmtime)
 
 
-class Yuan_H3MotionContextSaveLatent:
-    """Save an H3 AV latent to disk so the NEXT run can load it.
+def _dir_fingerprint(prefix_path):
+    """目录级综合指纹：对 prefix_path 所在目录下所有
+    prefix_*.safetensors 文件，按「文件名 + 内容」计算 SHA256 综合指纹。
 
-    Wiring the sampler's output straight into context_latent is a cycle:
-    the sampler would be consuming its own result. The latent that motion
-    context needs is the PREVIOUS clip's, which lives in the previous run
-    -- so it has to cross runs through disk, the same way the frames and
-    audio already do. Stock Save/Load Latent can't serialise H3's nested
-    video/audio pair; this saves the two streams side by side.
+    任一文件新增/覆盖/删除都会改变指纹；所有文件内容不变则指纹不变。
+    用于「加载潜空间」的 IS_CHANGED：该阶段 ComfyUI 对链接输入一律传
+    None（execution.py get_input_data 以 execution_list=None 调用，
+    链接输入被 mark_missing 置空），片段序号来自 GetNode/表达式链路时
+    拿不到真实值，因此退化为对整个存储目录做指纹，保证：
+      - 新片段保存（内容变化）→ 指纹变化 → 下游重跑
+      - 同一片段重试（内容不变）→ 指纹不变 → 缓存命中，不再重跑
+    目录不存在时返回确定性 "missing" 标记（可缓存），首次保存出现
+    文件后指纹变化，自然触发一次重跑。
     """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "潜空间": ("LATENT", {
-                    "tooltip": "采样器的输出潜空间（与你连接到解码节点的"
-                               "相同）。"}),
-                "存储位置": ("STRING", {
-                    "default": "H3-Mubu",
-                    "tooltip": "保存在 ComfyUI 输出文件夹下的子目录名。"
-                               "「加载潜空间」节点使用相同的存储位置即可"
-                               "对应加载。"}),
-                "片段序号": ("INT", {
-                    "default": 1, "min": 1, "max": 9999,
-                    "tooltip": "本片段在链条中的序号。设为 2 时保存到"
-                               "latent_00002_.safetensors，重复生成会覆盖原文件。"
-                               "「加载潜空间」节点设相同序号即可对应加载。"}),
-                "保存到本地": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "开启时将潜空间保存到本地文件，关闭时仅直通"
-                               "输出不生成文件。不影响潜空间输出端口。"}),
-            },
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("潜空间",)
-    FUNCTION = "save"
-    OUTPUT_NODE = True
-    CATEGORY = "Yuan Tool/MiniMax"
-    DESCRIPTION = ("保存采样器的 AV 潜空间到磁盘，同时将输入潜空间原样直通输出，"
-                   "使下一次运行的运动上下文节点可通过配套的「加载潜空间」节点"
-                   "从中固定音频，本片段的潜空间也可继续向下游传输。")
-
-    def save(self, 潜空间, 存储位置, 片段序号=1, 保存到本地=True):
-        if 保存到本地:
-            if _st_save is None:
-                raise RuntimeError("h3_motion_context: safetensors is not "
-                                   "available; cannot save latents.")
-            parts = _streams_from_latent(潜空间)
-            if len(parts) < 2:
-                raise ValueError(
-                    "h3_motion_context: latent has no audio stream; wire the "
-                    "sampler output of an H3 AV graph.")
-            video = parts[0].cpu().contiguous()
-            audio = parts[1].cpu().contiguous()
-            # 文件前缀固定为 latent，用户只能设置存储目录
-            full_prefix = os.path.join(存储位置, "latent")
-            folder, filename, _, _, _ = folder_paths.get_save_image_path(
-                full_prefix, folder_paths.get_output_directory())
-            os.makedirs(folder, exist_ok=True)  # 确保子目录存在
-            # 片段序号 2 -> latent_00002_.safetensors
-            # 重新生成会覆盖自身的废弃文件，不会堆叠新文件
-            path = os.path.join(folder, "%s_%05d_.safetensors"
-                                % (filename, int(片段序号)))
-            _st_save({"video": video, "audio": audio}, path,
-                     metadata={"format": "h3_motion_context_av_v1"})
-            _LOG.info("h3_motion_context: saved AV latent to %s (video %s, "
-                      "audio %s)", path, tuple(video.shape), tuple(audio.shape))
-        # 输入潜空间原样直通输出，无论是否保存到本地都不影响输出端口
-        return (潜空间,)
+    p = (prefix_path or "").strip().strip('"').strip("'")
+    if not p:
+        p = "H3-Mubu/latent"
+    h = hashlib.sha256()
+    h.update(p.encode("utf-8"))
+    # 候选目录顺序与 _resolve_latent_path 一致：先原路径，再 output 目录
+    for c in (p, os.path.join(folder_paths.get_output_directory(), p)):
+        dir_part = os.path.dirname(c)
+        prefix = os.path.basename(c)
+        if dir_part and os.path.isdir(dir_part):
+            files = sorted(f for f in os.listdir(dir_part)
+                           if f.startswith(prefix) and f.endswith(".safetensors"))
+            for fname in files:
+                h.update(fname.encode("utf-8"))
+                try:
+                    with open(os.path.join(dir_part, fname), "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                except OSError:
+                    pass
+            return "%s:%s" % (p, h.hexdigest())
+    return "missing:%s" % p
 
 
 class Yuan_H3MotionContextLoadLatent:
@@ -1392,12 +1303,12 @@ class Yuan_H3MotionContextLoadLatent:
             "required": {
                 "存储位置": ("STRING", {
                     "default": "H3-Mubu",
-                    "tooltip": "与「保存潜空间」节点相同的存储位置"
+                    "tooltip": "与「H3 运动裁剪」节点相同的存储位置"
                                "（ComfyUI 输出文件夹下的子目录名）。"}),
                 "片段序号": ("INT", {
                     "default": 1, "min": 0, "max": 9999,
                     "tooltip": "要加载的片段序号。设为 2 时加载"
-                               "latent_00002_.safetensors，与「保存潜空间」"
+                               "latent_00002_.safetensors，与「H3 运动裁剪」"
                                "节点的命名规则一致。设为 0 时表示链条的第一个"
                                "片段（无前序上下文）：不读取本地文件，输出空"
                                "标记，运动上下文节点识别后条件化直通、裁剪帧"
@@ -1408,7 +1319,7 @@ class Yuan_H3MotionContextLoadLatent:
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "load"
     CATEGORY = "Yuan Tool/MiniMax"
-    DESCRIPTION = ("加载由「H3 保存潜空间」节点保存的潜空间，"
+    DESCRIPTION = ("加载由「H3 运动裁剪」节点保存的潜空间，"
                    "仅用于运动上下文节点的「上下文潜空间」输入。"
                    "片段序号设为 0 时表示第一个片段，不读取文件，"
                    "运动上下文节点将条件化直通。")
@@ -1424,43 +1335,51 @@ class Yuan_H3MotionContextLoadLatent:
 
     @classmethod
     def IS_CHANGED(cls, 存储位置, 片段序号=1):
-        # 片段序号 0 = 第一个片段，输出确定性的空标记，无需读取文件
-        if int(片段序号) == 0:
-            return 0
-        # the path string stays constant while the file behind it changes
-        # (newest save, or an overwritten slot), so cache on the resolved
-        # file identity instead -- otherwise ComfyUI would happily serve
-        # a stale latent forever
+        # 片段序号显式为常量 0 = 第一个片段：输出确定性的空标记，无需读文件。
+        # 注意：IS_CHANGED 阶段 ComfyUI 对链接输入一律传 None（execution.py
+        # get_input_data 以 execution_list=None 调用），片段序号来自
+        # GetNode/表达式链路时拿不到真实值（int(None) 抛异常）。这里不再
+        # 依赖片段序号，改为对存储目录下全部 latent 文件做综合指纹：
+        #   - 任一文件新增/覆盖/删除 → 指纹变化 → 下游重跑（新上下文）
+        #   - 内容不变（同一片段重试）→ 指纹不变 → 缓存命中，不再重跑
         try:
-            p = _resolve_latent_path(_build_load_path(存储位置), 片段序号)
-            return "%s:%d" % (p, os.stat(p).st_mtime_ns)
+            if int(片段序号) == 0:
+                return 0
+        except (TypeError, ValueError):
+            pass  # 链接输入拿不到序号，走目录级指纹
+        try:
+            return _dir_fingerprint(_build_load_path(存储位置))
         except Exception:
-            return float("NaN")  # unresolvable: never cache
+            return float("NaN")  # 意外失败：永不缓存，保守重跑
 
     def load(self, 存储位置, 片段序号=1):
         # 片段序号 0 = 第一个片段：无前序上下文，不读取本地文件，
         # 输出带空标记的空 latent，运动上下文节点识别后条件化直通、裁剪 0
-        if int(片段序号) == 0:
+        try:
+            idx = int(片段序号)
+        except (TypeError, ValueError):
+            raise ValueError("h3_motion_context: 片段序号必须是整数，得到 %r"
+                             % (片段序号,))
+        if idx == 0:
             return ({"samples": [], self.EMPTY_MARKER: True,
                      self.EMPTY_REASON: "first_clip"},)
         if _st_load is None:
             raise RuntimeError("h3_motion_context: safetensors is not "
                                "available; cannot load latents.")
         try:
-            path = _resolve_latent_path(_build_load_path(存储位置), 片段序号)
+            path = _resolve_latent_path(_build_load_path(存储位置), idx)
         except FileNotFoundError as e:
             # 文件未找到：按第一片段处理，输出空标记并携带原因，
             # 运动上下文节点识别后条件化直通、裁剪 0，并在节点下方显示提示
             return ({"samples": [], self.EMPTY_MARKER: True,
                      self.EMPTY_REASON: "file_not_found",
-                     self.EMPTY_REASON_DETAIL: str(int(片段序号))},)
+                     self.EMPTY_REASON_DETAIL: str(idx)},)
         data = _st_load(path)
         if "video" not in data or "audio" not in data:
             raise ValueError(
                 "h3_motion_context: %s is not an h3_motion_context latent "
                 "(missing video/audio streams). Was it saved by the stock "
                 "Save Latent node instead?" % path)
-        _LOG.info("h3_motion_context: loaded AV latent from %s", path)
         # a plain list, not a NestedTensor: only this repo's context_latent
         # input accepts it, which is the point -- it cannot be mistaken
         # for a decodable latent without failing loudly downstream
@@ -1472,12 +1391,10 @@ class Yuan_H3MotionContextLoadLatent:
 NODE_CLASS_MAPPINGS = {
     "Yuan_H3MotionContext": Yuan_H3MotionContext,
     "Yuan_H3MotionContextTrim": Yuan_H3MotionContextTrim,
-    "Yuan_H3MotionContextSaveLatent": Yuan_H3MotionContextSaveLatent,
     "Yuan_H3MotionContextLoadLatent": Yuan_H3MotionContextLoadLatent,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Yuan_H3MotionContext": "H3 运动上下文",
     "Yuan_H3MotionContextTrim": "H3 运动裁剪",
-    "Yuan_H3MotionContextSaveLatent": "H3 保存潜空间",
     "Yuan_H3MotionContextLoadLatent": "H3 加载潜空间",
 }

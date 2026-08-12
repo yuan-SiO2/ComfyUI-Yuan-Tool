@@ -102,7 +102,6 @@ class YuanMultiImage:
             try:
                 full_path = self._resolve_image_path(path)
                 if not os.path.exists(full_path):
-                    print(f"[加载批量图像] 警告：图像路径不存在: {path}")
                     continue
 
                 image = Image.open(full_path)
@@ -113,8 +112,8 @@ class YuanMultiImage:
                 image_tensor = torch.from_numpy(image_np)[None,]
                 image_tensor = self.resize_image(image_tensor, 16)
                 track_images.append(image_tensor)
-            except Exception as e:
-                print(f"[加载批量图像] 加载失败 {path}: {e}")
+            except Exception:
+                pass
 
         if len(track_images) == 0:
             return torch.zeros((1, 64, 64, 3))
@@ -162,7 +161,6 @@ class YuanMultiImage:
         try:
             tracks = json.loads(tracks_data) if tracks_data and tracks_data.strip() else []
         except (json.JSONDecodeError, TypeError):
-            print("[加载批量图像] 警告：tracks_data JSON 解析失败，使用空数据。")
             tracks = []
 
         results = []
