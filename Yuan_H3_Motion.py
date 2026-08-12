@@ -906,11 +906,12 @@ class Yuan_H3MotionContext:
                                "打乱剩余潜空间的时序相位，导致画面闪烁。"
                                "17 帧仅勉强流畅，34 帧近乎无缝。更长的窗口"
                                "固定更多运动，但会从交付片段的头部扣除。"}),
-                "音频上下文长度": (["17", "34", "51", "68"], {
+                "音频上下文长度": (["0", "17", "34", "51", "68"], {
                     "default": "17",
-                    "tooltip": "尾部音频的固定帧数，独立于画面窗口。"
-                               "该窗口与固定的视频尾端对齐。音频潜空间按 "
-                               "40Hz 连续采样，没有 VRF 分组，帧数按 24fps "
+                    "tooltip": "尾部音频的固定帧数，独立于画面窗口。设为 0 时"
+                               "不延续前一片段的声音，模型为当前片段生成全新的"
+                               "音频。该窗口与固定的视频尾端对齐。音频潜空间按"
+                               " 40Hz 连续采样，没有 VRF 分组，帧数按 24fps "
                                "画面换算（40/24 ≈ 5/3）。"}),
             },
         }
@@ -1021,31 +1022,37 @@ class Yuan_H3MotionContext:
         _ensure_payload_patch()
         # 音频窗口独立于视频窗口：音频条件行占行但不占交付帧
         a_frames = int(音频上下文长度)
-        audio_latent, ref_audio_t, overhang = _audio_tail_from_latent(
-            上下文潜空间, a_frames)
-        ref = {
-            "kind": "audio",
-            "ref_audio_t": ref_audio_t,
-            "audio_latent": audio_latent,
-        }
-        if audio_mode == "timeline":
-            # 将音频窗口尾端对齐到固定视频：两者都是片段 A 的尾部，
-            # 必须在新时间轴的同一时刻结束。latent 路径上切片内容
-            # 会超出 A 最后帧 overhang 个步（H3 音频网格向上取整），
-            # 所以结束坐标移动那么多
-            end_frame = float(span if anchor_mode == "head" else 0)
-            end_frame += overhang / FRAME_RESCALE
-            # 将窗口对齐到目标自身的音频网格
-            end_coord = round(FRAME_RESCALE * end_frame)
-            end_frame = end_coord / FRAME_RESCALE
-            ref[MC_AUDIO_KEY] = end_frame
-        # APPEND 而非赋值：Ref2VA 条件化已携带图自身的引用块，
-        # 赋值会替换全部。用第二次调用让关键帧值先落位
-        audio_ref = ref
+        if a_frames > 0:
+            audio_latent, ref_audio_t, overhang = _audio_tail_from_latent(
+                上下文潜空间, a_frames)
+            ref = {
+                "kind": "audio",
+                "ref_audio_t": ref_audio_t,
+                "audio_latent": audio_latent,
+            }
+            if audio_mode == "timeline":
+                # 将音频窗口尾端对齐到固定视频：两者都是片段 A 的尾部，
+                # 必须在新时间轴的同一时刻结束。latent 路径上切片内容
+                # 会超出 A 最后帧 overhang 个步（H3 音频网格向上取整），
+                # 所以结束坐标移动那么多
+                end_frame = float(span if anchor_mode == "head" else 0)
+                end_frame += overhang / FRAME_RESCALE
+                # 将窗口对齐到目标自身的音频网格
+                end_coord = round(FRAME_RESCALE * end_frame)
+                end_frame = end_coord / FRAME_RESCALE
+                ref[MC_AUDIO_KEY] = end_frame
+            # APPEND 而非赋值：Ref2VA 条件化已携带图自身的引用块，
+            # 赋值会替换全部。用第二次调用让关键帧值先落位
+            audio_ref = ref
 
-        out = node_helpers.conditioning_set_values(条件化, values)
-        out = node_helpers.conditioning_set_values(
-            out, {"minimax_refs": [audio_ref]}, append=True)
+            out = node_helpers.conditioning_set_values(条件化, values)
+            out = node_helpers.conditioning_set_values(
+                out, {"minimax_refs": [audio_ref]}, append=True)
+        else:
+            # 音频上下文为 0：不安装音频引用，模型为当前片段生成全新声音。
+            # 不设置 minimax_refs 时 stock 的 extra_conds 会单独把画面
+            # 关键帧写入 payload，两个补丁分支都不会触发
+            out = node_helpers.conditioning_set_values(条件化, values)
 
         trim = span if anchor_mode == "head" else 0
         # 正常切片成功：提示已关联的片段序号（来自加载节点）
