@@ -965,7 +965,6 @@ class Yuan_H3MotionContext:
         audio_mode = AUDIO_MODE
         上下文长度 = int(上下文长度)
         音频上下文长度 = int(音频上下文长度)
-        _ensure_layout_patch()
 
         video = _video_from_latent(潜空间)
         latent_t = int(video.shape[2])
@@ -979,13 +978,11 @@ class Yuan_H3MotionContext:
         src_w = int(src_video.shape[4]) * 16
         src_h = int(src_video.shape[3]) * 16
         if src_w != width or src_h != height:
-            # latent 无法缩放，分辨率变化在链条中几乎总是错误，直接报错
-            raise ValueError(
-                "h3_motion_context: context_latent is %dx%d but this "
-                "clip is %dx%d. A latent cannot be resized, so the "
-                "previous clip has to be regenerated at this "
-                "resolution, or the chain restarted here."
-                % (src_w, src_h, width, height))
+            # 分辨率不一致时无法在同一 latent 网格上拼接前段画面/声音，
+            # 跳过上下文，本次作为独立片段直通（效果等同重启链条）
+            return {"result": (条件化, 0), "ui": {
+                "h3_hint": "分辨率不一致，已跳过"}}
+        _ensure_layout_patch()
         if int(src_video.shape[1]) != int(video.shape[1]):
             raise ValueError(
                 "h3_motion_context: context_latent has %d channels, "
