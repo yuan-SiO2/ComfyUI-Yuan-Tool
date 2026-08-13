@@ -34,6 +34,7 @@ H3 图也保持与原版逐位一致。
 import hashlib
 import math
 import os
+import re
 
 import folder_paths
 import node_helpers
@@ -521,12 +522,18 @@ def _layout_already_patched():
     return None
 
 
+_layout_fail_reason = None
+
+
 def _apply_layout_patch():
-    global _layout_orig_init, _layout_applied
+    global _layout_orig_init, _layout_applied, _layout_fail_reason
     if _layout_applied:
         return True
     who = _layout_already_patched()
     if who == "foreign":
+        _layout_fail_reason = (
+            "PackedLayout.__init__ is already wrapped by a different pack "
+            "from another module; refusing to stack a second wrapper.")
         return False
     if who:
         # the patch IS active, just not ours, and the calling pack's nodes
@@ -534,12 +541,17 @@ def _apply_layout_patch():
         _layout_applied = True
         return True
     if not hasattr(mm, "PackedLayout") or not hasattr(mm, "FRAME_RESCALE"):
+        _layout_fail_reason = (
+            "this ComfyUI lacks comfy.ldm.minimax.model.PackedLayout or "
+            "FRAME_RESCALE; its H3 backend predates the layout machinery "
+            "this node needs.")
         return False
     _layout_orig_init = mm.PackedLayout.__init__
     try:
         _layout_self_test()
-    except Exception:
+    except Exception as e:
         _layout_orig_init = None
+        _layout_fail_reason = "self-test failed: %s" % e
         return False
     mm.PackedLayout.__init__ = _patched_init
     _layout_applied = True
@@ -629,15 +641,24 @@ def _payload_already_patched(cls):
     return None
 
 
+_payload_fail_reason = None
+
+
 def _apply_payload_patch():
-    global _payload_orig_extra_conds, _payload_applied
+    global _payload_orig_extra_conds, _payload_applied, _payload_fail_reason
     if _payload_applied:
         return True
     cls = getattr(model_base, "MiniMaxH3", None)
     if cls is None or not hasattr(cls, "extra_conds"):
+        _payload_fail_reason = (
+            "model_base.MiniMaxH3.extra_conds was not found; this ComfyUI "
+            "predates the H3 extra_conds mechanism this node needs.")
         return False
     who = _payload_already_patched(cls)
     if who == "foreign":
+        _payload_fail_reason = (
+            "MiniMaxH3.extra_conds is already wrapped by a different pack "
+            "from another module; refusing to stack a second wrapper.")
         return False
     if who:
         # the patch IS active, just not ours, and the calling pack's nodes
@@ -676,8 +697,8 @@ def _ensure_layout_patch():
     if not _apply_layout_patch():
         raise RuntimeError(
             "h3_motion_context: the layout patch could not be applied, so "
-            "interior anchors would be rejected by ComfyUI. The reason was "
-            "logged just above this error.")
+            "interior anchors would be rejected by ComfyUI. Reason: %s"
+            % (_layout_fail_reason or "unknown"))
 
 
 def _ensure_payload_patch():
@@ -692,8 +713,8 @@ def _ensure_payload_patch():
         raise RuntimeError(
             "h3_motion_context: the payload patch could not be applied. "
             "Without it the audio ref would overwrite the pinned video "
-            "latents and the motion context would be lost. The reason was "
-            "logged just above this error.")
+            "latents and the motion context would be lost. Reason: %s"
+            % (_payload_fail_reason or "unknown"))
 
 
 # ============================================================================
@@ -1239,12 +1260,16 @@ def _resolve_prefix(dir_part, prefix, idx):
     """Resolve a latent file by filename prefix (matches Save's filename_prefix).
 
     e.g. prefix="latent", idx=2  ->  latent_00002_.safetensors
+    同时兼容云端导出的带任意后缀文件名，如
+    latent_00002_etaar_1786585381.safetensors，以及旧版
+    latent_00002.safetensors / latent_clip002.safetensors。
     """
-    endings = ("%s_%05d_.safetensors" % (prefix, idx),
-               "%s_%05d.safetensors" % (prefix, idx),  # 兼容旧版无下划线
-               "%s_clip%03d.safetensors" % (prefix, idx))  # 更早版本
+    pat = re.compile(r"^%s_%05d(?:_[^.]*)?\.safetensors$"
+                     % (re.escape(prefix), int(idx)))
+    pat_clip = re.compile(r"^%s_clip%03d\.safetensors$"
+                          % (re.escape(prefix), int(idx)))
     files = [os.path.join(dir_part, f) for f in os.listdir(dir_part)
-             if f.endswith(endings)]
+             if pat.match(f) or pat_clip.match(f)]
     if not files:
         raise FileNotFoundError(
             "h3_motion_context: no saved latent for clip %d "
