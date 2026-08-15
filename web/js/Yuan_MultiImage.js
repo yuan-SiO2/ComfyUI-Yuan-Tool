@@ -61,6 +61,55 @@
                 font-size: 10px; cursor: pointer; color: white; white-space: nowrap;
                 transition: background 0.15s;
             }
+            /* --- 原图预览窗口 --- */
+            .yuan-mi-preview-overlay {
+                position: fixed; inset: 0; z-index: 99999;
+                background: rgba(0, 0, 0, 0.82);
+                display: flex; flex-direction: column;
+                align-items: center; justify-content: center;
+                font-family: system-ui, sans-serif;
+            }
+            .yuan-mi-preview-toolbar {
+                display: flex; align-items: center; gap: 8px;
+                padding: 8px 12px; background: #22222e;
+                border: 1px solid #3a3a4a; border-radius: 6px;
+                margin-bottom: 8px; color: #ddd; font-size: 12px;
+                max-width: 92vw; box-sizing: border-box;
+            }
+            .yuan-mi-preview-btn {
+                background: #3a3f4b; border: 1px solid #5a5f6b; color: #fff;
+                border-radius: 4px; padding: 3px 10px; font-size: 12px;
+                cursor: pointer; white-space: nowrap; user-select: none;
+                flex-shrink: 0;
+            }
+            .yuan-mi-preview-btn:hover { background: #4a4f5b; }
+            .yuan-mi-preview-close { background: #5a2a2a; border-color: #7f3a3a; }
+            .yuan-mi-preview-close:hover { background: #7a3a3a; }
+            .yuan-mi-preview-name {
+                max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+                white-space: nowrap; color: #aaa;
+                direction: rtl; text-align: left; flex-shrink: 1;
+            }
+            .yuan-mi-preview-viewport {
+                position: relative; width: 92vw; height: calc(100vh - 120px);
+                min-height: 200px; overflow: hidden;
+                border: 1px solid #3a3a4a; border-radius: 4px;
+                background: #101014; cursor: grab; touch-action: none;
+            }
+            .yuan-mi-preview-viewport.dragging { cursor: grabbing; }
+            .yuan-mi-preview-img {
+                position: absolute; top: 0; left: 0;
+                transform-origin: 0 0; will-change: transform;
+                user-select: none; -webkit-user-drag: none;
+                max-width: none; max-height: none;
+            }
+            .yuan-mi-preview-hint {
+                position: absolute; bottom: 8px; left: 50%;
+                transform: translateX(-50%); color: #999;
+                font-size: 11px; pointer-events: none;
+                background: rgba(0, 0, 0, 0.5); padding: 2px 8px;
+                border-radius: 3px; white-space: nowrap;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -306,7 +355,188 @@
                 });
             }
 
-            // --- 6. 滑轨 UI 渲染 ---
+            // --- 6. 原图预览（点击缩略图弹出，可放大缩小 / 平移）---
+            let previewOverlay = null;
+            let previewImg = null;
+            let previewZoom = 1;
+            let previewFitZoom = 1;
+            let previewTx = 0;
+            let previewTy = 0;
+
+            function openPreview(path) {
+                closePreview();
+
+                const overlay = document.createElement("div");
+                overlay.className = "yuan-mi-preview-overlay";
+
+                // 顶部工具栏：缩放按钮 + 文件名 + 关闭
+                const toolbar = document.createElement("div");
+                toolbar.className = "yuan-mi-preview-toolbar";
+
+                const zoomOutBtn = document.createElement("button");
+                zoomOutBtn.className = "yuan-mi-preview-btn";
+                zoomOutBtn.innerText = "−";
+
+                const zoomLabel = document.createElement("span");
+                zoomLabel.style.minWidth = "44px";
+                zoomLabel.style.textAlign = "center";
+                zoomLabel.style.flexShrink = "0";
+                zoomLabel.innerText = "100%";
+
+                const zoomInBtn = document.createElement("button");
+                zoomInBtn.className = "yuan-mi-preview-btn";
+                zoomInBtn.innerText = "+";
+
+                const resetBtn = document.createElement("button");
+                resetBtn.className = "yuan-mi-preview-btn";
+                resetBtn.innerText = "适应窗口";
+
+                const nameSpan = document.createElement("span");
+                nameSpan.className = "yuan-mi-preview-name";
+                nameSpan.innerText = path;
+
+                const closeBtn = document.createElement("button");
+                closeBtn.className = "yuan-mi-preview-btn yuan-mi-preview-close";
+                closeBtn.innerText = "✕ 关闭";
+
+                toolbar.append(zoomOutBtn, zoomLabel, zoomInBtn, resetBtn, nameSpan, closeBtn);
+
+                // 视口区域
+                const viewport = document.createElement("div");
+                viewport.className = "yuan-mi-preview-viewport";
+
+                const img = document.createElement("img");
+                img.className = "yuan-mi-preview-img";
+                img.src = "/api/view?filename=" + encodeURIComponent(path) + "&type=input";
+                img.alt = path;
+
+                const hint = document.createElement("div");
+                hint.className = "yuan-mi-preview-hint";
+                hint.innerText = "滚轮缩放 · 拖拽平移 · 双击适应窗口 · ESC 关闭";
+
+                viewport.appendChild(img);
+                viewport.appendChild(hint);
+                overlay.appendChild(toolbar);
+                overlay.appendChild(viewport);
+                document.body.appendChild(overlay);
+
+                previewOverlay = overlay;
+                previewImg = img;
+                previewZoom = 1;
+                previewFitZoom = 1;
+                previewTx = 0;
+                previewTy = 0;
+
+                function fitToWindow() {
+                    const vw = viewport.clientWidth;
+                    const vh = viewport.clientHeight;
+                    const iw = img.naturalWidth || vw;
+                    const ih = img.naturalHeight || vh;
+                    previewFitZoom = Math.min(vw / iw, vh / ih, 1);
+                    previewZoom = previewFitZoom;
+                    previewTx = (vw - iw * previewZoom) / 2;
+                    previewTy = (vh - ih * previewZoom) / 2;
+                    updateTransform();
+                }
+
+                function updateTransform() {
+                    img.style.transform =
+                        "translate(" + previewTx + "px," + previewTy + "px) scale(" + previewZoom + ")";
+                    zoomLabel.innerText = Math.round(previewZoom * 100) + "%";
+                }
+
+                /** 以屏幕坐标 (clientX, clientY) 为锚点缩放 */
+                function zoomAt(clientX, clientY, factor) {
+                    const rect = viewport.getBoundingClientRect();
+                    const mx = clientX - rect.left;
+                    const my = clientY - rect.top;
+                    const px = (mx - previewTx) / previewZoom;
+                    const py = (my - previewTy) / previewZoom;
+                    const newZoom = Math.min(Math.max(previewZoom * factor, previewFitZoom * 0.5), 8);
+                    if (newZoom === previewZoom) return;
+                    previewZoom = newZoom;
+                    previewTx = mx - px * previewZoom;
+                    previewTy = my - py * previewZoom;
+                    updateTransform();
+                }
+
+                // 按钮
+                zoomInBtn.onclick = () => {
+                    zoomAt(viewport.clientWidth / 2, viewport.clientHeight / 2, 1.25);
+                };
+                zoomOutBtn.onclick = () => {
+                    zoomAt(viewport.clientWidth / 2, viewport.clientHeight / 2, 0.8);
+                };
+                resetBtn.onclick = () => fitToWindow();
+                closeBtn.onclick = () => closePreview();
+
+                // 滚轮缩放
+                viewport.addEventListener("wheel", (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+                }, { passive: false });
+
+                // 拖拽平移
+                let panStart = null;
+                viewport.addEventListener("mousedown", (e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    panStart = { x: e.clientX, y: e.clientY, tx: previewTx, ty: previewTy };
+                    viewport.classList.add("dragging");
+                });
+                window.addEventListener("mousemove", onPanMove);
+                window.addEventListener("mouseup", onPanUp, { once: true });
+                function onPanMove(e) {
+                    if (!panStart) return;
+                    previewTx = panStart.tx + (e.clientX - panStart.x);
+                    previewTy = panStart.ty + (e.clientY - panStart.y);
+                    updateTransform();
+                }
+                function onPanUp() {
+                    panStart = null;
+                    viewport.classList.remove("dragging");
+                    window.removeEventListener("mousemove", onPanMove);
+                }
+
+                // 双击适应窗口
+                viewport.addEventListener("dblclick", (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    fitToWindow();
+                });
+
+                // 点击遮罩空白处关闭
+                overlay.addEventListener("mousedown", (e) => {
+                    if (e.target === overlay) closePreview();
+                });
+
+                // ESC 关闭
+                const escHandler = (e) => {
+                    if (e.key === "Escape") closePreview();
+                };
+                document.addEventListener("keydown", escHandler);
+                overlay._escHandler = escHandler;
+
+                if (img.complete && img.naturalWidth > 0) {
+                    fitToWindow();
+                } else {
+                    img.onload = () => fitToWindow();
+                }
+            }
+
+            function closePreview() {
+                if (!previewOverlay) return;
+                if (previewOverlay._escHandler) {
+                    document.removeEventListener("keydown", previewOverlay._escHandler);
+                }
+                previewOverlay.remove();
+                previewOverlay = null;
+                previewImg = null;
+            }
+
+            // --- 7. 滑轨 UI 渲染 ---
             /** 仅渲染 DOM（不触碰端口，避免破坏连接） */
             function renderTracksUI() {
                 tracksContainer.innerHTML = "";
@@ -538,6 +768,23 @@
                     numBadge.innerText = (imgIndex + 1).toString();
 
                     item.addEventListener("contextmenu", (e) => e.stopPropagation());
+
+                    // 点击缩略图 → 原图预览（记录按下位置，区分拖拽）
+                    let pressX = 0;
+                    let pressY = 0;
+                    item.addEventListener("mousedown", (e) => {
+                        if (e.button !== 0) return;
+                        pressX = e.clientX;
+                        pressY = e.clientY;
+                    });
+                    item.addEventListener("click", (e) => {
+                        // 发生位移视为拖拽，不触发预览
+                        if (Math.abs(e.clientX - pressX) > 4 || Math.abs(e.clientY - pressY) > 4) return;
+                        // 点击删除按钮时不触发预览（del.onclick 已 stopPropagation，此处双保险）
+                        if (e.target === del || del.contains(e.target)) return;
+                        e.stopPropagation();
+                        openPreview(path);
+                    });
 
                     // 拖拽排序
                     item.ondragstart = (e) => {
