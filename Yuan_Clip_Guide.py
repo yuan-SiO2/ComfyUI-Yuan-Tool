@@ -435,6 +435,10 @@ class YuanClipGuide:
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "图像引导的注意力强度，控制图像引导帧对生成结果的注意力影响。"
                 }),
+                "MSR_LORA": (["auto", "MSR2.5", "MSR2.3"], {
+                    "default": "auto",
+                    "tooltip": "MSR 适配模式：auto 按 LoRA 元数据自动检测（V1 触发、V2/普通不触发）；MSR2.5（LTX-2.5-Licon-MSR-V1）强制 MSR 适配（负偏移+槽位嵌入）；MSR2.3（LTX-2.3-Licon-MSR-V2）强制普通模式（正帧，无嵌入）。"
+                }),
             },
         }
 
@@ -466,6 +470,141 @@ class YuanClipGuide:
         except (TypeError, ValueError):
             factor = 1
         return factor
+
+    @classmethod
+    def _is_msr_model(cls, model):
+        """自动检测模型是否加载了 MSR 类 LoRA。
+
+        MSR 检查点（如 LTX-2.5-Licon-MSR-V1）的 safetensors 元数据声明
+        reference_slot_embedding_enabled / reference_slot_embedding_dim，且参考图按
+        pic1_based_negative_time 约定放置于负时间偏移位置。普通 LoRA（如
+        LTX-2.3-Licon-MSR-V2，元数据为空）不会触发。
+        """
+        if model is None:
+            return False
+        try:
+            meta = model.get_attachment("lora_metadata")
+        except Exception:
+            return False
+        if not meta:
+            return False
+        try:
+            offsets = str(meta.get("reference_slot_time_offsets", "pic1_based_negative_time"))
+            if "negative" not in offsets:
+                return False
+            enabled_raw = meta.get("reference_slot_embedding_enabled", False)
+            if isinstance(enabled_raw, bool):
+                enabled = enabled_raw
+            else:
+                enabled = str(enabled_raw).strip().lower() in {"1", "true", "yes", "on"}
+            dim_raw = meta.get("reference_slot_embedding_dim", 0)
+            try:
+                dim = int(float(str(dim_raw)))
+            except (TypeError, ValueError):
+                dim = 0
+            return enabled or dim > 0
+        except Exception:
+            return False
+
+    _msr_slot_state_cache = {}
+
+    @classmethod
+    def _load_msr_slot_state(cls, lora_path):
+        """从 MSR LoRA 文件加载学习到的 reference_slot_embedding 权重。
+
+        原生 MSR 在推理时会把该 Fourier-MLP 槽位嵌入加到参考图 latent 通道上，
+        模型靠它识别"这是第几个槽位的参考图"并提取人物身份。V2 等元数据为空的
+        普通 LoRA 返回 None（不注入）。
+        """
+        try:
+            import safetensors
+        except ImportError:
+            return None
+        if not lora_path or not os.path.isfile(lora_path):
+            return None
+        try:
+            mtime = os.path.getmtime(lora_path)
+        except OSError:
+            mtime = 0.0
+        cache_key = (lora_path, mtime)
+        if cache_key in cls._msr_slot_state_cache:
+            return cls._msr_slot_state_cache[cache_key]
+        state = None
+        try:
+            with safetensors.safe_open(lora_path, framework="pt") as f:
+                meta = f.metadata() or {}
+                enabled_raw = meta.get("reference_slot_embedding_enabled", False)
+                if isinstance(enabled_raw, bool):
+                    enabled = enabled_raw
+                else:
+                    enabled = str(enabled_raw).strip().lower() in {"1", "true", "yes", "on"}
+                if enabled:
+                    offsets = str(meta.get("reference_slot_time_offsets", "pic1_based_negative_time"))
+                    if "negative" in offsets:
+                        prefixes = ("reference_slot_embedding.", "diffusion_model.reference_slot_embedding.")
+                        state = {}
+                        for key in f.keys():
+                            for prefix in prefixes:
+                                if key.startswith(prefix):
+                                    state[key[len(prefix):]] = f.get_tensor(key).detach().cpu()
+                                    break
+                        required = {"frequencies", "net.0.weight", "net.0.bias", "net.2.weight", "net.2.bias"}
+                        if not required.issubset(state):
+                            state = None
+        except Exception:
+            state = None
+        cls._msr_slot_state_cache[cache_key] = state
+        return state
+
+    @classmethod
+    def _msr_slot_embedding(cls, slot_id, state, device, dtype):
+        """复刻原生 MSR 的 Fourier-MLP slot embedding 计算（slot_id 从 1 起）。"""
+        frequencies = state["frequencies"].to(device=device, dtype=torch.float32)
+        slot_value = torch.tensor(float(slot_id), device=device, dtype=torch.float32)
+        scaled = slot_value / 16.0
+        phases = scaled * frequencies
+        features = torch.cat((scaled.reshape(1), torch.sin(phases), torch.cos(phases)))
+        weight0 = state["net.0.weight"].to(device=device, dtype=torch.float32)
+        bias0 = state["net.0.bias"].to(device=device, dtype=torch.float32)
+        hidden = torch.nn.functional.silu(torch.nn.functional.linear(features, weight0, bias0))
+        weight2 = state["net.2.weight"].to(device=device, dtype=torch.float32)
+        bias2 = state["net.2.bias"].to(device=device, dtype=torch.float32)
+        embedding = torch.nn.functional.linear(hidden, weight2, bias2)
+        return embedding.to(dtype=dtype)
+
+    @classmethod
+    def _resolve_msr_slot_state(cls, model, msr_lora):
+        """按 MSR_LORA 选项解析槽位嵌入权重来源。
+
+        - "MSR2.5"：使用 LTX-2.5-Licon-MSR-V1（含槽位嵌入，强制 MSR 模式）
+        - "MSR2.3"：LTX-2.3-Licon-MSR-V2 无槽位嵌入，返回 None
+        - "auto"：在 loras 目录中查找第一个元数据声明 MSR 的 LoRA
+          （V2 元数据为空会被跳过）。找到返回 slot_state，否则返回 None。
+        """
+        if model is None:
+            return None
+        keyword = None
+        if msr_lora and msr_lora != "auto":
+            if msr_lora == "MSR2.3":
+                return None
+            keyword = "LTX-2.5"
+        try:
+            names = folder_paths.get_filename_list("loras")
+        except Exception:
+            return None
+        for name in names:
+            if keyword is not None and (keyword not in name or "MSR" not in name):
+                continue
+            try:
+                path = folder_paths.get_full_path("loras", name)
+            except Exception:
+                path = None
+            if not path:
+                continue
+            state = cls._load_msr_slot_state(path)
+            if state is not None:
+                return state
+        return None
 
     @classmethod
     def get_latent_index(cls, cond, latent_length, guide_length, frame_idx, scale_factors, latent_shape=None):
@@ -584,7 +723,8 @@ class YuanClipGuide:
 
     @classmethod
     def _execute_timeline(cls, positive, negative, vae, latent, guide_data, motion_guide_data,
-                          iclora_parameters=None, model=None, image_attention_strength=1.0):
+                          iclora_parameters=None, model=None, image_attention_strength=1.0,
+                          msr_lora="auto"):
         """Timeline 批量引导模式：处理 guide_data 和 motion_guide_data。"""
         scale_factors = vae.downscale_index_formula
         latent_image = latent["samples"].clone()
@@ -613,11 +753,28 @@ class YuanClipGuide:
         segments = motion_segments
         time_scale_factor = scale_factors[0]
 
+        # MSR_LORA 选项决定 MSR 适配模式：
+        # - MSR2.5：强制启用（负偏移 + 槽位嵌入）
+        # - MSR2.3：强制关闭（正帧普通逻辑，V2 无嵌入）
+        # - auto：按 LoRA 元数据自动检测（V1 触发、V2/普通不触发）
+        if msr_lora == "MSR2.5":
+            msr_mode = True
+        elif msr_lora == "MSR2.3":
+            msr_mode = False
+        else:
+            msr_mode = cls._is_msr_model(model)
+        # MSR 模式下加载参考图槽位嵌入权重（原生 MSR 的 Fourier-MLP embedding，
+        # 加到参考图 latent 通道上恢复人物身份绑定；V2 或普通 LoRA 不注入）
+        msr_slot_state = cls._resolve_msr_slot_state(model, msr_lora) if msr_mode else None
+
         # -----------------------------------------------------------------------
         # 标准 Timeline 引导模式：将图像分段和视频分段作为关键帧注入 latent
         # -----------------------------------------------------------------------
         if len(images) > 0 or len(segments) > 0:
-            # A. 处理图像引导
+            # A. 处理图像引导（主轨分段引导图）
+            # 主轨图始终按标准路径以 insert_frames 正帧位置注入引导，不参与
+            # MSR 参考槽位分配——MSR 槽位仅由 IC-LoRA 轨的 @图X 静态参考图
+            # （B 分支）独占，避免主轨图挤占 @图 的 slot 编号与槽位嵌入。
             for idx, img_tensor in enumerate(images):
                 f_idx = insert_frames[idx] if idx < len(insert_frames) else 0
                 img_strength = float(strengths[idx] if idx < len(strengths) else 1.0)
@@ -635,6 +792,7 @@ class YuanClipGuide:
                 image_pixels, guide_latent = cls.encode(
                     vae, latent_width, latent_height, img_tensor, scale_factors, latent_downscale_factor
                 )
+
                 frame_idx, latent_idx = cls.get_latent_index(
                     positive, latent_length, len(image_pixels), int(f_idx), scale_factors
                 )
@@ -646,12 +804,26 @@ class YuanClipGuide:
                 if guide_latent.shape[2] > max_frames:
                     guide_latent = guide_latent[:, :, :max_frames]
 
-                tokens_added = guide_latent.shape[2] * guide_latent.shape[3] * guide_latent.shape[4]
                 guide_orig_shape = list(guide_latent.shape[2:])
 
+                # IC-LoRA 空间扩张：与视频分段（B分支）保持一致，保证原生 LTXVCropGuides
+                # 按 keyframe_idxs token 计数裁剪的帧数等于实际追加的 latent 帧数，
+                # 避免裁剪不足导致尾部残留参考帧（流露出人物参考图）
+                guide_mask = None
+                if latent_downscale_factor > 1:
+                    B_g, _, F_g, H_g, W_g = guide_latent.shape
+                    guide_mask = torch.ones(
+                        (B_g, 1, F_g, H_g, W_g), device=guide_latent.device, dtype=guide_latent.dtype
+                    )
+                    guide_latent, guide_mask = cls._dilate_latent_with_mask(
+                        guide_latent, guide_mask, latent_downscale_factor
+                    )
+
+                tokens_added = guide_latent.shape[2] * guide_latent.shape[3] * guide_latent.shape[4]
                 positive, negative, latent_image, noise_mask = cls.append_keyframe(
                     positive, negative, frame_idx, latent_image, noise_mask,
                     guide_latent, img_strength, scale_factors,
+                    guide_mask=guide_mask,
                     latent_downscale_factor=latent_downscale_factor,
                 )
                 positive, negative = _append_guide_attention_entry(
@@ -659,14 +831,16 @@ class YuanClipGuide:
                 )
 
             # B. 处理视频分段
-            # 自动合并相邻的静态图像段为合成视频序列，保持"前端显示分段、后端执行合成"语义
-            # 合并条件：isStaticImage=True 且前一段 end == 当前段 start（连续排列）
+            # MSR 模式（检测到 pic1_based_negative_time 类 LoRA）：静态参考图段不合并，
+            # 每个槽位独立按负时间偏移追加，对齐原生 MSR 语义。
+            # 非 MSR 模式保持"前端显示分段、后端执行合成"语义：自动合并相邻的静态
+            # 图像段为合成视频序列，合并条件为 isStaticImage=True 且前一段 end == 当前段 start
             merged_segments = []
             i_seg = 0
             while i_seg < len(segments):
                 seg = segments[i_seg]
                 is_static = bool(seg.get("isStaticImage", False))
-                if is_static:
+                if is_static and not msr_mode:
                     # 收集连续相邻的静态图像段
                     batch = [seg]
                     j = i_seg + 1
@@ -703,6 +877,22 @@ class YuanClipGuide:
                     merged_segments.append(seg)
                     i_seg += 1
 
+            # MSR 模式：静态参考图段的槽位按 @图X 编号（subjectNum）绑定，
+            # slot = subjectNum（@图3 即 slot 3，书写/排列顺序不影响绑定），
+            # num_slots = 参考图槽位最大值。标准流程（@图1..@图N 连续无缺号）
+            # 下与"按排列顺序"的结果完全一致；删除中间段后仍保持编号对齐。
+            _msr_slot_b = 0
+            _msr_total_b = 0
+            if msr_mode:
+                _slot_nums = []
+                for _seg in merged_segments:
+                    if (bool(_seg.get("isStaticImage", False))
+                            and float(_seg.get("videoStrength", 1.0)) > 0.0
+                            and int(_seg.get("length", 1)) > 0):
+                        _slot_nums.append(int(_seg.get("subjectNum", 0)))
+                _valid_nums = [n for n in _slot_nums if n > 0]
+                _msr_total_b = max(_valid_nums) if _valid_nums else len(_slot_nums)
+
             # 补帧对齐：合并段总帧数须满足 VAE 的 (N-1)%time_scale_factor==0，
             # 否则第766行截断会丢帧。多出的1帧由 _load_motion_video_frames
             # 最大余数法自动分配给第一张图。
@@ -735,6 +925,52 @@ class YuanClipGuide:
 
                     num_frames_to_keep = ((video_frames.shape[0] - 1) // time_scale_factor) * time_scale_factor + 1
                     video_frames = video_frames[:num_frames_to_keep]
+
+                    # MSR 模式静态参考图段：按原生 MSR 约定 frame_offset=-(num_slots-slot_index)
+                    # 以负时间偏移追加到视频起点之前。跳过 get_latent_index 正帧换算（会把
+                    # 负索引钳制到视频末尾），causal_fix=True 且不加渐变 mask，由 LTXVCropGuides
+                    # 按 keyframe_idxs token 计数裁剪，与原生 MSR 工作流一致。
+                    if msr_mode and bool(seg.get("isStaticImage", False)):
+                        # 槽位编号 = @图X 编号（subjectNum），缺失时回退为排列顺序
+                        slot_id = int(seg.get("subjectNum", 0))
+                        if slot_id <= 0:
+                            _msr_slot_b += 1
+                            slot_id = _msr_slot_b
+                        # 原生 MSR 约定：slot k 的时间偏移 = -(num_slots - k + 1)
+                        frame_idx = -(_msr_total_b - slot_id + 1)
+                        _, guide_latent = cls._encode_for_timeline(
+                            vae, latent_width, latent_height, video_frames, scale_factors,
+                            latent_downscale_factor, resize_method=active_resize_method,
+                        )
+                        # 注入原生 MSR 的学习槽位嵌入，恢复人物身份绑定
+                        if msr_slot_state is not None:
+                            emb = cls._msr_slot_embedding(slot_id, msr_slot_state, guide_latent.device, guide_latent.dtype)
+                            if emb.numel() == guide_latent.shape[1]:
+                                guide_latent = guide_latent + emb.view(1, -1, 1, 1, 1)
+                        guide_orig_shape = list(guide_latent.shape[2:])
+                        guide_mask = None
+                        if latent_downscale_factor > 1:
+                            B_g, _, F_g, H_g, W_g = guide_latent.shape
+                            guide_mask = torch.ones(
+                                (B_g, 1, F_g, H_g, W_g), device=guide_latent.device, dtype=guide_latent.dtype
+                            )
+                            guide_latent, guide_mask = cls._dilate_latent_with_mask(
+                                guide_latent, guide_mask, latent_downscale_factor
+                            )
+                        tokens_added = guide_latent.shape[2] * guide_latent.shape[3] * guide_latent.shape[4]
+                        positive, negative, latent_image, noise_mask = cls.append_keyframe(
+                            positive, negative, frame_idx, latent_image, noise_mask,
+                            guide_latent, video_strength, scale_factors,
+                            guide_mask=guide_mask,
+                            latent_downscale_factor=latent_downscale_factor,
+                            causal_fix=True,
+                        )
+                        positive, negative = _append_guide_attention_entry(
+                            positive, negative, tokens_added, guide_orig_shape,
+                            strength=video_attention_strength,
+                        )
+                        continue
+
                     causal_fix = int(start_frame) == 0 or num_frames_to_keep == 1
                     encode_frames = video_frames if causal_fix else torch.cat([video_frames[:1], video_frames], dim=0)
 
@@ -894,11 +1130,11 @@ class YuanClipGuide:
         return model_clone
 
     def execute(self, 模型, 正向条件, 负向条件, VAE, 潜空间, 引导数据=None, 运动引导数据=None,
-                IC_LORA参数=None, 图像注意力强度=1.0):
+                IC_LORA参数=None, 图像注意力强度=1.0, MSR_LORA="auto"):
         """节点入口：Timeline 批量引导模式。"""
         return self._execute_timeline(
             正向条件, 负向条件, VAE, 潜空间, 引导数据, 运动引导数据,
-            IC_LORA参数, 模型, 图像注意力强度,
+            IC_LORA参数, 模型, 图像注意力强度, MSR_LORA,
         )
 
 
