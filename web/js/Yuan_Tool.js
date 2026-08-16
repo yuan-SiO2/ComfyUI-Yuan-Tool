@@ -531,6 +531,69 @@ function registerYuanH3MotionContext(nodeType) {
     };
 }
 
+// ==================== Yuan_H3MotionContextLoadLatent（H3 加载潜空间：手动上传按钮）====================
+
+async function yuanH3LatentUploadFile(file, onProgress) {
+    // 分块上传潜空间文件到后端 /yuan_h3_motion_upload_latent（与时间轴节点同款策略，
+    // 避免单次请求超出服务端 body 上限），最后一块的响应携带 {"name": "..."}
+    const CHUNK_SIZE = 4 * 1024 * 1024;
+    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+    let lastResp = null;
+    for (let i = 0; i < totalChunks; i++) {
+        const blob = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+        const formData = new FormData();
+        formData.append("file", blob);
+        formData.append("filename", file.name);
+        formData.append("chunk_index", String(i));
+        formData.append("total_chunks", String(totalChunks));
+        const res = await fetch("/yuan_h3_motion_upload_latent", { method: "POST", body: formData });
+        if (!res.ok) throw new Error(`chunk ${i + 1}/${totalChunks} failed: ${res.status}`);
+        if (i === totalChunks - 1) lastResp = await res.json();
+        if (onProgress) onProgress(i + 1, totalChunks);
+    }
+    return lastResp;
+}
+
+function registerYuanH3MotionContextLoadLatent(nodeType) {
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+        const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+        const self = this;
+        const manualWidget = this.widgets && this.widgets.find((w) => w.name === "手动上传");
+        if (!manualWidget || this._yuanLatentUploadBtn) return r;
+        const btn = this.addWidget("button", "上传潜空间", null, () => {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = ".safetensors";
+            input.onchange = async () => {
+                const file = input.files && input.files[0];
+                if (!file) return;
+                const origLabel = btn.name;
+                btn.name = "上传中…";
+                try {
+                    const resp = await yuanH3LatentUploadFile(file, (done, total) => {
+                        btn.name = `上传潜空间 ${done}/${total}`;
+                    });
+                    if (!resp || !resp.name) {
+                        throw new Error((resp && resp.error) || "上传失败：服务器未返回文件名");
+                    }
+                    manualWidget.value = resp.name;
+                    self.setDirtyCanvas(true, true);
+                    btn.name = "上传完成";
+                } catch (err) {
+                    console.error("[Yuan H3 加载潜空间] 上传失败:", err);
+                    btn.name = "上传失败";
+                } finally {
+                    setTimeout(() => { btn.name = origLabel; }, 2000);
+                }
+            };
+            input.click();
+        });
+        this._yuanLatentUploadBtn = btn;
+        return r;
+    };
+}
+
 app.registerExtension({
     name: "ComfyUI-Yuan-Tool",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -561,6 +624,8 @@ app.registerExtension({
             registerYuanRTXVideoUpscaleH3(nodeType);
         } else if (nodeData.name === "Yuan_H3MotionContext") {
             registerYuanH3MotionContext(nodeType);
+        } else if (nodeData.name === "Yuan_H3MotionContextLoadLatent") {
+            registerYuanH3MotionContextLoadLatent(nodeType);
         }
     },
 });
