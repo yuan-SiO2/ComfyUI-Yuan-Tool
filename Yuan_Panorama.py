@@ -1,11 +1,4 @@
-"""Yuan Tool · Panorama 节点
-
-复刻自 ComfyUI-Panorama-Stickers，仅包含两个节点：
-- YuanPanoramaPreview  : 交互式 ERP 全景预览（360°/180°），支持视频批次
-- YuanPanoramaSeamPrep : 为接缝修复准备 ERP 图像
-
-节点分类: "Yuan Tool/图像"
-"""
+"""Yuan Tool · Panorama 节点：ERP 全景交互预览（360°/180°，支持视频批次）与接缝修复准备。"""
 
 import base64
 import io
@@ -269,9 +262,7 @@ def _make_video_ui_payload(mp4_path: Path, fps: float, frame_count: int) -> dict
 class YuanPanoramaPreview:
     """交互式预览 ERP 全景图（360°/180°），支持视频批次输入。
 
-    后端职责：将输入 ERP 图像落盘为预览图（pano_input_images），
-    若为视频批次则额外编码 mp4 预览（pano_videos / pano_video_meta）。
-    前端通过 WebGL 读取这些 UI 条目并以球面投影交互渲染。
+    后端将输入落盘为预览图（pano_input_images），视频批次额外编码 mp4 预览（pano_videos / pano_video_meta）。
     """
 
     @classmethod
@@ -303,8 +294,7 @@ class YuanPanoramaPreview:
         ui_ret = {}
         warnings = []
         fps_value = 24.0
-        # output_current_view = True  → 全景模式（输出完整 ERP 全景图）
-        # output_current_view = False → 裁剪模式（输出当前 3D 裁剪截图）
+        # output_current_view=True 输出完整全景图，False 输出当前 3D 裁剪截图
         panorama_mode = bool(output_current_view)
         # 裁剪分辨率：限制到合法范围
         view_w = max(64, min(8192, int(view_width or 1024)))
@@ -332,7 +322,6 @@ class YuanPanoramaPreview:
         if warnings:
             ui_ret["pano_preview_warnings"] = warnings
 
-        # 全景模式输出完整 ERP 全景图；裁剪模式输出前端截取的当前 3D 裁剪画面
         output_image = ERP_image if ERP_image is not None else torch.zeros(
             (1, 1, 1, 3), dtype=torch.float32,
         )
@@ -349,12 +338,7 @@ class YuanPanoramaPreview:
 class YuanPanoramaSeamPrep:
     """为接缝修复（seam-focused inpainting）准备 ERP 图像。
 
-    输入 IMAGE 形状 [B,H,W,C]（0..1）。
-    输出:
-      - image        [B,H,W,C]  平移接缝到中心后的图像
-      - mask         [B,H,W]    接缝带掩码
-      - mask_blurred [B,H,W]    高斯模糊后的掩码
-
+    输入 [B,H,W,C]（0..1），输出平移接缝后的图像 [B,H,W,C] 与接缝掩码 [B,H,W]（硬掩码 + 高斯模糊掩码）。
     seam_center_offset_px 为正时接缝带右移，为负时左移。
     """
 

@@ -7,13 +7,11 @@ class AnyType(str):
         return False
 
 
-# ==============================================================================
-# JSON提取（按端口名作为键提取对应字段，全部输出字符串）
-# ==============================================================================
+# ==== JSON提取：按端口名提取对应字段，全部输出字符串 ====
 
 class YUAN_TXTJsonExtractor:
     # 输出端口名
-    OUTPUT_NAMES = ("整体风格", "角色档案", "道具档案", "场景档案", "分镜序列", "场景索引", "角色索引", "道具索引", "索引时长", "场景判断")
+    OUTPUT_NAMES = ("整体风格", "档案", "档案编码", "分镜序列", "角色道具场景", "角色索引", "道具索引", "场景索引", "索引时长", "场景判断")
 
     # 台词保护引号对（与文本批量替换节点一致）
     QUOTE_PAIRS = [
@@ -37,12 +35,37 @@ class YUAN_TXTJsonExtractor:
                     "default": 1,
                     "min": 1,
                     "step": 1,
-                    "tooltip": "对应分镜序列中的「编号」值，选择该编号的分镜。分镜序列端口输出该分镜的时间段内容；场景索引端口根据该分镜标题智能匹配场景档案；角色索引和道具索引端口在时间段内容中智能匹配角色和道具。"
+                    "tooltip": "对应分镜序列中的「编号」值，选择该编号的分镜。分镜序列端口整合输出 detailed_description(整体风格) + [Shot N]编号的时间段 + overall_soundscape(环境音) + non_diegetic_music(BGM)，标签与内容之间仅换行不空行；分镜「类型」含武戏时时间段不加 [Shot N] 编号、原行输出；角色道具场景端口先在时间段内容中智能匹配角色和道具档案，再根据该分镜标题智能匹配场景档案，按 角色→道具→场景 顺序输出对应档案的完整描述，整体以 retention_analysis: 开头换行输出，每条描述前加 <Picture N> 序号（从1连续编号）；角色索引/道具索引端口输出匹配到的角色/道具在对应档案中的0基序号（逗号分隔），场景索引端口输出匹配到的场景档案0基序号（未匹配为空），三者均受对应输出开关控制，关时输出空文本；索引时长端口锁定该分镜「类型」字段中的时长（如 武戏：12秒、文戏：8s，单位 s 或无单位均可）。"
+                }),
+                "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
+                    "default": "角色档案",
+                    "tooltip": "选择「档案」输出端口输出的档案类型：角色档案、音色档案、道具档案或场景档案。"
+                }),
+                "角色开关": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "输出",
+                    "label_off": "不输出",
+                    "display_name": "角色输出",
+                    "tooltip": "同时控制「角色道具场景」端口中的角色描述与「角色索引」端口：开=输出，关=不输出（索引输出空文本）。"
+                }),
+                "道具开关": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "输出",
+                    "label_off": "不输出",
+                    "display_name": "道具输出",
+                    "tooltip": "同时控制「角色道具场景」端口中的道具描述与「道具索引」端口：开=输出，关=不输出（索引输出空文本）。"
+                }),
+                "场景开关": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "输出",
+                    "label_off": "不输出",
+                    "display_name": "场景输出",
+                    "tooltip": "同时控制「角色道具场景」端口中的场景描述与「场景索引」端口：开=输出，关=不输出（索引输出空文本）。"
                 }),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "FLOAT", "BOOLEAN")
+    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING", "STRING", "STRING", "STRING", "FLOAT", "BOOLEAN")
     RETURN_NAMES = OUTPUT_NAMES
     FUNCTION = "extract_json"
     CATEGORY = "Yuan Tool/文本"
@@ -127,10 +150,7 @@ class YUAN_TXTJsonExtractor:
 
     @staticmethod
     def _find_appearing_indices(text, char_names, prop_names):
-        """在非保护区域查找出现的角色和道具，使用最长匹配优先避免冲突。
-        例如道具「林夏的手机」会先消费其位置，角色「林夏」不会在该位置误匹配。
-        返回 (角色索引列表, 道具索引列表)，均按首次出现位置排序。
-        """
+        """在非保护区域查找出现的角色和道具（最长匹配优先，避免子串误匹配），返回按首次出现位置排序的 (角色索引列表, 道具索引列表)。"""
         if not text:
             return [], []
 
@@ -184,17 +204,10 @@ class YUAN_TXTJsonExtractor:
 
     @staticmethod
     def _max_duration_seconds(text):
-        """从时间段文本中提取最大时长（秒）。
-        仅匹配每行开头的时段标记，支持以下格式：
-        - 0-7s / 0-7秒 / 0-7（s、秒、无单位）
-        - 5-12.5s / 5-12.5秒 / 5-12.5（支持小数）
-        时间段标记位于行首（允许前置空白），避免误匹配文本中的其他数字。
-        例如文本「0-7s，中近景...」会匹配，而「24寸行李箱」不会匹配。
-        """
+        """提取时间段文本中的最大结束时间（秒）：仅匹配行首的「开始-结束」时段标记（支持 s/秒/无单位、小数），避免误匹配其他数字。"""
         if not text:
             return 0.0
-        # 仅匹配行首位置（^ 或 \n 后），避免误判文本中间的数字
-        # 支持单位：s、秒、或无单位；数字可为小数
+        # 仅匹配行首的时段标记（支持 s/秒/无单位、小数）
         pattern = r'(?:^|\n)\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*(?:s|秒)?'
         matches = re.findall(pattern, text)
         if not matches:
@@ -204,10 +217,47 @@ class YUAN_TXTJsonExtractor:
         return max(end_times) if end_times else 0.0
 
     @staticmethod
-    def _extract_scene_prefix(title):
-        """从分镜标题中提取场景关键词（取「—」或「-」前部分）。
-        例如「韩家土屋卧房-深夜未眠」→「韩家土屋卧房」。
+    def _type_duration_seconds(type_str):
+        """从分镜「类型」字段提取锁定时长（秒）：取字符串中第一个数字；无数字或为空时返回 None。"""
+        if not type_str:
+            return None
+        m = re.search(r'(\d+(?:\.\d+)?)', str(type_str))
+        if not m:
+            return None
+        return float(m.group(1))
+
+    @staticmethod
+    def _build_detailed_description(整体风格, 时间段, 环境音, BGM, 类型=""):
+        """整合分镜序列：detailed_description(整体风格) → 时间段逐行编号[Shot N] → overall_soundscape(环境音) → non_diegetic_music(BGM)；标签与内容间仅换行不空行。
+
+        类型含「武戏」时时间段不加 [Shot N] 编号，原行输出。
         """
+        if isinstance(时间段, str):
+            shot_lines = 时间段.split("\n") if 时间段.strip() else []
+        elif isinstance(时间段, list):
+            shot_lines = 时间段
+        else:
+            shot_lines = []
+        is_action = "武戏" in str(类型 or "")
+        # 时间段逐行编号 [Shot N]（武戏不加编号），跳过空行，编号连续
+        numbered = []
+        for line in shot_lines:
+            s = str(line) if line is not None else ""
+            if s.strip():
+                if is_action:
+                    numbered.append(s)
+                else:
+                    numbered.append(f"[Shot {len(numbered) + 1}] {s}")
+        blocks = ["detailed_description:" + ("\n" + 整体风格 if 整体风格 else "")]
+        if numbered:
+            blocks.append("\n\n".join(numbered))
+        blocks.append("overall_soundscape:" + ("\n" + 环境音 if 环境音 else ""))
+        blocks.append("non_diegetic_music:" + ("\n" + BGM if BGM else ""))
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _extract_scene_prefix(title):
+        """从分镜标题提取场景关键词：取「—」或「-」前部分。"""
         if not title:
             return ""
         prefix = title
@@ -219,16 +269,12 @@ class YUAN_TXTJsonExtractor:
 
     @staticmethod
     def _match_scene_index(title, scenes):
-        """根据分镜标题智能匹配场景档案索引。
-        标题形如「江海大学方向街道-林夏安慰」，取「-」前部分作为场景关键词；
-        场景档案项形如「江海大学方向街道，九月...」，取「，」前部分作为场景名；
-        双向包含匹配，匹配不到返回 0。
-        """
+        """根据分镜标题智能匹配场景档案索引：标题取「-」前部分、档案取「，」前部分，双向包含匹配，匹配不到返回 -1。"""
         if not title or not isinstance(scenes, list) or not scenes:
-            return 0
+            return -1
         prefix = YUAN_TXTJsonExtractor._extract_scene_prefix(title)
         if not prefix:
-            return 0
+            return -1
         for idx, scene in enumerate(scenes):
             scene_str = str(scene) if scene is not None else ""
             scene_name = scene_str
@@ -241,9 +287,9 @@ class YUAN_TXTJsonExtractor:
                 continue
             if prefix in scene_name or scene_name in prefix:
                 return idx
-        return 0
+        return -1
 
-    def extract_json(self, json=None, 索引=1):
+    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 角色开关=True, 道具开关=True, 场景开关=True):
         # 形参名必须与输入端口名一致（ComfyUI 按关键字传参）
         data = json
 
@@ -259,53 +305,108 @@ class YUAN_TXTJsonExtractor:
 
         # 整体风格
         整体风格 = self._list_to_lines(data.get("整体风格", ""))
-        # 角色档案
+        # 各类档案数据（内部保留，角色/道具档案用于索引匹配）
         角色档案数据 = data.get("角色档案", [])
-        角色档案 = self._list_to_lines(角色档案数据)
-        # 道具档案
+        音色档案数据 = data.get("音色档案", [])
         道具档案数据 = data.get("道具档案", [])
-        道具档案 = self._list_to_lines(道具档案数据)
-        # 场景档案
         场景档案数据 = data.get("场景档案", [])
-        场景档案 = self._list_to_lines(场景档案数据)
 
-        # 分镜序列：按索引(编号)选取对应分镜，输出其时间段内容
+        # 档案：按「档案选择」输出对应档案内容
+        档案表 = {
+            "角色档案": 角色档案数据,
+            "音色档案": 音色档案数据,
+            "道具档案": 道具档案数据,
+            "场景档案": 场景档案数据,
+        }
+        档案 = self._list_to_lines(档案表.get(档案选择, 角色档案数据))
+
+        # 档案编码：按「档案选择」输出对应编码（角色档案=0、音色档案=1、道具档案=2、场景档案=3）
+        档案编码 = {
+            "角色档案": 0,
+            "音色档案": 1,
+            "道具档案": 2,
+            "场景档案": 3,
+        }.get(档案选择, 0)
+
+        # 分镜序列：按编号选取对应分镜
         分镜序列数据 = data.get("分镜序列", [])
         分镜序列文本 = ""
+        时间段 = []
+        分镜序列整合 = ""
+        环境音 = ""
+        BGM = ""
         matched_title = ""
+        matched_type = ""
         found_shot = False
         if isinstance(分镜序列数据, list):
             for item in 分镜序列数据:
                 if isinstance(item, dict) and item.get("编号") == 索引:
                     时间段 = item.get("时间段", [])
                     分镜序列文本 = self._list_to_lines(时间段)
+                    环境音 = self._list_to_lines(item.get("环境音", ""))
+                    BGM = self._list_to_lines(item.get("BGM", ""))
                     matched_title = str(item.get("标题", ""))
+                    matched_type = str(item.get("类型", ""))
                     found_shot = True
                     break
+        # 始终输出整合格式；索引未匹配到分镜时，时间段/环境音/BGM 留空，不报错
+        分镜序列整合 = self._build_detailed_description(整体风格, 时间段, 环境音, BGM, matched_type)
 
-        # 场景索引：未找到对应分镜输出空；否则智能匹配，匹配不到也输出空
+        # 角色道具场景：未找到分镜输出空；否则按 角色→道具→场景 顺序输出档案完整描述
+        # 角色/道具/场景索引：匹配到的档案 0 基序号（角色/道具逗号分隔，场景单个），未匹配为空
         if not found_shot:
-            场景索引 = ""
+            角色道具场景 = ""
             角色索引 = ""
             道具索引 = ""
+            场景索引 = ""
             索引时长 = 0.0
         else:
-            idx = self._match_scene_index(matched_title, 场景档案数据)
-            场景索引 = str(idx) if idx >= 0 else ""
-
-            # 角色索引、道具索引：在分镜时间段文本中智能匹配
+            # 角色、道具：在分镜时间段文本中智能匹配，输出对应档案的完整描述
             char_names = [self._extract_name(e) for e in (角色档案数据 if isinstance(角色档案数据, list) else [])]
             prop_names = [self._extract_name(e) for e in (道具档案数据 if isinstance(道具档案数据, list) else [])]
             char_indices, prop_indices = self._find_appearing_indices(分镜序列文本, char_names, prop_names)
-            角色索引 = ",".join(str(i) for i in char_indices)
-            道具索引 = ",".join(str(i) for i in prop_indices)
+            角色描述列表 = []
+            if isinstance(角色档案数据, list):
+                for i in char_indices:
+                    if 0 <= i < len(角色档案数据) and 角色档案数据[i] is not None:
+                        角色描述列表.append(str(角色档案数据[i]))
+            道具描述列表 = []
+            if isinstance(道具档案数据, list):
+                for i in prop_indices:
+                    if 0 <= i < len(道具档案数据) and 道具档案数据[i] is not None:
+                        道具描述列表.append(str(道具档案数据[i]))
 
-            # 索引时长：从分镜时间段文本中提取最大结束时间（秒）
-            索引时长 = self._max_duration_seconds(分镜序列文本)
+            # 场景：根据分镜标题智能匹配，输出对应档案的完整描述
+            idx = self._match_scene_index(matched_title, 场景档案数据)
+            场景描述 = ""
+            if idx >= 0 and isinstance(场景档案数据, list) and idx < len(场景档案数据) and 场景档案数据[idx] is not None:
+                场景描述 = str(场景档案数据[idx])
 
-        # 场景判断：当前索引与后一个索引（索引+1）对应分镜的场景是否相同
-        # 标题形如「韩家土屋卧房-深夜未眠」，取「-」前部分作为场景关键词比较
-        # 最后一个编号（找不到后一索引）默认输出 False；找不到当前索引也输出 False
+            # 角色/道具/场景索引：对应档案的 0 基序号，未匹配为空；由对应输出开关控制，关时输出空文本
+            角色索引 = ",".join(str(i) for i in char_indices) if 角色开关 else ""
+            道具索引 = ",".join(str(i) for i in prop_indices) if 道具开关 else ""
+            场景索引 = (str(idx) if idx >= 0 else "") if 场景开关 else ""
+
+            # 按开关过滤后输出：先角色再道具最后场景，整体以 retention_analysis: 开头、每条加 <Picture N> 序号
+            输出块 = []
+            if 角色开关:
+                输出块.extend(角色描述列表)
+            if 道具开关:
+                输出块.extend(道具描述列表)
+            if 场景开关 and 场景描述:
+                输出块.append(场景描述)
+            if 输出块:
+                编号行 = [f"<Picture {i + 1}>：{d}" for i, d in enumerate(输出块)]
+                角色道具场景 = "retention_analysis:\n" + "\n".join(编号行) + "\n"
+            else:
+                角色道具场景 = ""
+
+            # 索引时长：优先取「类型」字段中的时长；未含数字时回退为时间段文本中的最大结束时间
+            索引时长 = self._type_duration_seconds(matched_type)
+            if 索引时长 is None:
+                索引时长 = self._max_duration_seconds(分镜序列文本)
+
+        # 场景判断：当前分镜与后一个分镜（编号+1）的场景关键词是否相同（取「-」前部分比较）；找不到后一编号则输出 False
         场景判断 = False
         if found_shot and isinstance(分镜序列数据, list):
             next_title = ""
@@ -322,13 +423,11 @@ class YUAN_TXTJsonExtractor:
                     场景判断 = True
 
         return {
-            "result": [整体风格, 角色档案, 道具档案, 场景档案, 分镜序列文本, 场景索引, 角色索引, 道具索引, 索引时长, 场景判断]
+            "result": [整体风格, 档案, 档案编码, 分镜序列整合, 角色道具场景, 角色索引, 道具索引, 场景索引, 索引时长, 场景判断]
         }
 
 
-# ==============================================================================
-# 出场排序
-# ==============================================================================
+# ==== 出场排序 ====
 
 class YUAN_TXTAppearanceOrder:
 
@@ -388,9 +487,7 @@ class YUAN_TXTAppearanceOrder:
         return (result,)
 
 
-# ==============================================================================
-# 格式转换
-# ==============================================================================
+# ==== 格式转换 ====
 
 class YUAN_TXTConvertAny:
     @classmethod
@@ -429,9 +526,7 @@ class YUAN_TXTConvertAny:
         return (result,)
 
 
-# ==============================================================================
-# 列表编号
-# ==============================================================================
+# ==== 列表编号 ====
 
 class YUAN_TXTListNumber:
     @classmethod
@@ -479,10 +574,7 @@ class YUAN_TXTListNumber:
 
     def number_list(self, 文本, 起始编号, 编号前缀, 编号后缀, 输出模式, 合并间隔符):
         if not 文本 or not 文本.strip():
-            # OUTPUT_IS_LIST=True 的输出必须返回长度 ≥1 的列表，
-            # 否则 ComfyUI 在展开空列表给下游普通输入时会中断执行（或报错）。
-            # 空输入时统一返回 [""]：下游（如文本处理 any_x 端口）经 strip() 判空后会跳过该段，语义等价于"无文本"，
-            # 但链路不中断。
+            # OUTPUT_IS_LIST=True 必须返回长度 ≥1 的列表，否则空列表会中断下游执行；统一返回 [""] 保链路不断
             return ([""], 起始编号)
 
         lines = [line for line in 文本.split('\n') if line.strip()]
@@ -506,9 +598,7 @@ class YUAN_TXTListNumber:
         return (results, next_num)
 
 
-# ==============================================================================
-# 文本批量替换
-# ==============================================================================
+# ==== 文本批量替换 ====
 
 class YUAN_TXTReplace:
 
@@ -585,10 +675,7 @@ class YUAN_TXTReplace:
             ch = text[i]
             # 尝试作为 opening：只匹配一种（取列表第一个，即秩最高的映射；QUOTE_PAIRS 已按用户期望序唯一定义，每个 opening 唯一）
             if ch in opening_map:
-                # 半角引号 ASCII " / ' 既可开也可关，采用「智能判断」：
-                #   - 当前存在同 rank 的未闭合栈顶 → 作为 closing（优先关闭未闭合）
-                #   - 否则，作为 opening
-                # 注意：栈三元组是 (rank, closing_char, start_idx)
+                # 半角引号 " / ' 既可开也可关：存在同 rank 未闭合栈顶则作 closing（优先关闭），否则作 opening
                 if ch in ('"', "'"):
                     expected_rank = 1 if ch == '"' else 2
                     if stack and stack[-1][0] == expected_rank:
@@ -674,7 +761,6 @@ class YUAN_TXTReplace:
                 pairs.append((find_str, replace_str))
 
         # 按查找文本长度降序排序（最长匹配优先，避免短名误替换长名中的子串）
-        # 例如「林夏的手机」先替换，「林夏」不会在其位置被误匹配
         pairs.sort(key=lambda x: -len(x[0]))
 
         result = text
@@ -688,9 +774,145 @@ class YUAN_TXTReplace:
         return (result,)
 
 
-# ==============================================================================
-# 文本处理（分段）
-# ==============================================================================
+# ==== 分镜角色替换 ====
+
+class YUAN_TXTShotReplace:
+
+    # <d>...</d> 台词标签（与引号保护叠加）
+    DIALOGUE_TAG_RE = re.compile(r'<d>.*?</d>', re.DOTALL)
+
+    # 台词归属边界标点：名称前必须是句首或句末标点/空白之后（逗号不算，避免「甲对乙说」中的乙误归属）
+    BELONG_BOUNDARY = '。！？!?\n；;'
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "角色道具场景": ("STRING", {
+                    "forceInput": True,
+                    "multiline": True,
+                    "tooltip": "接入 JSON提取节点的「角色道具场景」输出。每行 <Picture N>：名称，描述… 取第一个逗号前的名称作为查找对象，在分镜序列中替换为对应的 <Picture N> 标记。"
+                }),
+                "分镜序列": ("STRING", {
+                    "forceInput": True,
+                    "multiline": True,
+                    "tooltip": "接入 JSON提取节点的「分镜序列」输出。文本中出现的角色/道具/场景名称将被替换为对应的 <Picture N> 标记（最长匹配优先），其余内容原样保留。\n"
+                               "【台词归属特殊规则】名称后紧跟引导句+冒号+<d>台词时（如「沈惊鸿低声说：<d>…</d>」），名称替换为台词归属代号 (SN)（如「(S1)低声说：<d>…</d>」）而非 <Picture N>。"
+                }),
+                "台词开关": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "保护台词",
+                    "label_off": "正常替换",
+                    "display_name": "台词保护",
+                    "tooltip": "【台词保护】\n开启后，被以下格式包裹的「人物说话内容」中的名称不替换、原文保留：\n"
+                               "● 半角双引号 / 单引号：\"...\"  '...'\n"
+                               "● 中文弯引号：“...”  ‘...’\n"
+                               "● 中文直角引号：「...」 『...』\n"
+                               "● 台词标签：<d>...</d>\n"
+                               "关闭时，整段文本正常执行名称替换。",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("分镜序列",)
+    FUNCTION = "replace_shot_names"
+    CATEGORY = "Yuan Tool/文本"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _parse_picture_names(text):
+        """从「角色道具场景」解析 <Picture N>：名称，描述… 定义，返回 [(名称, "<Picture N>"), ...]。
+
+        名称取第一个逗号（全角/半角）前的部分；无逗号时取整行描述。
+        """
+        pairs = []
+        if not text:
+            return pairs
+        for line in text.split("\n"):
+            m = re.match(r'^\s*<Picture\s+(\d+)>\s*[：:]\s*(.+?)\s*$', line)
+            if not m:
+                continue
+            desc = m.group(2)
+            name = ""
+            for sep in ("，", ","):
+                if sep in desc:
+                    name = desc.split(sep)[0].strip()
+                    break
+            if not name:
+                name = desc.strip()
+            if name:
+                pairs.append((name, f"<Picture {m.group(1)}>"))
+        return pairs
+
+    @staticmethod
+    def _build_protect_mask(text):
+        """台词保护掩码：引号对内部（复用文本批量替换）+ <d>...</d> 标签内部（含标签自身）。"""
+        mask = YUAN_TXTReplace._build_protect_mask(text)
+        for m in YUAN_TXTShotReplace.DIALOGUE_TAG_RE.finditer(text):
+            for k in range(m.start(), m.end()):
+                mask[k] = True
+        return mask
+
+    @staticmethod
+    def _picture_tag_to_sn(tag):
+        """<Picture N> → (SN)；非标准标记返回 None。"""
+        m = re.match(r'^<Picture (\d+)>$', tag)
+        return f"(S{m.group(1)})" if m else None
+
+    @staticmethod
+    def _belong_replace(text, name, sn, mask):
+        """台词归属替换：`名称+引导句+冒号+<d>台词` → `(SN)+引导句+冒号+<d>台词`。
+
+        - 名称前必须是句首或句末标点/空白边界（BELONG_BOUNDARY），避免「甲对乙说」中的乙被误归属
+        - 引导句不含任何标点（如「低声说」「沉声道」「对柳如烟说」），含逗号/顿号等则跳过特殊规则走普通替换
+        - mask 非空时（台词保护开启），名称处于被保护位置则保留原文
+        """
+        boundary = YUAN_TXTShotReplace.BELONG_BOUNDARY
+        pattern = re.compile(
+            r'(?<![^\s' + boundary + r'])'      # 名称前边界：句首/句末标点/空白
+            r'(' + re.escape(name) + r')'        # 组1：名称
+            r'[^' + boundary + r'，,、：:]*?'    # 引导句（不含任何标点，非贪婪）
+            r'[：:]\s*'                          # 冒号+可选空白
+            r'(?=<d>)'                           # 紧跟台词标签
+        )
+
+        def repl(m):
+            if mask is not None:
+                for k in range(m.start(1), m.end(1)):
+                    if mask[k]:
+                        return m.group(0)
+            return sn + m.group(0)[len(name):]
+
+        return pattern.sub(repl, text)
+
+    def replace_shot_names(self, 角色道具场景, 分镜序列, 台词开关):
+        pairs = self._parse_picture_names(角色道具场景 or "")
+
+        # 按名称长度降序排序（最长匹配优先，避免短名误替换长名中的子串）
+        pairs.sort(key=lambda x: -len(x[0]))
+
+        result = 分镜序列 or ""
+
+        # 特殊规则：台词归属替换 名称+引导句+：<d> → (SN)+引导句+：<d>
+        for name, tag in pairs:
+            sn = self._picture_tag_to_sn(tag)
+            if sn:
+                mask = self._build_protect_mask(result) if 台词开关 else None
+                result = self._belong_replace(result, name, sn, mask)
+
+        # 普通替换：名称 → <Picture N>
+        for name, tag in pairs:
+            if 台词开关:
+                result = YUAN_TXTReplace._replace_with_protect(
+                    result, name, tag, YUAN_TXTShotReplace._build_protect_mask(result))
+            else:
+                result = result.replace(name, tag)
+
+        return (result,)
+
+
+# ==== 文本处理（分段） ====
 
 class YUAN_TXTParagraphSplitter:
     @classmethod
@@ -769,14 +991,7 @@ class YUAN_TXTParagraphSplitter:
         return False
 
     def _convert_to_str(self, val):
-        """把任意 ComfyUI 输入统一转成纯字符串。
-        - None → ""（视为无内容）
-        - str/int/float/bool → str(val)
-        - bytes → utf-8 解码（失败则 latin-1 兜底）
-        - list/tuple/set/frozenset → 逐元素 str() 后用换行拼接（空容器 → ""）
-        - dict → str(dict)
-        - 其他（含 torch.Tensor、numpy.ndarray 等）→ 尝试 str()，异常返回 ""
-        """
+        """把任意 ComfyUI 输入统一转成纯字符串：None→""、容器逐元素换行拼接、bytes 先 utf-8 再 latin-1 解码、其余直接 str()（异常返回 ""）。"""
         if val is None:
             return ""
         if isinstance(val, bool):
@@ -835,9 +1050,16 @@ class YUAN_TXTParagraphSplitter:
 
         if 分段方式 == "端口":
             if collected_texts:
+                # 端口模式下每个 any_x 端口对应一个段落位置：即使端口为空也保留占位，
+                # 保证选取段落索引与端口序号一一对应（如 any2 未接入时索引1应输出空文本）
                 paras = []
-                for t in collected_texts:
-                    paras.append(t.strip() if 段落优化 else t)
+                for i in range(1, input_count + 1):
+                    val = kwargs.get(f"any_{i}", None)
+                    if val is None:
+                        paras.append("")
+                    else:
+                        s = self._convert_to_str(val)
+                        paras.append(s.strip() if 段落优化 else s)
             else:
                 paras = [text.strip() if 段落优化 else text] if text else []
         elif 分段方式 == "空行":
@@ -944,9 +1166,11 @@ class YUAN_TXTParagraphSplitter:
                     paras.append(pl)
 
         sel = 选取段落.strip() if 选取段落 is not None else ""
+        selected_indices = []  # 被选取段落的原始索引（段落x端口按原始索引一一对应）
         if sel == "-1":
             # -1：输出所有段落（默认行为）
             to = paras.copy()
+            selected_indices = list(range(len(paras)))
         elif sel == "":
             # 留空：总段输出为空（不选取任何段落）
             to = []
@@ -959,6 +1183,7 @@ class YUAN_TXTParagraphSplitter:
                     idx = int(i.strip())
                     if 0 <= idx < len(paras):
                         to.append(paras[idx])
+                        selected_indices.append(idx)
                 except:
                     continue
 
@@ -968,14 +1193,21 @@ class YUAN_TXTParagraphSplitter:
         cnt = len(to)
 
         max_out = self.MAX_OUTPUTS
-        po = [to[i] if i < 输出段落 and i < len(to) else "" for i in range(max_out)]
+        po = [""] * max_out
+        if 输出模式:
+            # 分段列表模式：段落x端口按原始段落索引一一对应（选取段落=0→段落1、=1→段落2...，支持索引多端口）
+            for idx in selected_indices:
+                if idx < 输出段落:
+                    po[idx] = paras[idx]
+        else:
+            # 原始文本模式：保持原行为，总段文本落到段落1端口
+            for i in range(min(max_out, len(to), 输出段落)):
+                po[i] = to[i]
 
         return (cnt, to,) + tuple(po)
 
 
-# ==============================================================================
-# 长度
-# ==============================================================================
+# ==== 长度 ====
 
 class YUAN_TXTLength:
 
@@ -1047,11 +1279,7 @@ class YUAN_TXTLength:
             return (len(plain.splitlines()),)
 
         if 长度模式 == "空行":
-            # 按空行（段落之间的空白行）分割：
-            #   - 先 strip 去掉首尾空行/空白
-            #   - 按 \n\s*\n（两个换行中间可有任意空白）分割
-            #   - 过滤空片段
-            #   - 统计片段数
+            # 去掉首尾空白后，按空行（空白行）切分文本，统计非空片段数
             stripped = plain.strip()
             if stripped == "":
                 return (0,)
@@ -1079,6 +1307,7 @@ NODE_CLASS_MAPPINGS = {
     "YUAN_TXTConvertAny": YUAN_TXTConvertAny,
     "YUAN_TXTListNumber": YUAN_TXTListNumber,
     "YUAN_TXTReplace": YUAN_TXTReplace,
+    "YUAN_TXTShotReplace": YUAN_TXTShotReplace,
     "YUAN_TXTParagraphSplitter": YUAN_TXTParagraphSplitter,
     "YUAN_TXTLength": YUAN_TXTLength,
 }
@@ -1089,6 +1318,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "YUAN_TXTConvertAny": "格式转换",
     "YUAN_TXTListNumber": "列表编号",
     "YUAN_TXTReplace": "文本批量替换",
+    "YUAN_TXTShotReplace": "分镜角色替换",
     "YUAN_TXTParagraphSplitter": "文本处理",
     "YUAN_TXTLength": "长度",
 }

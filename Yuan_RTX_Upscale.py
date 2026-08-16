@@ -1,25 +1,6 @@
 """Yuan Tool · RTX 视频放大 (H3) 节点
 
-复刻自 "C:\\My Xiangmu\\Yuan Tool" 的 RTX 视频超分辨率 (AV) 合并节点，
-合并 RTX 视频超分辨率 + AV Decode Split + PT H3 Concat AV Latent 三者为一体。
-
-支持两种输入模式（二选一，互斥）：
-  - images 模式：直接对图像进行 RTX 超分辨率
-  - av_latent 模式：先用 video_vae 解码 H3 联合 AV latent 为图像帧 + 分离后的
-    audio_latent，再对图像帧进行 RTX 超分辨率
-
-统一流程（无论哪种模式）：
-  1. 得到图像帧（来自输入或解码）
-  2. RTX 超分辨率 → upscaled_images
-  3. 用 video_vae 对 upscaled_images 重新编码 → new_video_latent
-  4. 合并 new_video_latent + audio_latent → av_latent 输出
-     （images 模式下 audio_latent 为 None，av_latent 输出也为 None）
-
-内置缓存机制：当输入指纹（张量 shape/dtype/device/version/data_ptr + 参数）未变时，
-直接返回上次的两个输出，跳过耗时的 RTX 超分辨率与 VAE 编解码。
-
-节点分类: "Yuan Tool/放大"
-依赖: nvidia-vfx（pip install nvidia-vfx，需 NVIDIA RTX 显卡）
+合并 RTX 视频超分辨率 + AV Decode Split + PT H3 Concat AV Latent 为一体，支持 images 直连与 av_latent（解码→放大→重编码→合并音频）两种互斥输入模式；内置输入指纹缓存，输入未变时直接返回上次结果。依赖 nvidia-vfx（需 NVIDIA RTX 显卡）。
 """
 
 import torch
@@ -40,12 +21,7 @@ MAX_PIXELS = 1024 * 1024 * 16
 
 
 def _nested_av_parts(av_latent):
-    """将 MiniMax H3 联合 AV latent 拆分为视频与音频两个张量。
-
-    H3 的 AV latent 是一个 NestedTensor，包含两个槽位：
-      - video: 5 维张量 [1, 24, T, H/16, W/16]
-      - audio: 4 维张量 [1, 32, 2, audio_t]
-    """
+    """将 MiniMax H3 联合 AV latent（NestedTensor）拆分为 video（5 维）与 audio（4 维）两个张量。"""
     if not isinstance(av_latent, dict) or "samples" not in av_latent:
         raise ValueError("Expected a MiniMax H3 joint AV LATENT")
     samples = av_latent["samples"]
@@ -66,19 +42,11 @@ def _nested_av_parts(av_latent):
 
 
 def _decode_av_latent(av_latent, video_vae):
-    """解码 latent（仅视频 VAE），兼容两种输入。
-
-    支持的输入形式：
-      1. H3 联合 AV latent：samples 为 NestedTensor，含 video + audio 两部分
-         → 解码 video 部分为图像帧，并返回分离后的 video_latent / audio_latent
-      2. 纯视频 latent：samples 为普通 torch.Tensor
-         → 直接解码为图像帧，audio_latent 返回 None
-    """
+    """用视频 VAE 解码 latent 为图像帧，兼容两种输入：H3 联合 AV latent（NestedTensor）返回分离的 video_latent/audio_latent；纯视频 latent 直接解码，audio_latent 为 None。"""
     samples = av_latent["samples"]
 
-    # 判断是否为 H3 联合 AV latent（NestedTensor）
+    # H3 联合 AV latent：拆分出 video + audio 分别解码
     if getattr(samples, "is_nested", False):
-        # 联合 AV latent：拆分出 video + audio
         video, audio = _nested_av_parts(av_latent)
         images = video_vae.decode(video)
         if images.ndim == 5:
@@ -102,10 +70,7 @@ def _decode_av_latent(av_latent, video_vae):
 
 
 class YuanRTXVideoUpscaleH3:
-    """RTX 视频放大 (H3) 节点
-
-    合并 RTX 视频超分辨率 + AV Decode Split + PT H3 Concat AV Latent 三者为一体。
-    """
+    """RTX 视频放大 (H3) 节点：合并 RTX 视频超分辨率 + AV Decode Split + PT H3 Concat AV Latent 三者为一体。"""
 
     # 类级缓存：{cache_key: (upscaled, av_latent_output)}
     _cache = {}
@@ -199,7 +164,6 @@ class YuanRTXVideoUpscaleH3:
         if not has_images and not has_av:
             raise ValueError("必须连接 images 或 av_latent 中的一个")
 
-        # 组装 resize 参数
         resize_params = {
             "resize_type": resize_type,
             "scale": scale,
@@ -218,7 +182,7 @@ class YuanRTXVideoUpscaleH3:
         if has_av:
             if video_vae is None:
                 raise ValueError("使用 av_latent 输入时必须连接 video_vae")
-            images, _video_latent, audio_latent = _decode_av_latent(av_latent, video_vae)
+            images, _, audio_latent = _decode_av_latent(av_latent, video_vae)
 
         # 统一走 RTX 超分辨率
         upscaled = self._run_super_resolution(images, resize_params, quality)
@@ -255,11 +219,7 @@ class YuanRTXVideoUpscaleH3:
 
     @staticmethod
     def _tensor_fingerprint(t):
-        """张量指纹：shape + dtype + device + version + data_ptr。
-
-        version 检测原地修改，data_ptr 检测内存地址变化。
-        推理张量不跟踪 version，此时用 None 占位（仍可由 data_ptr 检测变化）。
-        """
+        """张量指纹：shape + dtype + device + version + data_ptr；version 检测原地修改，data_ptr 检测内存地址变化（推理张量无 version 时以 None 占位）。"""
         try:
             version = t._version
         except RuntimeError:
@@ -275,7 +235,6 @@ class YuanRTXVideoUpscaleH3:
     @classmethod
     def _build_cache_key(cls, images, av_latent, video_vae, resize_params, quality):
         """根据所有输入构建可哈希的缓存 key。"""
-        # images 指纹
         images_fp = cls._tensor_fingerprint(images) if images is not None else None
 
         # av_latent 指纹（区分 NestedTensor 与普通 Tensor）
@@ -312,7 +271,7 @@ class YuanRTXVideoUpscaleH3:
 
     @staticmethod
     def _run_super_resolution(images, resize_params, quality):
-        b, h, w, c = images.shape
+        _, h, w, c = images.shape
 
         selected_type = resize_params["resize_type"]
         if selected_type == UPSCALE_BY:

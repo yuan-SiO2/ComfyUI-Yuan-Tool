@@ -1,11 +1,6 @@
-"""Yuan 引导注入节点 —— 将图像/视频帧作为引导关键帧注入视频 latent
+"""Yuan 引导注入节点：将图像/视频帧作为引导关键帧注入视频 latent。
 
-复刻自 ComfyUI-Yuan-Director 的 LTXVAddGuide 节点（comfy_extras/nodes_lt.py 的 LTXVAddGuide 扩展）。
-将引导图像/视频帧编码为 latent 后拼接到视频 latent 的时间维末尾，
-并通过 keyframe_idxs / guide_attention_entries 元数据告知模型对应关系。
-
-接收来自 Yuan CLIP 时间轴节点的 guide_data 和 motion_guide_data，
-支持图像引导、视频分段引导（IC-LoRA），以及 Ref Guidance 参考特征引导。
+复刻自 ComfyUI-Yuan-Director 的 LTXVAddGuide，支持图像引导、视频分段引导（IC-LoRA）与 Ref Guidance 参考特征引导。
 """
 
 import os
@@ -34,16 +29,13 @@ ICLoRAParameters = "IC_LORA_PARAMETERS"
 
 
 # ==============================================================================
-# K/V 视觉特征注入：把 motionSegments 参考帧的视觉特征注入到 @图X token 的 K/V
-# 注入点：transformer_blocks.{idx}.attn2.forward
-# 公式：k[marker] = k[marker]*(1-alpha) + ref_k*alpha
-# 段外帧对 @图X token 的注意力抑制由 Timeline 生成的 token 级 mask（promptrelay_mask_fn）负责
+# K/V 视觉特征注入：把参考帧视觉特征注入 @图X token 的 K/V
+# 注入点：transformer_blocks.{idx}.attn2.forward；公式：k[marker] = k[marker]*(1-alpha) + ref_k*alpha
+# 段外帧的注意力抑制由 Timeline 生成的 token 级 mask（promptrelay_mask_fn）负责
 # ==============================================================================
 
 def _positive_batch_mask(transformer_options, batch_size, device):
-    """从 transformer_options 获取正向条件 batch mask。
-    返回 (B,) bool tensor，True 表示正向条件行。
-    """
+    """从 transformer_options 获取正向条件 batch mask，返回 (B,) bool tensor（True=正向行）。"""
     cond_or_uncond = transformer_options.get("cond_or_uncond")
     if not cond_or_uncond or batch_size <= 0:
         return None
@@ -62,32 +54,21 @@ def _positive_batch_mask(transformer_options, batch_size, device):
 
 def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
                                          transformer_options={}, **kwargs):
-    """替换 attn2 forward：K/V 视觉特征注入。
-
-    对每个主体 @图X：
-    1. 使用预计算的参考帧视觉特征 ref_summary（参考图经 VAE + patchify 独立编码）
-    2. 投影为 ref_k/ref_v
-    3. 注入到 @图X token 位置的 K/V（仅正向批次）
-    段外帧对 @图X token 的注意力抑制由 token 级 mask（promptrelay_mask_fn）负责。
-    """
+    """替换 attn2 forward：把预计算的参考帧视觉特征 ref_summary 投影为 ref_k/ref_v，注入到 @图X token 的 K/V（仅正向批次）。"""
     if mask is None:
         mask_provider = transformer_options.get("promptrelay_mask_fn")
         if mask_provider is not None:
             mask = mask_provider(x.shape[1], context.shape[1], x.dtype, x.device, transformer_options)
 
-    # 获取注入参数
     marker_token_indices = getattr(self, "marker_token_indices", {})
     ref_alpha = getattr(self, "ref_alpha", 0.0)
     subject_ref_features = getattr(self, "subject_ref_features", None)
 
-    # 计算 K/V
     q = self.q_norm(self.to_q(x))
     k = self.k_norm(self.to_k(context))
     v = self.to_v(context)
 
-    # K/V 注入：仅对拥有独立参考特征的主体注入
-    # 无特征的主体直接跳过，绝不从 x（去噪中的视频 token）取值注入，
-    # 否则会把去噪噪声/自生成内容当作参考特征，导致主体特征错乱（两个人物）
+    # K/V 注入：仅对拥有独立参考特征的主体注入，绝不可从 x（去噪中的视频 token）取值，否则会把去噪噪声当作参考特征导致主体特征错乱
     if marker_token_indices and ref_alpha > 0.0 and subject_ref_features:
         # 正向批次 mask：只对正向条件做 K/V 注入，负向条件保持原样
         positive_mask = _positive_batch_mask(transformer_options, x.shape[0], x.device)
@@ -101,9 +82,7 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
         # token 越界保护：marker token 索引可能超过 context 长度（CLIP 截断）
         max_context_index = context.shape[1] - 1
 
-        # K/V 注入强度：段内全强度注入，段外抑制由 token 级 mask 负责
-        # ref_tau 控制 mask 的段外高斯衰减速度（在 build_segments 中使用）
-        # 这里保持全强度注入，让 mask 机制控制段外帧对 @图X token 的 attention 权重
+        # 段内全强度注入；段外帧对 @图X token 的注意力抑制由 token 级 mask 负责
         effective_alpha = ref_alpha
 
         for subject_num, token_indices in marker_token_indices.items():
@@ -114,16 +93,13 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
             if not usable:
                 continue
 
-            # 独立视觉编码：用预计算的 ref_summary，不从 x 取
-            # 彻底解耦物理坐标系错位问题
+            # 用预计算的 ref_summary 独立编码，解耦物理坐标系错位问题
             ref_summary = subject_ref_features[subject_num].to(device=x.device, dtype=x.dtype)
             # 扩展到正向批次数
             num_pos = len(positive_rows) if positive_rows is not None else x.shape[0]
             ref_summary = ref_summary.expand(num_pos, -1)  # [num_pos, inner_dim]
 
-            # 投影为 ref_k/ref_v
-            # ref_k 必须经过 k_norm（RMSNorm），与原始 K 的处理保持一致
-            # 否则 ref_k 的尺度与 k 不匹配，导致 attention 权重异常
+            # ref_k 必须经 k_norm（RMSNorm）与原始 K 尺度对齐，否则 attention 权重异常
             ref_k = self.k_norm(self.to_k(ref_summary[:, None, :])).to(dtype=k.dtype, device=k.device)  # (B', 1, C)
             ref_v = self.to_v(ref_summary[:, None, :]).to(dtype=v.dtype, device=v.device)  # (B', 1, C)
 
@@ -132,7 +108,6 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
             ref_k_expanded = ref_k.expand(-1, len(usable), -1)  # (B', num_markers, C)
             ref_v_expanded = ref_v.expand(-1, len(usable), -1)  # (B', num_markers, C)
             if positive_rows is not None:
-                # 仅对正向行注入
                 k[positive_rows[:, None], marker_tensor[None, :], :] = (
                     k[positive_rows[:, None], marker_tensor[None, :], :] * (1.0 - effective_alpha)
                     + ref_k_expanded * effective_alpha
@@ -307,11 +282,7 @@ def _resolve_input_video_path(video_file):
 
 
 def _load_motion_video_frames(video_file, trim_start_frames, length_frames, director_fps, resample_mode="nearest", frame_files=None):
-    """加载视频文件的指定帧区间，支持静态图像（重复帧）和视频两种模式。
-    
-    当 frame_files 提供时（多图像拼接模式），按顺序加载每张图像，
-    均分帧数后拼接为完整帧序列，模拟真实视频的多帧效果。
-    """
+    """加载视频文件的指定帧区间；frame_files 提供时为多图像拼接模式（均分帧数后拼接）。"""
     # 多图像拼接模式：frame_files 非空且有多张图时，按序加载拼接
     if frame_files and isinstance(frame_files, list) and len(frame_files) > 1:
         n_imgs = len(frame_files)
@@ -401,11 +372,7 @@ def _load_motion_video_frames(video_file, trim_start_frames, length_frames, dire
 # --- 主节点类 ---
 
 class YuanClipGuide:
-    """Yuan 引导注入 —— 将图像/视频帧作为引导关键帧注入视频 latent。
-
-    接收 Yuan CLIP 时间轴节点的 guide_data（图像引导）和 motion_guide_data（IC-LoRA 视频分段），
-    将引导帧经 VAE 编码后拼接到 latent 时间维末尾，并通过 keyframe_idxs 告知模型对应位置。
-    """
+    """Yuan 引导注入：将图像/视频引导帧经 VAE 编码后拼接到视频 latent 末尾，并用 keyframe_idxs 告知模型对应位置。"""
 
     PATCHIFIER = SymmetricPatchifier(1, start_end=True)
 
@@ -473,13 +440,7 @@ class YuanClipGuide:
 
     @classmethod
     def _is_msr_model(cls, model):
-        """自动检测模型是否加载了 MSR 类 LoRA。
-
-        MSR 检查点（如 LTX-2.5-Licon-MSR-V1）的 safetensors 元数据声明
-        reference_slot_embedding_enabled / reference_slot_embedding_dim，且参考图按
-        pic1_based_negative_time 约定放置于负时间偏移位置。普通 LoRA（如
-        LTX-2.3-Licon-MSR-V2，元数据为空）不会触发。
-        """
+        """检测模型是否加载了 MSR 类 LoRA：元数据声明 reference_slot_embedding_enabled/dim 且时间偏移为负时触发，元数据为空的普通 LoRA（如 MSR-V2）不触发。"""
         if model is None:
             return False
         try:
@@ -510,12 +471,7 @@ class YuanClipGuide:
 
     @classmethod
     def _load_msr_slot_state(cls, lora_path):
-        """从 MSR LoRA 文件加载学习到的 reference_slot_embedding 权重。
-
-        原生 MSR 在推理时会把该 Fourier-MLP 槽位嵌入加到参考图 latent 通道上，
-        模型靠它识别"这是第几个槽位的参考图"并提取人物身份。V2 等元数据为空的
-        普通 LoRA 返回 None（不注入）。
-        """
+        """从 MSR LoRA 文件加载学习到的 reference_slot_embedding 槽位嵌入权重（带缓存）；元数据为空的普通 LoRA 返回 None。"""
         try:
             import safetensors
         except ImportError:
@@ -574,13 +530,7 @@ class YuanClipGuide:
 
     @classmethod
     def _resolve_msr_slot_state(cls, model, msr_lora):
-        """按 MSR_LORA 选项解析槽位嵌入权重来源。
-
-        - "MSR2.5"：使用 LTX-2.5-Licon-MSR-V1（含槽位嵌入，强制 MSR 模式）
-        - "MSR2.3"：LTX-2.3-Licon-MSR-V2 无槽位嵌入，返回 None
-        - "auto"：在 loras 目录中查找第一个元数据声明 MSR 的 LoRA
-          （V2 元数据为空会被跳过）。找到返回 slot_state，否则返回 None。
-        """
+        """按 MSR_LORA 选项解析槽位嵌入权重来源：MSR2.5 用 LTX-2.5-Licon-MSR-V1；MSR2.3 返回 None；auto 在 loras 目录中查找第一个元数据声明 MSR 的 LoRA。"""
         if model is None:
             return None
         keyword = None
@@ -753,28 +703,21 @@ class YuanClipGuide:
         segments = motion_segments
         time_scale_factor = scale_factors[0]
 
-        # MSR_LORA 选项决定 MSR 适配模式：
-        # - MSR2.5：强制启用（负偏移 + 槽位嵌入）
-        # - MSR2.3：强制关闭（正帧普通逻辑，V2 无嵌入）
-        # - auto：按 LoRA 元数据自动检测（V1 触发、V2/普通不触发）
+        # MSR_LORA：MSR2.5 强制启用（负偏移+槽位嵌入），MSR2.3 强制关闭，auto 按 LoRA 元数据自动检测
         if msr_lora == "MSR2.5":
             msr_mode = True
         elif msr_lora == "MSR2.3":
             msr_mode = False
         else:
             msr_mode = cls._is_msr_model(model)
-        # MSR 模式下加载参考图槽位嵌入权重（原生 MSR 的 Fourier-MLP embedding，
-        # 加到参考图 latent 通道上恢复人物身份绑定；V2 或普通 LoRA 不注入）
+        # MSR 模式加载槽位嵌入权重（加到参考图 latent 通道上恢复人物身份绑定）
         msr_slot_state = cls._resolve_msr_slot_state(model, msr_lora) if msr_mode else None
 
         # -----------------------------------------------------------------------
         # 标准 Timeline 引导模式：将图像分段和视频分段作为关键帧注入 latent
         # -----------------------------------------------------------------------
         if len(images) > 0 or len(segments) > 0:
-            # A. 处理图像引导（主轨分段引导图）
-            # 主轨图始终按标准路径以 insert_frames 正帧位置注入引导，不参与
-            # MSR 参考槽位分配——MSR 槽位仅由 IC-LoRA 轨的 @图X 静态参考图
-            # （B 分支）独占，避免主轨图挤占 @图 的 slot 编号与槽位嵌入。
+            # A. 处理图像引导：主轨图按 insert_frames 正帧注入，不参与 MSR 参考槽位分配（槽位仅由 IC-LoRA 轨的 @图X 静态参考图独占）
             for idx, img_tensor in enumerate(images):
                 f_idx = insert_frames[idx] if idx < len(insert_frames) else 0
                 img_strength = float(strengths[idx] if idx < len(strengths) else 1.0)
@@ -806,9 +749,7 @@ class YuanClipGuide:
 
                 guide_orig_shape = list(guide_latent.shape[2:])
 
-                # IC-LoRA 空间扩张：与视频分段（B分支）保持一致，保证原生 LTXVCropGuides
-                # 按 keyframe_idxs token 计数裁剪的帧数等于实际追加的 latent 帧数，
-                # 避免裁剪不足导致尾部残留参考帧（流露出人物参考图）
+                # IC-LoRA 空间扩张：保证 LTXVCropGuides 按 keyframe_idxs 裁剪的帧数等于实际追加的 latent 帧数，避免尾部残留参考帧
                 guide_mask = None
                 if latent_downscale_factor > 1:
                     B_g, _, F_g, H_g, W_g = guide_latent.shape
@@ -831,10 +772,7 @@ class YuanClipGuide:
                 )
 
             # B. 处理视频分段
-            # MSR 模式（检测到 pic1_based_negative_time 类 LoRA）：静态参考图段不合并，
-            # 每个槽位独立按负时间偏移追加，对齐原生 MSR 语义。
-            # 非 MSR 模式保持"前端显示分段、后端执行合成"语义：自动合并相邻的静态
-            # 图像段为合成视频序列，合并条件为 isStaticImage=True 且前一段 end == 当前段 start
+            # MSR 模式：静态参考图段不合并，各槽位独立按负时间偏移追加；非 MSR 模式：自动合并相邻静态图像段（isStaticImage 且前段 end == 当前段 start）为合成视频序列
             merged_segments = []
             i_seg = 0
             while i_seg < len(segments):
@@ -854,8 +792,7 @@ class YuanClipGuide:
                             continue
                         break
                     if len(batch) > 1:
-                        # 合并为一个视频段：frameFiles 收集所有图，length 为总和
-                        # description 合并所有段的描述（每段一行，对应 @图X=描述）
+                        # 合并为一段：frameFiles 收集所有图，length 为总和，description 逐行合并（对应 @图X=描述）
                         merged_desc = "\n".join(
                             b.get("description", "") for b in batch if b.get("description")
                         )
@@ -877,10 +814,7 @@ class YuanClipGuide:
                     merged_segments.append(seg)
                     i_seg += 1
 
-            # MSR 模式：静态参考图段的槽位按 @图X 编号（subjectNum）绑定，
-            # slot = subjectNum（@图3 即 slot 3，书写/排列顺序不影响绑定），
-            # num_slots = 参考图槽位最大值。标准流程（@图1..@图N 连续无缺号）
-            # 下与"按排列顺序"的结果完全一致；删除中间段后仍保持编号对齐。
+            # MSR 模式：静态参考图段按 @图X 编号（subjectNum）绑定槽位，num_slots 取槽位最大值
             _msr_slot_b = 0
             _msr_total_b = 0
             if msr_mode:
@@ -893,9 +827,7 @@ class YuanClipGuide:
                 _valid_nums = [n for n in _slot_nums if n > 0]
                 _msr_total_b = max(_valid_nums) if _valid_nums else len(_slot_nums)
 
-            # 补帧对齐：合并段总帧数须满足 VAE 的 (N-1)%time_scale_factor==0，
-            # 否则第766行截断会丢帧。多出的1帧由 _load_motion_video_frames
-            # 最大余数法自动分配给第一张图。
+            # 补帧对齐：合并段总帧数须满足 (N-1)%time_scale_factor==0，否则截断会丢帧
             for seg in merged_segments:
                 if seg.get("isStaticImage"):
                     total_len = seg.get("length", 0)
@@ -926,10 +858,8 @@ class YuanClipGuide:
                     num_frames_to_keep = ((video_frames.shape[0] - 1) // time_scale_factor) * time_scale_factor + 1
                     video_frames = video_frames[:num_frames_to_keep]
 
-                    # MSR 模式静态参考图段：按原生 MSR 约定 frame_offset=-(num_slots-slot_index)
-                    # 以负时间偏移追加到视频起点之前。跳过 get_latent_index 正帧换算（会把
-                    # 负索引钳制到视频末尾），causal_fix=True 且不加渐变 mask，由 LTXVCropGuides
-                    # 按 keyframe_idxs token 计数裁剪，与原生 MSR 工作流一致。
+                    # MSR 模式静态参考图段：按原生 MSR 约定 frame_offset=-(num_slots-slot_index) 负时间偏移追加到视频起点前，
+                    # 跳过正帧换算并 causal_fix=True，由 LTXVCropGuides 按 keyframe_idxs 裁剪
                     if msr_mode and bool(seg.get("isStaticImage", False)):
                         # 槽位编号 = @图X 编号（subjectNum），缺失时回退为排列顺序
                         slot_id = int(seg.get("subjectNum", 0))
@@ -1041,10 +971,8 @@ class YuanClipGuide:
         ref_alpha = float(guide_data.get("ref_alpha", 0.0)) if guide_data else 0.0
         marker_token_indices = guide_data.get("marker_token_indices") if guide_data else None
         if ref_alpha > 0.0 and model is not None and marker_token_indices:
-            # --- 独立视觉编码：为每个 @图X 参考图预计算 visual feature ---
-            # 不依赖 video token x 中参考帧的物理位置，彻底解耦坐标系错位问题。
-            # 每个主体独立 try/except：单个主体编码失败只跳过该主体，
-            # 绝不整块失败后回退到从 x 取均值（那是去噪中的噪声，会导致两个人物/特征错乱）
+            # 为每个 @图X 参考图独立预计算视觉特征（不依赖 x 中参考帧的物理位置，解耦坐标系错位）；
+            # 单个主体编码失败只跳过该主体，不中断整体执行
             subject_ref_features = {}
             try:
                 diffusion_model = model.get_model_object("diffusion_model")
@@ -1110,11 +1038,7 @@ class YuanClipGuide:
 
     @classmethod
     def _apply_ref_guidance_patch(cls, model, marker_token_indices, ref_alpha, subject_ref_features=None):
-        """把 K/V 注入参数绑定到 attn2，替换其 forward。
-
-        仅处理视频分支（audio_attn2 不参与），与 PromptRelay 兼容：
-        forward 内部主动读 transformer_options["promptrelay_mask_fn"]。
-        """
+        """把 K/V 注入参数绑定到 attn2 并替换其 forward（仅视频分支，与 PromptRelay 兼容）。"""
         model_clone = model.clone()
         diffusion_model = model_clone.get_model_object("diffusion_model")
 

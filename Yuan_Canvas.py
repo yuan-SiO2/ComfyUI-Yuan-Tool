@@ -44,11 +44,9 @@ def _images_batch_signature(tensor):
 
 
 def _save_images_batch_with_sig(images_tensor):
-    """将 images batch 落盘为预览图，返回前端可用的 UI 条目列表（含 sig）。
+    """将 images batch 经 PreviewImage 节点落盘为预览图，返回带 sig 的 UI 条目列表。
 
-    参考全景预览节点的 _save_preview_images 实现，使用 ComfyUI 内置的
-    PreviewImage 节点落盘。每个 entry 携带 sig（图像内容签名），前端用 sig
-    作为图像唯一标识，调换 batch 顺序时 transforms 仍能正确对应同一张图。
+    sig 作为图像唯一标识，保证前端调换 batch 顺序时 transforms 仍能对应同一张图。
     """
     if images_tensor is None:
         return []
@@ -81,11 +79,7 @@ async def receivedDone(request):
 
 
 class Yuan_Canvas:
-    """自包含的合成器（V3）节点。
-
-    接收最多 8 张图像，在内嵌的 fabric.js 编辑器中可视化放置、旋转、缩放。
-    前端合成后的图像会回传后端，作为单个 IMAGE 输出。
-    """
+    """自包含的合成器（V3）节点：接收最多 8 张图像在 fabric.js 编辑器中可视化编辑，合成后作为单个 IMAGE 输出。"""
 
     result = None
     configCache = None
@@ -161,11 +155,8 @@ class Yuan_Canvas:
         configChanged = self.configCache != config
         self.configCache = config
 
-        # 始终落盘 images batch，确保切换工作流再返回等场景前端能获取图像。
-        # 前端根据画布状态决定是否重新下载：
-        #   - configChanged=false 且画布已有图像：不重新下载，保持原位可拖动
-        #   - configChanged=false 且画布为空：从 images_entries 重新加载
-        #   - configChanged=true：clearInputImages 后重新加载
+        # 始终落盘 images batch，确保前端总能获取图像；
+        # 前端按 configChanged 与画布是否已有图像决定是否重新下载
         images_entries = _save_images_batch_with_sig(images_tensor)
         bg_entries = _save_images_batch_with_sig(bg_image)
 

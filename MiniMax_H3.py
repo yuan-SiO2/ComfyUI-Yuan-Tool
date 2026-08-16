@@ -1,21 +1,7 @@
-"""MiniMax H3 节点复刻（汉化版）：AV 潜空间生成与任务条件构建（t2va / fl2va / ref2va）。
+"""MiniMax H3 节点（汉化版）：图生视频 / 参考图生视频，构建 AV 联合潜空间与任务条件。
 
-H3 packed-DiT 通过条件接收：
-- Qwen3-VL-32B 的隐藏状态，带逐 token 模态标记（来自 MiniMax CLIP）
-- 关键帧 / 参考条件潜空间，每个采样步重新注入（不做去噪）
-
-潜空间为 NestedTensor 对（视频 [B,24,T,H/16,W/16]、音频 [B,32,2,T40]）；
-采样在扁平打包数据上进行，可使用任何常规采样器（模型内部处理音频流的偏移调度）。
-
-本文件复刻自 ComfyUI 原生 comfy_extras/nodes_minimax_h3.py 的：
-- MiniMaxH3ImageToVideo（MiniMax H3 Image to Video）
-- MiniMaxH3ReferenceToVideo（MiniMax H3 Reference to Video）
-
-已合并为单个节点 Yuan_MiniMaxH3Video，通过"模式"下拉框切换：
-- 图生视频：提示词 + 可选首帧/尾帧关键帧
-- 参考图生视频：提示词 + <Picture i> / <Video k> / <Audio j> 参考内容
-
-端口与说明均已汉化，node_id 加 "Yuan_" 前缀避免与原生节点冲突。
+复刻自 comfy_extras/nodes_minimax_h3.py，合并为单个节点 Yuan_MiniMaxH3Video，
+通过"模式"下拉框切换，node_id 加 "Yuan_" 前缀避免与原生节点冲突。
 """
 
 import math
@@ -138,7 +124,6 @@ class YuanMiniMaxH3Video:
                                   "tooltip": "用于编码参考音频的音频 VAE 模型"}),
             "ref_image_size": (["匹配", "最大"], {"default": "匹配", "display_name": "参考图尺寸",
                 "tooltip": "参考图像尺寸策略。'匹配'：将每张参考图（仅缩小、保持宽高比）缩放到生成画面的像素面积；'最大'：使用参考管线的 2048px 短边以获得最佳主体保真度。参考标记会贯穿每个采样步，'最大' 模式可能慢数倍。"}),
-            # 参考图像列表端口：可连接多张图像（batch），最多 REF_IMAGE_PORTS 张，超出自动切断
             "ref_images": image_port(
                 "参考图像", f"参考图像列表（可连接多张图像，最多 {REF_IMAGE_PORTS} 张，超出自动切断）"),
         }

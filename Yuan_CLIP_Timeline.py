@@ -1,7 +1,6 @@
 """
-Yuan CLIP Timeline - 视觉时间轴提示词编码节点
-复刻自 ComfyUI-PromptRelay 的 Prompt Relay Encode (Timeline) 节点
-集成 video latent / audio latent 自动生成方法（与 LTXV 空潜空间原理一致）
+Yuan CLIP Timeline - 视觉时间轴提示词编码节点（PromptRelay Timeline 复刻，
+集成 LTXV 视频/音频空潜空间自动生成）。
 """
 
 import json
@@ -367,12 +366,7 @@ async def _yuan_clip_timeline_clear_seg_images(request):
 # ==============================================================================
 
 def _resolve_image_path(ref: str) -> str:
-    """解析图像/视频引用路径，支持 output:/input:/temp: 类型前缀。
-    无前缀或 input: 前缀 → input 目录；
-    output: 前缀 → output 目录；
-    temp: 前缀 → temp 目录。
-    返回绝对路径（文件可能不存在）。
-    """
+    """解析图像/视频引用路径，支持 output:/input:/temp: 类型前缀（无前缀默认 input 目录）。"""
     if not ref:
         return ""
     ref = ref.strip()
@@ -390,10 +384,7 @@ def _resolve_image_path(ref: str) -> str:
 
 
 def _load_image_tensor(seg: dict) -> torch.Tensor:
-    """加载图像为 [1,H,W,3] float32。
-    imageFile 支持类型前缀（output:/input:/temp:），无前缀默认 input 目录。
-    回退 base64；都失败返回 512x512 黑色零张量。
-    """
+    """加载图像为 [1,H,W,3] float32（支持类型前缀，回退 base64，失败返回 512x512 黑色零张量）。"""
     if seg.get("imageFile"):
         file_path = _resolve_image_path(seg["imageFile"])
         if file_path and os.path.exists(file_path):
@@ -815,10 +806,8 @@ def build_segments(token_ranges, segment_lengths, epsilon=1e-3,
     """为时间惩罚构建每段元数据。
 
     @图X token 级 mask 抑制 + K/V 全强度注入：
-    - @图X token 的活跃帧范围 = 引用它的主轨 local 段的帧范围（段内全可见，cost=0）
-    - 段外帧对该 @图X token 的 attention 权重按高斯衰减（suppress=True）
+    - @图X token 活跃帧范围 = 引用它的主轨 local 段帧范围（段内全可见 cost=0，段外高斯衰减）
     - K/V 注入保持全强度（effective_alpha = ref_alpha）
-    - 效果：段内帧看到全强度 K/V + 全可见，段外帧看到全强度 K/V + 衰减 attention 权重
     """
     sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
 
@@ -921,10 +910,7 @@ def _find_marker_phrase_token_indices(
     stop_at_equals=True,
 ):
     """返回 marker token 索引列表（离散）。
-    markers 如 ['@图1', '@图2']，定位这些标记在 CLIP token 序列中的位置。
-
-    stop_at_equals=True 时，遇到 '=' 立即停止，只定位 @图X 标记本身，
-    不扩展到描述文本（避免 K/V 注入覆盖文本描述语义）。
+    stop_at_equals=True 时只定位 @图X 标记本身，不扩展到描述文本（避免 K/V 注入覆盖描述语义）。
     """
     if raw_tokenizer is None or not prompt_text or not markers:
         return []
@@ -1039,12 +1025,7 @@ def _distribute_evenly(num_segments, target_total):
 
 
 def distribute_segment_lengths(num_segments, latent_frames, specified_lengths=None):
-    """验证或自动分布段帧数，确保总和精确等于 latent_frames。
-
-    无论 specified_lengths 来自何处（用户手动输入、_convert_to_latent_lengths 转换、
-    时间轴编辑器），最终输出始终规范化到总和 = latent_frames，
-    避免段长度溢出导致惩罚矩阵污染参考帧 tokens 区域。
-    """
+    """验证或自动分布段帧数，确保总和精确等于 latent_frames（避免段长度溢出污染参考帧 tokens 区域）。"""
     if num_segments <= 0 or latent_frames <= 0:
         return []
 
@@ -1169,10 +1150,8 @@ def _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames):
 # ==============================================================================
 
 def _auto_generate_latent(width, height, length_frames):
-    """自动生成 LTXV 兼容的视频空潜空间张量。
-    LTXV 时间压缩: latent_t = ((length - 1) // 8) + 1
-    零张量不含 noise_mask，采样器将对整个潜空间加噪并去噪生成新内容。
-    """
+    """自动生成 LTXV 兼容视频空潜空间（LTXV 时间压缩: latent_t = ((length-1)//8)+1；
+    零张量不含 noise_mask，采样器对整体加噪去噪生成新内容）。"""
     w = max(32, (width // 32) * 32)
     h = max(32, (height // 32) * 32)
     latent_t = ((length_frames - 1) // 8) + 1
@@ -1184,10 +1163,7 @@ def _auto_generate_latent(width, height, length_frames):
 
 
 def _auto_generate_audio_latent(audio_vae, length_frames, frame_rate):
-    """自动生成 LTXV 兼容的音频空潜空间张量。
-    与 video latent 使用相同的 length_frames 和 frame_rate，保证帧对齐。
-    零张量不含 noise_mask，采样器将对整个音频潜空间加噪并去噪生成新音频。
-    """
+    """自动生成 LTXV 兼容音频空潜空间（与 video latent 使用相同帧数/帧率，保证帧对齐）。"""
     inner = getattr(audio_vae, "first_stage_model", audio_vae)
     z_channels = audio_vae.latent_channels
     audio_freq = inner.latent_frequency_bins
@@ -1273,12 +1249,7 @@ _MSR_CHAR_PATTERN = re.compile(r'^@图(\d+)\s*[=：:]\s*(.+)')
 
 
 def _parse_msr_characters(global_prompt: str) -> tuple:
-    """解析 global_prompt 中的 @图X=描述 行。
-
-    返回:
-        char_map: dict, {"@图1": "描述1", "@图2": "描述2", ...}
-        char_list: list of dict, [{"tag": "@图1"}, ...]
-    """
+    """解析 global_prompt 中的 @图X=描述 行，返回 (char_map, char_list)。"""
     char_map = {}
     char_list = []
     if not global_prompt:
@@ -1296,11 +1267,7 @@ def _parse_msr_characters(global_prompt: str) -> tuple:
 
 
 def _generate_short_alias(desc: str, max_chars: int = 10) -> str:
-    """从角色描述中提取简短别名，用于后续 @图X 引用时节省 CLIP token。
-
-    取前 max_chars 个字符，在标点处截断，确保别名简短且具有辨识度。
-    例如 "亚洲中年男性，背头，金丝眼镜" → "亚洲中年男性，背头"
-    """
+    """从角色描述中提取简短别名（前 max_chars 字符、标点处截断），用于后续 @图X 引用节省 CLIP token。"""
     short = desc[:max_chars]
     for sep in ['，', '、', '。', '；', '：', ',']:
         idx = short.rfind(sep)
@@ -1319,15 +1286,11 @@ def _apply_msr_replacements(text: str, char_map: dict, force_short: bool = False
                             seen_tags: set = None, keep_marker: bool = False) -> str:
     """将文本中的 @图X 引用替换为角色描述。
 
-    - 按数字倒序排序避免子串误匹配（@图1 误匹配 @图10 前缀）。
-    - 正则带负向断言 @图X(?！\\d)，确保 @图1 不会匹配到 @图10 中。
-    - 首次出现使用完整描述，后续出现使用简短别名以节省 CLIP token。
-    - force_short=True 时全部使用简短别名（用于 CLIP 截断主动缓解）。
-    - seen_tags 非空时，已在 seen_tags 中的标签视为"已出现"，全部用简短别名；
-      本函数会更新 seen_tags（首次出现的标签会被加入）。
-    - keep_marker=True 时保留 @图X 标记并在后面添加描述（用于 local 段 K/V 注入）：
-      "@图1在喝奶茶" → "@图1女孩在喝奶茶"
-      这样 K/V 注入能直接作用于 local 段中的 @图X token，关联视觉特征与行为描述。
+    - 按数字倒序 + 负向断言 @图X(?！[0-9]) 避免子串误匹配（@图1 不匹配 @图10）。
+    - 首次出现用完整描述，后续用简短别名节省 token；force_short 时全部用别名；
+      seen_tags 中已有的标签视为已出现（本函数会更新它）。
+    - keep_marker=True 时保留 @图X 标记并追加描述（如 "@图1在喝奶茶"→"@图1女孩在喝奶茶"），
+      使 K/V 注入能直接作用于 local 段中的 @图X token。
     """
     if not text or not char_map:
         return text
@@ -1600,10 +1563,9 @@ class YuanCLIPTimeline:
                 lines_prompts = [p["prompt"] for p in parsed_time_lines]
                 local_prompts = " | ".join(lines_prompts)
 
-                # 从时间段中读取最大结束时间，自动计算 max_frames
+                # 按最大结束时间计算 max_frames，并对齐 LTXV 时间步长 (8)
                 max_end_sec = max(p["end_sec"] for p in parsed_time_lines)
                 raw_max = int(max_end_sec * fps) + 1
-                # 对齐 LTXV 时间步长 (8): 实际输出帧 = (max_frames//8)*8+1，确保 max_frames 与此一致
                 max_frames = ((raw_max - 2) // 8 + 1) * 8 + 1
 
                 # 将秒数转换为帧数
@@ -1637,7 +1599,7 @@ class YuanCLIPTimeline:
                 segment_lengths = ", ".join(str(s["length"]) for s in new_segs)
 
             else:
-                # --- 无时间格式：按原先均分逻辑处理 ---
+                # --- 无时间格式：按均分逻辑处理 ---
                 lines = [line.strip() for line in lines_raw if line.strip()]
                 if lines:
                     local_prompts = " | ".join(lines)
@@ -1689,9 +1651,7 @@ class YuanCLIPTimeline:
         if not global_prompt:
             global_prompt = tdata.get("global_prompt", "")
 
-        # --- 处理 segment_images 端口：将图像 batch 按段数分配到对应段落 ---
-        # 第1张→第1段、第2张→第2段……多出段落数量的图像忽略，不足的段落保持原状
-        # 锁定状态下拒绝上游数据，完全以时间轴编辑器内的数据为准
+        # --- 处理 segment_images 端口：图像 batch 按段序分配（第1张→第1段……），锁定状态下拒绝上游数据 ---
         if segment_images is not None and prompt_lock:
             try:
                 segments = tdata.get("segments", [])
@@ -1728,9 +1688,7 @@ class YuanCLIPTimeline:
             except Exception:
                 pass
 
-        # --- 处理 motion_images 端口：将图像/视频合并为 IC-LoRA 轨道段 ---
-        # 所有图像合并为单个段，携带 frameFiles 供 Guide 节点解码为连续帧序列
-        # 锁定状态下拒绝上游数据，完全以时间轴编辑器内的数据为准
+        # --- 处理 motion_images 端口：图像/视频合并为 IC-LoRA 轨道段，锁定状态下拒绝上游数据 ---
         if motion_images is not None and prompt_lock:
             try:
                 # 每张运动图像的帧数由 运动图像帧数 参数控制（8/16/24/32）
@@ -1800,8 +1758,7 @@ class YuanCLIPTimeline:
             except Exception:
                 pass
 
-        # --- 处理 音频输入 端口：将上游 AUDIO 数据保存为音频文件并添加到音频轨道 ---
-        # 锁定状态下拒绝上游数据，完全以时间轴编辑器内的数据为准
+        # --- 处理 音频输入 端口：上游 AUDIO 数据保存为音频文件并添加到音频轨道，锁定状态下拒绝上游数据 ---
         if audio_input is not None and prompt_lock:
             try:
                 waveform = audio_input.get("waveform") if isinstance(audio_input, dict) else None
@@ -1838,11 +1795,10 @@ class YuanCLIPTimeline:
                         # 计算音频时长对应帧数（按当前帧率）
                         duration_sec = int16_np.shape[0] / float(sample_rate)
                         desired_len = max(1, int(math.ceil(duration_sec * fps)))
-                        # 物理碰撞分配位置（与前端 _findFreeSlot 同样从0开始遍历找空隙）
+                        # 物理碰撞分配位置：与前端 _findFreeSlot 思路一致，从 0 开始找第一个能放下 desired_len 的空隙
                         existing_audio = tdata.get("audioSegments", [])
                         max_f = int(max_frames)
                         start_pos = 0
-                        # 复用前端 _findFreeSlot 思路：找第一个能放下 desired_len 的空隙
                         sorted_segs = sorted(existing_audio, key=lambda s: s.get("start", 0))
                         cursor = 0
                         for s in sorted_segs:
@@ -1883,9 +1839,7 @@ class YuanCLIPTimeline:
                 pass
 
         # --- @图X=描述 角色解析 + marker token 定位 ---
-        # @图X=描述 行保留在 global_prompt 中作为 token 标记
         # K/V 注入：定位 @图X 在 full_prompt（global+local）中的位置，注入对应主体参考帧的 K/V
-        marker_token_indices = {}  # {subject_num(int): [token_indices]}（在 _encode_relay 中填充）
         marker_segment_refs = {}   # {subject_num(int): [seg_idx, ...]} 每个 @图X 被哪些 local 段引用
         marker_tags = []           # [@图1, @图2, ...] 用于在 full_prompt 中定位所有 @图X token
         if global_prompt and "@图" in global_prompt:
@@ -1933,8 +1887,7 @@ class YuanCLIPTimeline:
 
         # （参考图像已通过 frameFiles 合并段统一走 IC-LoRA 视频路径）
 
-        # --- 自动生成 LTXV 潜空间（如果未连接 latent 输入） ---
-        # max_frames 已在动态分配时对齐 LTXV stride 8，ltxv_length 直接使用 max_frames
+        # --- 自动生成 LTXV 潜空间（未连接 latent 输入时；max_frames 已对齐 stride 8，直接使用） ---
         ltxv_length = max_frames
         if latent is None:
             # 优先使用引导图像推导的尺寸，否则使用 width/height
@@ -1949,7 +1902,7 @@ class YuanCLIPTimeline:
             ref_tau=ref_tau,
         )
 
-        # --- 音频潜空间（保留原有自动生成逻辑） ---
+        # --- 音频潜空间（自动生成） ---
         audio_latent = _auto_generate_audio_latent(audio_vae, ltxv_length, fps)
 
         # --- 合成时间轴音频（供下游音频修复/替换使用） ---
@@ -1967,8 +1920,7 @@ class YuanCLIPTimeline:
         guide_data["resize_method"] = resize_method
 
         # --- K/V 视觉特征注入：marker_token_indices + ref_alpha ---
-        # @图X 在 full_prompt（global + local）中的 token 位置被标记，
-        # 由下游 Yuan 引导注入节点把 motionSegments 对应主体的参考帧视觉特征注入到这些 token 的 K/V。
+        # 由下游 Yuan 引导注入节点把 motionSegments 对应主体的参考帧视觉特征注入到 @图X token 的 K/V；
         # 段外注意力抑制由 build_segments 生成的 token 级 mask（promptrelay_mask_fn）负责，ref_tau 已在此生效。
         if marker_token_indices and ref_alpha > 0.0:
             guide_data["marker_token_indices"] = marker_token_indices

@@ -125,8 +125,7 @@ class YuanTool:
                 image = kwargs.get(name)
                 if image is None:
                     continue
-                # 单图端口也遵循空兜底识别：接收到「筛选图像」的 (1,64,64,3) 全零图，
-                # 视为该端口未接入——不参与帧计数，不输出该图图像
+                # 单图端口同样识别「筛选图像」的空兜底图，视为未接入
                 if YuanTool._is_empty_fallback_image(image):
                     continue
                 subjects.append(prepare(image, target_size, preserve_full=True))
@@ -137,19 +136,15 @@ class YuanTool:
             prepare(background, target_size, preserve_full=False) if background is not None else None
         )
 
-        # 背景帧数：有有效背景图时与 frame_multiplier 一致，否则 0
+        # 背景帧数与每图帧数一致；slot1 额外 1 帧用于 VAE 8 帧分组对齐（无主体或帧数为 1 时无意义）
         bg_frame_count = frame_multiplier if background_image is not None else 0
-        # slot1 多1帧用于 VAE 8帧分组对齐；仅当存在主体且 frame_multiplier>1 时加；否则无意义
         first_slot_extra = 1 if (subjects and frame_multiplier > 1) else 0
         frame_count = len(subjects) * frame_multiplier + first_slot_extra + bg_frame_count
         frames = self._expand_frames_with_info(
             subjects, background_image, frame_multiplier, frame_count
         )
 
-        # 最终输出：
-        # - 有帧：正常展开
-        # - 完全无有效输入（主体空 + 背景也空/兜底/None）：输出 1 张 64×64 空图(全黑)，与 GetImage 兜底保持一致
-        # - 主体空但背景有效：_expand_frames_with_info 会产出 bg_frame_count 张背景帧
+        # 有帧则堆叠输出；完全无有效输入时输出 1 张 64×64 全黑空图（与 GetImage 兜底一致）
         if frames:
             output = torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0)
         else:
@@ -159,18 +154,16 @@ class YuanTool:
 
     @staticmethod
     def _tensor_to_rgb_array(image):
+        """统一转成 0-255 的 uint8 RGB 数组（兼容张量/数组、灰度/RGBA）。"""
         if isinstance(image, torch.Tensor):
-            # ComfyUI image tensor is [B, H, W, C] or [H, W, C]
             if image.ndim == 4:
                 image = image[0]
             image = image.detach().cpu().numpy()
 
         image = np.asarray(image)
-        # Ensure it's in 0-255 uint8 format
         if image.dtype != np.uint8:
             image = np.clip(image * 255.0, 0, 255).astype(np.uint8)
 
-        # Handle grayscale or RGBA
         if image.ndim == 2:
             image = np.stack([image, image, image], axis=-1)
         elif image.shape[-1] == 4:
@@ -234,15 +227,8 @@ class YuanTool:
     def _expand_frames_with_info(subjects, background, frame_multiplier, frame_count):
         frames = []
 
-        # slot1 多1帧: VAE 第一帧 (frame 0) 是独立帧 → latent 0,
-        # 不参与8帧分组。slot1 吸收这个独立帧后, 后续 slot 的帧边界
-        # 才能对齐 VAE 的8帧分组边界, 避免混合帧。
-        # 例: frame_multiplier=16
-        #   slot1: frames[0,16]  → latent 0(frame0) + latent 1(f1-8) + latent 2(f9-16) = 纯img1
-        #   slot2: frames[17,32] → latent 3(f17-24) + latent 4(f25-32) = 纯img2
-        #   slot3: frames[33,48] → latent 5(f33-40) + latent 6(f41-48) = 纯img3
+        # slot1 额外 1 帧吸收 VAE 的独立首帧（frame 0 不参与 8 帧分组），使后续帧边界对齐 8 帧分组、避免混合帧
         for index, image in enumerate(subjects):
-            # slot1 多1帧用于 VAE 8帧分组对齐；frame_multiplier=1 时无对齐意义，不加
             extra = 1 if (index == 0 and frame_multiplier > 1) else 0
             repeats = frame_multiplier + extra
             frames.extend([image] * repeats)

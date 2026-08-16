@@ -1,14 +1,8 @@
 """Yuan Tool · 加载批量图像 节点（多滑轨版）
 
-复刻自 WhatDreamsCost-ComfyUI 的 MultiImageLoader 节点并扩展为多滑轨架构：
-支持最多 20 个独立滑轨，每个滑轨可单独加载批量图像并独立输出。
-使用 lanczos 插值将宽高向上取整到 16 的倍数。
-
-前端通过 tracks_data（JSON 字符串）维护滑轨数据，格式：
-[
-  {"name": "批量图像A", "paths": ["img1.png", "img2.png"]},
-  {"name": "批量图像B", "paths": ["img3.png"]}
-]
+复刻自 WhatDreamsCost-ComfyUI 的 MultiImageLoader，支持最多 20 个独立滑轨，
+每滑轨单独加载批量图像并独立输出；使用 lanczos 插值将宽高向上取整到 16 的倍数。
+前端通过 tracks_data（JSON 字符串）维护滑轨数据。
 
 节点分类: "Yuan Tool/图像"
 """
@@ -37,12 +31,7 @@ def _default_track_name(index):
 
 
 class YuanMultiImage:
-    """加载批量图像节点（多滑轨版）
-
-    通过 JSON 格式的 tracks_data 维护多个滑轨，每个滑轨独立加载批量图像。
-    每个滑轨使用 lanczos 插值将宽高向上取整到 16 的倍数。
-    返回最多 20 路 IMAGE 输出（每路对应一个滑轨的 batch）。
-    """
+    """加载批量图像节点（多滑轨版）：tracks_data 维护多个滑轨，每滑轨独立加载并输出一路 IMAGE batch。"""
 
     MAX_TRACKS = 20
 

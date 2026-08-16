@@ -1,26 +1,18 @@
 """Yuan Tool · 色彩匹配 节点
 
-复刻自 ComfyUI-KJNodes 的 ColorMatch 节点，基于 color-matcher 库实现
-跨图像的色彩迁移，可用于自动色彩校正、画面调色以及光线/色温统一。
-
-节点分类: "Yuan Tool/图像"
+复刻自 ComfyUI-KJNodes 的 ColorMatch，基于 color-matcher 库实现跨图像色彩迁移（自动色彩校正、调色、光线/色温统一）。
 """
 
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import torch
 
 _COLOR_MATCH_METHODS = ['mkl', 'hm', 'reinhard', 'mvgd', 'hm-mvgd-hm', 'hm-mkl-hm']
 
 
 class YuanColorMatch:
-    """色彩匹配节点
-
-    将参考图像（image_ref）的色彩分布迁移到目标图像（image_target）上。
-    支持批量处理与多线程加速；通过 strength 控制混合强度。
-    """
+    """将参考图像（image_ref）的色彩分布迁移到目标图像（image_target），支持批量处理与多线程加速，strength 控制混合强度。"""
 
     @classmethod
     def INPUT_TYPES(cls):
