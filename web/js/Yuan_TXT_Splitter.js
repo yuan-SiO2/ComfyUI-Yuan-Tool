@@ -1,8 +1,7 @@
 import { app } from "../../../scripts/app.js";
 
 /**
- * 文本处理 - 修复版
- * 确保 widget 名称与后端汉化后的名称 ("输入端口", "输出段落") 严格匹配。
+ * 文本处理节点：确保 widget 名称与后端汉化名称（"输入端口"/"输出段落"）严格匹配。
  */
 app.registerExtension({
     name: "YuanTool.TXTParagraphSplitter",

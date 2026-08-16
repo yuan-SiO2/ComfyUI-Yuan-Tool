@@ -2,11 +2,7 @@
  * Yuan Tool · Panorama 前端
  *
  * 为 YuanPanoramaPreview 节点提供自包含的 WebGL 球面投影全景查看器：
- *  - 拖拽旋转（yaw/pitch，带惯性）
- *  - 滚轮缩放（FOV）
- *  - 360° / 180° 覆盖支持
- *  - 图像与视频（mp4 批次）输入
- *  - 双击 / 空格 播放暂停视频
+ * 拖拽旋转（无惯性）、滚轮缩放、360°/180° 覆盖、图像与视频（mp4 批次）输入、双击/空格播放暂停视频。
  *
  * YuanPanoramaSeamPrep 为普通图像/掩码节点，由 ComfyUI 默认渲染，无需特殊前端。
  */
@@ -182,8 +178,7 @@
                             return apiUrl(`/view?filename=${encodeURIComponent(file)}&type=${type}&subfolder=${encodeURIComponent(subfolder)}`);
                         };
 
-                        // 1.1) 对于图像加载类节点，优先通过 widget 提取。
-                        // 因为加载节点未执行时，其 imgs 可能会被上一个工作流同 ID 节点的缓存污染，而 widget 始终保存着用户当前选择的图片。
+                        // 1.1) 加载类节点未执行时 imgs 可能被缓存污染，故优先从 widget 提取用户当前图片
                         if (isLoader && imageWidget && typeof imageWidget.value === "string") {
                             const url = extractWidgetUrl(imageWidget);
                             if (url) return url;
@@ -202,7 +197,7 @@
                             if (url) return url;
                         }
 
-                        // 1.4) 最后才尝试 getNodeImageUrls（因为它会读取 nodeOutputs，可能被跨工作流的同 ID 节点污染）
+                        // 1.4) 最后尝试 getNodeImageUrls（会读 nodeOutputs，可能被跨工作流同 ID 节点污染）
                         let urls = [];
                         try {
                             urls = typeof app?.getNodeImageUrls === "function" ? (app.getNodeImageUrls(originNode) || []) : [];
@@ -581,9 +576,8 @@
         }
 
         /**
-         * V3 (Nodes 2.0) 尺寸适配：在 comfy-node 元素上强制节点最小尺寸，
-         * 使 DOM 渲染尺寸与 V1 设计保持一致。V1 前端不存在该元素，直接跳过。
-         * 同时移除被编辑器隐藏管理的参数（current_view_data）占位端口。
+         * V3 (Nodes 2.0) 尺寸适配：强制节点最小尺寸并移除 current_view_data 占位端口。
+         * V1 前端不存在 comfy-node 元素，直接跳过。
          */
         _applyV3MinSize() {
             try {
@@ -661,8 +655,7 @@
             // output_current_view widget 即可见开关：True=全景模式，False=裁剪模式
             const widget = this.node?.widgets?.find?.((w) => w?.name === "output_current_view");
             this.outputCurrentView = Boolean(widget?.value);
-            // 静默设置 current_view_data：不触发 widget.callback 和 setDirtyCanvas，
-            // 避免大量 dataUrl 字符串引发 ComfyUI/LiteGraph 持续重绘或处理
+            // 静默写入 current_view_data，避免大量 dataUrl 字符串引发持续重绘
             const dataWidget = this.node?.widgets?.find?.((w) => w?.name === "current_view_data");
             if (!dataWidget) return;
             const idx = this.node.widgets.indexOf(dataWidget);
@@ -675,8 +668,7 @@
             // 裁剪模式：截取当前 3D 裁剪画面
             const dataUrl = this.screenshotDataUrl();
             if (!dataUrl) {
-                // 如果当前无法截图（例如媒体尚未加载、或切换工作流时暂无图像），
-                // 不要清空已有的 current_view_data，以免丢失先前保存的裁剪画面
+                // 无法截图时保留已有 current_view_data，避免丢失先前保存的裁剪画面
                 return;
             }
             dataWidget.value = dataUrl;
@@ -721,8 +713,7 @@
                 const dPitch = dy * DRAG_SENSITIVITY;
                 this._applyDelta(dYaw, dPitch);
                 this.requestDraw();
-                // 拖拽中不同步视图数据：WebGL canvas 的 toDataURL 会引发 GPU→CPU 管线停顿，
-                // 阻塞主线程导致掉帧卡顿。仅在 pointerup / wheel 时同步。
+                // 拖拽中不截图：toDataURL 的 GPU→CPU 停顿会阻塞主线程导致掉帧，仅 pointerup/wheel 时同步
                 ev.preventDefault();
                 ev.stopPropagation();
             });
@@ -825,15 +816,14 @@
                     return out;
                 };
             }
-            // 监听 output_current_view widget：True=全景模式，False=裁剪模式
+            // 监听 output_current_view widget（True=全景，False=裁剪）
             const ocvWidget = this.node?.widgets?.find?.((w) => w?.name === "output_current_view");
             if (ocvWidget) {
                 this.orig.ocvCallback = typeof ocvWidget.callback === "function"
                     ? ocvWidget.callback.bind(ocvWidget) : null;
                 ocvWidget.callback = (...args) => {
                     const out = self.orig.ocvCallback ? self.orig.ocvCallback(...args) : undefined;
-                    // 立即更新模式标志，但延迟截图（scheduleViewSync），
-                    // 避免模式切换瞬间同步截图导致后续拖拽卡顿
+                    // 立即更新模式标志，但延迟截图，避免切换瞬间同步导致拖拽卡顿
                     const ocvW = self.node?.widgets?.find?.((w) => w?.name === "output_current_view");
                     self.outputCurrentView = Boolean(ocvW?.value);
                     self.scheduleViewSync();
@@ -891,8 +881,7 @@
                     if (this.renderer) this.renderer.upload(video);
                     if (!this.videoPaused) void video.play().catch(() => {});
                     this.requestDraw();
-                    // 图像就绪后同步裁剪视图数据，避免切换工作流回来后
-                    // current_view_data 为空导致后端输出原图
+                    // 就绪后同步视图数据，避免 current_view_data 为空导致后端输出原图
                     this.scheduleViewSync();
                 };
                 const onTick = () => this.requestDraw();
@@ -935,8 +924,7 @@
                 this.img = image;
                 if (this.renderer) this.renderer.upload(image);
                 this.requestDraw();
-                // 图像就绪后同步裁剪视图数据，避免切换工作流回来后
-                // current_view_data 为空导致后端输出原图
+                // 就绪后同步视图数据，避免 current_view_data 为空导致后端输出原图
                 this.scheduleViewSync();
             };
             image.onerror = () => {

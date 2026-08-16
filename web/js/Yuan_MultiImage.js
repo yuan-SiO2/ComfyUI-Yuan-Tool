@@ -1,15 +1,8 @@
 /**
  * Yuan Tool · 加载批量图像 前端（多滑轨版）
  *
- * 功能：
- *  - 支持最多 20 个独立滑轨，每个滑轨可单独加载批量图像
- *  - 每个滑轨可自定义命名（默认 批量图像A、批量图像B...）
- *  - 每个滑轨有独立的 multi_output 输出端口，通过 getConnectionPos 重写
- *    将端口定位到滑轨右侧（而非节点顶部）
- *  - 滑轨内 Gallery 横向排列，支持滚动条与滚轮预览
- *  - 默认显示 1 个滑轨，新增滑轨在下方添加
- *  - 状态持久化到工作流（tracks_data widget）
- *  - 兼容 V1 / V3 前端
+ * 最多 20 个独立滑轨，每滑轨单独加载批量图像并自定义命名；
+ * 状态持久化到 tracks_data widget，兼容 V1 / V3 前端。
  */
 (function () {
     "use strict";
@@ -357,7 +350,6 @@
 
             // --- 6. 原图预览（点击缩略图弹出，可放大缩小 / 平移）---
             let previewOverlay = null;
-            let previewImg = null;
             let previewZoom = 1;
             let previewFitZoom = 1;
             let previewTx = 0;
@@ -421,7 +413,6 @@
                 document.body.appendChild(overlay);
 
                 previewOverlay = overlay;
-                previewImg = img;
                 previewZoom = 1;
                 previewFitZoom = 1;
                 previewTx = 0;
@@ -533,7 +524,6 @@
                 }
                 previewOverlay.remove();
                 previewOverlay = null;
-                previewImg = null;
             }
 
             // --- 7. 滑轨 UI 渲染 ---

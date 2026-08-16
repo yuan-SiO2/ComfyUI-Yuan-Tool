@@ -183,9 +183,7 @@ function hideWidget(w) {
 }
 
 // ── V3 (Nodes 2.0) 端口占位处理 ──
-// V3 前端下 widget 与输入端口"共存"（convertWidgetToInput 已废弃），
-// 被编辑器隐藏管理的参数会显示为空端口占位，把节点拉长。
-// 该函数在 V3 下移除这些参数对应的输入端口（保留真实可连接的 IMAGE 端口）。
+// V3 下被编辑器隐藏管理的参数会显示为空端口占位把节点拉长，此函数移除这些输入端口（保留真实可连接的 IMAGE 端口）。
 
 function isV3Node(node) {
   if (node._yuanIsV3Checked) return !!node._yuanIsV3;
@@ -1163,7 +1161,7 @@ class TimelineEditor {
     return srcNode ? String(srcNode.id) : null;
   }
 
-  // 从上游节点获取音频文件信息（参考运动图像的三层回退策略）
+  // 从上游节点获取音频文件信息（两层回退策略）
   _getUpstreamAudioInput() {
     const srcNode = this._getUpstreamAudioInputNode();
     if (!srcNode) return null;
@@ -1902,25 +1900,19 @@ class TimelineEditor {
     const cursorFrame = this.reorder.cursorX / ppf;
     const grabOffset = this.reorder.grabOffset;
     const initialLengths = this.reorder.initialLengths;
-    // 源段期望的新起始帧（保持抓取偏移）
+    // 源段期望的新起始帧（保持抓取偏移），且不超出 [0, totalLen - sourceLen]；总长不变
     let desiredStart = Math.max(0, cursorFrame - grabOffset);
-    // 源段长度不变
     const sourceLen = initialLengths[sourceIdx];
-    // 总长不变约束
     const totalLen = initialLengths.reduce((a, b) => a + b, 0);
-    // 限制 desiredStart 范围：源段不能超出 [0, totalLen - sourceLen]
     desiredStart = Math.max(0, Math.min(totalLen - sourceLen, desiredStart));
-    // 重新分配各段长度：基于 desiredStart 计算源段位置，相邻段相应伸缩
-    // 简化策略：保持段顺序不变，源段起始帧变为 desiredStart，
-    // 前面段总长 = desiredStart，后面段总长 = totalLen - desiredStart - sourceLen
+    // 简化策略：保持段顺序，源段起始帧变为 desiredStart，前后段按初始比例伸缩
     const frontTotal = desiredStart;
     const backTotal = totalLen - desiredStart - sourceLen;
-    // 按初始比例分配前面段
     let frontInitialTotal = 0;
     for (let i = 0; i < sourceIdx; i++) frontInitialTotal += initialLengths[i];
     let backInitialTotal = 0;
     for (let i = sourceIdx + 1; i < n; i++) backInitialTotal += initialLengths[i];
-    // 分配前面段长度（按比例缩放，保留最小长度）
+    // 分配前段长度（按比例缩放，保留最小长度）
     let frontAllocated = 0;
     for (let i = 0; i < sourceIdx; i++) {
       const ratio = frontInitialTotal > 0 ? initialLengths[i] / frontInitialTotal : 1 / sourceIdx;
@@ -1928,7 +1920,7 @@ class TimelineEditor {
       segs[i].length = len;
       frontAllocated += len;
     }
-    // 分配后面段长度
+    // 分配后段长度
     let backAllocated = 0;
     const backCount = n - sourceIdx - 1;
     for (let i = sourceIdx + 1; i < n; i++) {
@@ -1940,10 +1932,9 @@ class TimelineEditor {
     // 修正源段长度以吸收舍入误差，保持总长精确
     segs[sourceIdx].length = totalLen - frontAllocated - backAllocated;
     segs[sourceIdx].length = Math.max(MIN_SEGMENT_LENGTH, segs[sourceIdx].length);
-    // 重新计算 start
     let cursor = 0;
     for (const seg of segs) { seg.start = cursor; cursor += seg.length; }
-    // 如果源段中心跨越了相邻段中心，交换顺序（实现重排）
+    // 源段中心跨越相邻段中心时交换顺序（实现重排）
     const sourceCenter = segs[sourceIdx].start + segs[sourceIdx].length / 2;
     if (sourceIdx > 0) {
       const prevCenter = segs[sourceIdx - 1].start + segs[sourceIdx - 1].length / 2;
@@ -1954,7 +1945,6 @@ class TimelineEditor {
         segs[sourceIdx] = tmp;
         this.reorder.sourceIdx = sourceIdx - 1;
         this.selectedIndices = new Set([sourceIdx - 1]);
-        // 重新计算 start
         let c = 0;
         for (const seg of segs) { seg.start = c; c += seg.length; }
       }
@@ -3927,7 +3917,7 @@ class TimelineEditor {
           });
         }
 
-        // 物理碰撞分配位置（参考 LTX Director 算法）
+        // 物理碰撞分配位置（超总长度自动截取）
         const slot = this._findFreeSlot(this.timeline.motionSegments, desiredLen, max);
         const { start, length: segLen } = slot;
 
@@ -4301,7 +4291,7 @@ app.registerExtension({
                     }
                 }
             }
-            // 策略3: 只有一个 Timeline 节点时直接使用
+            // 策略2: 只有一个 Timeline 节点时直接使用
             if (nodes.length === 1) return nodes[0];
         } catch (e) {
             // 静默处理

@@ -116,12 +116,9 @@ function registerYuanTool(nodeType, portMeta) {
                 }
             }
 
-            // 第四步：确保背景端口存在且在最后（可选端口，空心圆点）
-            // 注意：不能使用 removeInput 删除背景端口来调整顺序，
-            // removeInput 会调用 disconnectInput 把已连接的线从 graph 中删掉，
-            // 而切换工作流/切换 list_mode 时第 5 步的重连又会因节点 id 为字符串而静默失败，
-            // 导致 background 端口的线丢失。这里改为在数组层面移动端口，
-            // 保留端口上的连接，并同步修正 graph 中相关 link 的 target_slot。
+            // 第四步：确保背景端口存在且在最后。
+            // 不能用 removeInput 调整顺序（会删除已连接的线，且重连会因字符串 id 静默失败），
+            // 改为数组层面移动端口并同步修正 link 的 target_slot。
             const bgIdx = self.inputs.findIndex(inp => inp.name === bgName);
             if (bgIdx !== -1) {
                 const bgInput = self.inputs[bgIdx];
@@ -130,9 +127,8 @@ function registerYuanTool(nodeType, portMeta) {
                 bgInput.shape = 7;
 
                 if (bgIdx !== self.inputs.length - 1) {
-                    // 从数组中移除背景端口（不删除连接）
                     self.inputs.splice(bgIdx, 1);
-                    // 移除后，bgIdx 及其之后端口的下标都前移了 1，同步修正对应 link 的 target_slot
+                    // 下标前移 1 位，同步修正后续端口的 target_slot
                     for (let i = bgIdx; i < self.inputs.length; i++) {
                         const inp = self.inputs[i];
                         if (inp && inp.link != null) {
@@ -159,9 +155,7 @@ function registerYuanTool(nodeType, portMeta) {
                     if (originNode) {
                         const targetSlot = self.inputs.indexOf(inp);
                         try {
-                            // 传节点对象而不是 self.id：
-                            // 新版 ComfyUI 的节点 id 是字符串（toNodeId 返回 String），
-                            // connect 只会解析 number 类型的 id，传 self.id 会静默返回 null 导致重连失败
+                            // 传节点对象而非 self.id：新版节点 id 为字符串，connect 只解析 number，传 id 会静默失败
                             originNode.connect(saved.origin_slot, self, targetSlot);
                         } catch (_) {}
                     }
@@ -176,10 +170,8 @@ function registerYuanTool(nodeType, portMeta) {
             app.graph.setDirtyCanvas(true, true);
         };
 
-        // 把 syncPortsReal 调度到下一 tick，确保 graph.links 已完整恢复。
-        // 在 onNodeCreated / onConfigure / mode.callback / onConnectionsChange
-        // 等生命周期中，links 可能尚未挂到 input.link 上，立即执行会
-        // 误判递进端口、重排 slot 错位、savedLinks 为空，导致切换工作流时断开。
+        // 调度到下一 tick 再同步：生命周期回调中 graph.links 可能尚未挂到 input.link 上，
+        // 立即执行会误判递进端口、slot 错位，导致切换工作流时断开
         const scheduleSync = (mode) => {
             clearTimeout(self._syncTimer);
             self._syncTimer = setTimeout(() => syncPortsReal(mode), 0);
@@ -390,10 +382,7 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
             }
         };
 
-        // 把 syncPortsReal 调度到下一 tick，确保 graph.links 已完整恢复（与 YuanTool 同源 BUG 修复）。
-        // 在 onNodeCreated / onConfigure / mode.callback / onConnectionsChange
-        // 等生命周期中，links 可能尚未挂到 input.link 上，立即执行会
-        // 误判递进端口、重排 slot 错位、savedLinks 为空，导致切换工作流时断开。
+        // 调度到下一 tick 再同步（与 YuanTool 同源修复）：links 可能尚未挂到 input.link 上，立即执行会误判端口
         const scheduleSync = () => {
             clearTimeout(self._syncTimer);
             self._syncTimer = setTimeout(syncPortsReal, 0);
@@ -470,9 +459,7 @@ function registerYuanRTXVideoUpscaleH3(nodeType) {
         const self = this;
         const resizeWidget = self.widgets.find(w => w.name === "resize_type");
         if (resizeWidget) {
-            // 初始化显隐
             syncResizeWidgets(self);
-            // 监听切换
             const origCallback = resizeWidget.callback;
             resizeWidget.callback = function () {
                 if (origCallback) origCallback.apply(this, arguments);
@@ -497,17 +484,14 @@ function registerYuanH3MotionContext(nodeType) {
 
     const origOnExecuted = nodeType.prototype.onExecuted;
     nodeType.prototype.onExecuted = function (data) {
-        // onExecuted 接收的 data 就是后端返回的 ui 字典本身
-        // （ComfyUI 前端调用 node.onExecuted(e.output)，e.output 即 ui 字典）
-        // 先在默认处理之前提取，避免数据被修改
+        // data 即后端返回的 ui 字典，需在默认处理之前提取
         let hint = null;
         if (data && data.h3_hint != null) {
             const raw = data.h3_hint;
             hint = Array.isArray(raw) ? raw.join("") : String(raw);
         }
-        // 调用 ComfyUI 默认处理
         if (origOnExecuted) origOnExecuted.apply(this, arguments);
-        // 保存提示（在默认处理之后赋值，避免被覆盖）
+        // 默认处理之后赋值，避免提示被覆盖
         this._h3Hint = hint;
         // 重新计算大小以容纳/移除提示行
         const curW = this.size ? this.size[0] : 200;
@@ -550,8 +534,7 @@ function registerYuanH3MotionContext(nodeType) {
 app.registerExtension({
     name: "ComfyUI-Yuan-Tool",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        // 从后端注册的 nodeData.input 提取每个可选端口的 display_name / tooltip 元数据
-        // 前端动态 addInput 时会用这份元数据，避免删建后汉化名丢失。
+        // 提取后端注册的可选端口元数据（display_name/tooltip），动态建端口时避免汉化名丢失
         const buildPortMeta = () => {
             const meta = {};
             const input = nodeData.input || {};

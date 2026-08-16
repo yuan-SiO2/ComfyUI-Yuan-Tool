@@ -1,11 +1,7 @@
 /**
- * Yuan Tool · 画布 前端
- *
- * 为 Yuan_Canvas 节点提供基于 fabric.js 的内嵌合成编辑器：
- *  - 接收 bg_image 与 images（batch）作为图层
- *  - 可视化放置、旋转、缩放、锁定、隐藏、调整层级
- *  - 合成结果上传后端，作为节点 IMAGE 输出
- *  - 支持位置信息持久化，切换工作流后可恢复
+ * Yuan Tool · 画布 前端：为 Yuan_Canvas 节点提供基于 fabric.js 的内嵌合成编辑器，
+ * 接收 bg_image 与 images(batch) 作为图层，支持放置/旋转/缩放/锁定/层级调整，
+ * 合成结果上传后端作为节点 IMAGE 输出，并持久化位置信息以在工作流切换后恢复。
  */
 import { fabric } from "./fabric.js";
 
@@ -107,17 +103,13 @@ function lookupNodeOutputEntry(nodeId) {
     return store[nodeId] || store[raw] || null;
 }
 
-/**
- * 从上游连接节点获取图像 URL 列表（支持 batch）。
- * 参考 ComfyUI-Yuan-Tool 的 getLinkedImageUrl 实现，不缓存图像信息。
- * 前端直接从上游节点获取图像，Yuan_画布节点只考虑图像的位置信息（transforms）。
- */
+/** 从上游连接节点获取图像 URL 列表（支持 batch，不缓存图像信息）。 */
 function getUpstreamImageUrls(node, inputName) {
     const inputs = Array.isArray(node?.inputs) ? node.inputs : [];
     let linkId = null;
     const preferred = inputs.find((i) => String(i?.name || "") === String(inputName));
     if (preferred?.link != null) linkId = preferred.link;
-    
+
     if (linkId == null) return [];
 
     const link = node?.graph?.links?.[linkId] || app?.graph?.links?.[linkId];
@@ -184,7 +176,7 @@ function getUpstreamImageUrls(node, inputName) {
         if (urls.length > 0) return urls;
     }
 
-    // 3) ComfyUI 内置缩略图（fallback）
+    // 4) ComfyUI 内置缩略图（fallback）
     let nodeUrls = [];
     try {
         nodeUrls = typeof app?.getNodeImageUrls === "function" ? (app.getNodeImageUrls(originNode) || []) : [];
@@ -195,7 +187,7 @@ function getUpstreamImageUrls(node, inputName) {
     }
     if (urls.length > 0) return urls;
 
-    // 4) image widget（LoadImage 类节点）
+    // 5) image widget（LoadImage 类节点）
     if (originNode) {
         const imageWidget = originNode?.widgets?.find?.((w) => String(w?.name || "").toLowerCase() === "image");
         const imageName = String(imageWidget?.value || "").trim();
@@ -208,12 +200,7 @@ function getUpstreamImageUrls(node, inputName) {
     return urls;
 }
 
-/**
- * 计算图像内容签名（sig），用于作为图像唯一标识。
- * 参考后端 _image_signature 实现：sig = shape_均值。
- * 前端从已加载的 fabric.Image 计算 sig，作为 transforms 的 key，
- * 这样调换 batch 顺序时 transforms 仍能正确对应同一张图。
- */
+/** 从已加载的 fabric.Image 计算内容签名（shape_均值），作为 transforms 的 key。 */
 function computeFabricImageSig(fabricImg) {
     try {
         const elem = fabricImg?.getElement?.() || fabricImg?._element;
@@ -245,93 +232,16 @@ function computeFabricImageSig(fabricImg) {
     }
 }
 
-/**
- * 注册扩展，可介入生命周期方法。
- * 以下是文档中的调用顺序：
- *
- * api 事件
- * 0: "status"
- * 1: "graphChanged"
- * 2: "promptQueued"
- * 3: "graphCleared"
- * 4: "executed"
- * 5: "execution_start"
- * 6: "execution_cached"
- * 7: "executing"
- * 8: "reconnecting"
- * 9: "reconnected"
- * 10: "manager-terminal-feedback"
- * 11: "cm-api-try-install-customnode"
- * 12: "progress"
- * 13: "execution_error"
- * 14: "b_preview"
- * 15: "crystools.monitor"
- * 16: "configure"
- * 17: "compositor.images"
- *
- * -- 网页加载 --
- * invokeExtensionsAsync init
- * invokeExtensionsAsync addCustomNodeDefs
- * invokeExtensionsAsync getCustomWidgets
- * invokeExtensionsAsync beforeRegisterNodeDef    [多次触发]
- * invokeExtensionsAsync registerCustomNodes
- * invokeExtensionsAsync beforeConfigureGraph
- * invokeExtensionsAsync nodeCreated
- * invokeExtensions      loadedGraphNode
- * invokeExtensionsAsync afterConfigureGraph
- * invokeExtensionsAsync setup
- *
- * -- 加载工作流 --
- * invokeExtensionsAsync beforeConfigureGraph
- * invokeExtensionsAsync beforeRegisterNodeDef   [零次、一次或多次]
- * invokeExtensionsAsync nodeCreated             [多次触发]
- * invokeExtensions      loadedGraphNode         [多次触发]
- * invokeExtensionsAsync afterConfigureGraph
- *
- * -- 添加新节点 --
- * invokeExtensionsAsync nodeCreated
- *
- * 关于 node 是什么等更多信息：
- * https://docs.comfy.org/essentials/javascript_objects_and_hijacking
- */
+/** 注册扩展，可介入节点生命周期（api 事件与扩展钩子的详细调用顺序见 ComfyUI 文档）。 */
 app.registerExtension({
     name: "Comfy.Yuan_Canvas",
 
     async getCustomWidgets(app) {
         // 无自定义 widget
     },
-    /**
-     * 在启动流程末尾调用。
-     * 适合添加事件监听（Comfy 事件或 DOM 事件）或全局菜单项。
-     * 此时从消息中可拿到 nodeId（若传递了），但没有节点上下文，需自行查找。
-     *
-     * 捕获 UI 事件
-     * 正如预期 - 在 DOM 中找到 UI 元素并 addEventListener。
-     * setup() 是做这事的好地方，因为页面已完全加载。
-     * 例如，检测对 'Queue' 按钮的点击：
-     * ```
-     *      function queue_button_pressed() { console.log("Queue button was pressed!") }
-     *      document.getElementById("queue-button").addEventListener("click", queue_button_pressed);
-     * ```
-     */
+    /** 启动流程末尾调用，用于注册事件监听与全局 UI 操作。 */
     async setup(app) {
         Editor.addCompositorSettings();
-
-        /** 任意消息示例
-         * PromptServer.instance.send_sync("my.custom.message", {"node": node_id, "other_things": etc})
-         * 在 api.ts 中搜索 "case 'executing'": 可找到所有发出的事件，或 "new CustomEvent('executing'"
-         * 内置事件示例，这应是节点即将开始（在后端）处理时
-         */
-        function executingMessageHandler(event) {
-            // 节点已在后台开始处理，此处无需前端干预
-        }
-
-        /**
-         * 处理 .py 执行期间发送的 progress 消息
-         */
-        function progressHandler() {
-            // 需按 node id 过滤
-        }
 
         /** 当节点"返回"一个 ui 元素时，通常在处理末尾 */
         function executedMessageHandler(event, a, b) {
@@ -343,8 +253,7 @@ app.registerExtension({
             }
             const instance = node.compositorInstance;
 
-            // 仅在 w/h/p 实际变化时才调整尺寸，否则点击"继续"
-            // 每次都会不必要地重置节点尺寸
+            // 仅在 w/h/p 实际变化时才调整尺寸，避免每次执行不必要地重置节点尺寸
             const newW = e.width[0];
             const newH = e.height[0];
             const newP = e.padding[0];
@@ -373,17 +282,13 @@ app.registerExtension({
             // 画布上是否已有图像
             const hasImagesOnCanvas = Object.keys(instance.inputImages).length > 0;
 
-            // configChanged 为 false 且画布上已有图像时（用户点击 continue 后图像内容未变），
-            // 保持画布上的图像原位，不重新加载，立即可拖动。
-            // configChanged 为 false 但画布上没有图像时（如切换工作流再返回），
-            // 需要从上游重新加载图像。
+            // configChanged 为 false 且画布已有图像时保持原位不重载；
+            // 画布为空时（如切换工作流再返回）需要从上游重新加载
             if (!instance.configChanged && hasImagesOnCanvas) {
                 return;
             }
 
-            // 在清空前，先把当前 inputImages 的 transforms 持久化到 fabricDataWidget。
-            // 这样用户调整过的位置不会因 clearInputImages 而丢失，
-            // 后续按 sig 恢复时能正确还原到最近一次的位置。
+            // 清空前先把当前 transforms 持久化，避免 clearInputImages 导致位置丢失
             try {
                 const currentSerialized = Editor.serializeStuff(node);
                 const currentParsed = JSON.parse(currentSerialized);
@@ -396,8 +301,7 @@ app.registerExtension({
             const restore = Editor.deserializeStuff(node.fabricDataWidget.value);
             const shouldRestore = restore ?? false;
 
-            // config 变化时清空旧的输入图层（数量或内容可能变化）；
-            // config 未变化但画布为空时（切换工作流再返回）不清空（本来就是空的）
+            // config 变化时清空旧图层；未变化且画布为空时无需清空
             if (instance.configChanged) {
                 instance.clearInputImages();
             }
@@ -405,7 +309,7 @@ app.registerExtension({
             // 从后端 UI 输出获取 bg_image，fallback 到上游节点获取
             let bgEntries = Array.isArray(e.bg_entries) ? e.bg_entries : [];
             bgEntries = bgEntries.filter((entry) => entry && entry.sig && imageSourceFromCandidate(entry));
-            
+
             if (bgEntries.length > 0) {
                 const bgUrl = imageSourceFromCandidate(bgEntries[0]);
                 if (bgUrl) {
@@ -423,10 +327,7 @@ app.registerExtension({
                 }
             }
 
-            // 参考 ERP_image 端口：优先从后端 UI 输出（images_entries）获取图像（含 sig），
-            // fallback 从上游节点获取（前端计算 sig）。
-            // 后端使用 PreviewImage 落盘 images batch（在后台线程完成，不阻塞前端 UI），
-            // 确保 batch 多张图像都能获取到。前端异步加载 URL，图像加载后立即可拖动。
+            // 优先从后端 images_entries（含 sig）获取图像，fallback 从上游节点获取（前端计算 sig）
             let imageEntries = Array.isArray(e.images_entries) ? e.images_entries : [];
             imageEntries = imageEntries.filter((entry) => entry && entry.sig && imageSourceFromCandidate(entry));
 
@@ -454,80 +355,31 @@ app.registerExtension({
                 });
             }
 
-            // 不在此处调用 uploadIfNeeded：
-            // 1. 此时 fabric.Image.fromURL 异步加载尚未完成，canvas 为空，
-            //    toDataURL 会导出空图像，且同步阻塞 UI 线程导致图像加载后无法立即拖动。
-            // 2. composition 上传应在用户点击 continue 时进行（continue 方法中先上传再执行）。
-
+            // 不在执行回调时调用 uploadIfNeeded：此时图像异步加载未完成，导出会得到空图；
+            // 上传应在用户点击 continue 时进行（continue 方法中先上传再执行）
         }
 
-        /** 重要消息考量  https://docs.comfy.org/essentials/comms_messages */
-
-        function configureHandler() {
-        }
-
-        function executionStartHandler() {
-        }
-
-        function executionCachedHandler() {
-        }
-
-        function graphChangedHandler() {
-            console.log("graphChangedHandler", arguments);
-        }
-
-        function changeWorkflowHandler() {
-        }
-
-
-        // change_workflow
-        // node 和 widget 的全局 on_change
-
-        api.addEventListener("compositor_init", executedMessageHandler);
-        api.addEventListener("graphChanged", graphChangedHandler);
-        api.addEventListener("change_workflow", changeWorkflowHandler);
-        api.addEventListener("execution_start", executionStartHandler);
-        api.addEventListener("execution_cached", executionCachedHandler);
-        api.addEventListener("executing", executingMessageHandler);
         // 注意：不监听 "executed" 事件。
         // 后端 composite 方法已通过 send_sync("compositor_init", ...) 推送 UI 数据，
         // executedMessageHandler 会在 compositor_init 时执行一次。
         // 若再监听 executed，同一节点每次执行会触发两次 executedMessageHandler，
         // 第二次的 clearInputImages 会清空第一次刚恢复的图像并重新异步加载，
         // 复杂的异步时序会导致 transforms 丢失（位置信息清零）。
-        /**
-         * 测试 .py 执行期间收到的 "progress"
-         */
-        api.addEventListener("progress", progressHandler);
-        api.addEventListener("configure", configureHandler);
-
-
+        api.addEventListener("compositor_init", executedMessageHandler);
     },
-    /**
-     * 在 Comfy 网页加载（或重载）时调用。
-     * 调用发生在 graph 对象创建之后，但任何节点注册或创建之前。
-     * 可用于通过劫持 app 或 graph（LiteGraph 对象）的方法来修改 Comfy 核心行为。
-     * 这在 Comfy Objects 中进一步讨论。
-     */
+    /** 网页加载（或重载）时调用，可劫持 app / graph（LiteGraph）修改 Comfy 核心行为。 */
     async init(args) {
     },
-    /**
-     * 对每个节点类型（AddNode 菜单中可用的节点列表）调用一次，
-     * 用于修改节点行为。
-     * 对 "nodeType.prototype" 的修改会应用于该类型的所有节点。
-     */
+    /** 对每个节点类型（AddNode 菜单中的列表）调用一次，可修改 nodeType.prototype 影响该类型所有节点。 */
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
     },
-    /**
-     * loadedGraphNode，在 nodeCreated 之后调用，此时 widget 值已从工作流 JSON 恢复。
-     */
+    /** 在 nodeCreated 之后调用，此时 widget 值已从工作流 JSON 恢复。 */
     async loadedGraphNode(node, app) {
         if (!isYuan_Canvas(node)) return;
         const instance = node.compositorInstance;
         if (!instance) return;
 
-        // widget 值在 nodeCreated 时尚未从 workflow JSON 恢复，
-        // initFabric 用默认 512x512 初始化了画布；此处值已恢复，需重新应用。
+        // widget 值已从工作流恢复，重新应用到画布（nodeCreated 时用的是默认值）
         const widthWidget = getCompositorWidget(node, "width");
         const heightWidget = getCompositorWidget(node, "height");
         const paddingWidget = getCompositorWidget(node, "padding");
@@ -545,9 +397,7 @@ app.registerExtension({
             instance.onPaddingChange(paddingWidget.value);
         }
 
-        // 参考 ERP_image 端口：切换工作流后直接从上游节点获取图像（不自动执行工作流）。
-        // 上游若已执行过，nodeOutputs 中有图像；若未执行，等用户手动执行后由
-        // executedMessageHandler 从上游重新获取。前端计算 sig 作为 transforms 的 key。
+        // 切换工作流后直接从上游获取图像（不自动执行工作流）；前端计算 sig 作为 transforms 的 key
         const restore = Editor.deserializeStuff(node.fabricDataWidget.value);
         const shouldRestore = restore ?? false;
 
@@ -562,8 +412,7 @@ app.registerExtension({
             }, { crossOrigin: "anonymous" });
         }
 
-        // images：一张或多张图像（batch），直接从上游获取
-        // 前端计算图像内容签名（sig）作为唯一标识，按 sig 恢复 transforms
+        // images：batch 多张图像，按 sig 恢复 transforms
         const upstreamImageUrls = getUpstreamImageUrls(node, "images");
         upstreamImageUrls.forEach((url, index) => {
             if (!url) return;
@@ -574,8 +423,7 @@ app.registerExtension({
             }, { crossOrigin: "anonymous" });
         });
 
-        // 重新盖上 firstRun 时间戳，让 IS_CHANGED 在下次执行时返回新值，
-        // 用户手动执行时节点重新执行，从上游重新拉取图像并按 fabricDataWidget 中的 transforms 恢复
+        // 刷新 firstRun 时间戳，保证下次手动执行时 IS_CHANGED 返回新值以重新拉取图像
         if (node.fabricDataWidget) {
             const data = restore || {};
             data.firstRun = Date.now();
@@ -583,24 +431,12 @@ app.registerExtension({
         }
     },
     async afterConfigureGraph(args) {
-        // 参考 ERP_image 端口：不自动执行工作流获取图像。
-        // 图像由 loadedGraphNode 直接从上游获取，无需触发执行。
-        // 用户需要手动执行工作流（点击 Queue Prompt 或 continue 按钮）来获取图像。
+        // 不自动执行工作流获取图像：由 loadedGraphNode 从上游获取，用户手动执行
     },
-    /**
-     * 当节点的某个具体实例被创建时调用
-     * （在 nodeType 末尾的 ComfyNode() 构造函数中）。
-     * 在此钩子中可修改节点的单个实例。
-     * 注：before register node def 更适合原型修改（？）
-     * node 参考
-     * https://docs.comfy.org/essentials/javascript_objects_and_hijacking
-     *
-     * 与 beforeRegisterNodeDef 原型中的 nodeCreated 事件不同（那是原型节点类实例）
-     */
+    /** 节点的某个具体实例创建时调用，可修改单个节点实例。 */
     async nodeCreated(node) {
         if (!isYuan_Canvas(node)) return;
 
-        /** 我们的输出合成图像 */
         node.imageNameWidget = getCompositorWidget(node, "imageName");
         const originalCallback = node.imageNameWidget.callback;
         node.imageNameWidget.callback = () => {
@@ -613,7 +449,6 @@ app.registerExtension({
         node.fabricDataWidget.computeSize = () => [0, 0];
         hideWidgetForGood(node, node.fabricDataWidget);
 
-
         // 确保重载时 widget 会被重新执行
         const firstRun = Editor.deserializeStuff(node.fabricDataWidget.value);
         firstRun["firstRun"] = Date.now();
@@ -625,10 +460,7 @@ app.registerExtension({
         c.id= "c_" + node.id;
         containerDiv.appendChild(c);
 
-
-
         node.editorWidget = node.addDOMWidget("test", "test", containerDiv, {
-            //serialize: false,
             hideOnZoom: false,
         });
         const fc = new fabric.Canvas(c,{
@@ -641,8 +473,6 @@ app.registerExtension({
             centeredKey: "altKey",
         });
 
-
-        /** 初始化合成器 GUI widget */
         const compositorInstance = new Editor(node, containerDiv);
         compositorInstance.initFabric(fc);
 
@@ -671,7 +501,7 @@ app.registerExtension({
                 compositorInstance.onPaddingChange(paddingWidget.value);
             };
         }
-        // 立即将当前 widget 值应用到画布
+        // 将当前 widget 值应用到画布
         compositorInstance.onWidthChange(compositorInstance.w.value);
         compositorInstance.onHeightChange(compositorInstance.h.value);
         compositorInstance.onPaddingChange(compositorInstance.p.value);
@@ -705,18 +535,12 @@ app.registerExtension({
             }
         }
 
-
-
-        /**
-         * grabUploadAndSetOutput 回调不能是 async，所以在 upload image 中传入 widget
-         * addWidget(type, name, value, callback, options)
-         */
+        // grabUploadAndSetOutput 回调不能是 async，故把 widget 传给 uploadImage 直接处理
         node.continue = node.addWidget("button", "continue", "continue", compositorInstance.continue.bind(compositorInstance));
     },
 });
 
-
-//来自 melmass
+// 来自 melmass
 function hideWidgetForGood(node, widget, suffix = '') {
     widget.origType = widget.type
     widget.origComputeSize = widget.computeSize
@@ -734,7 +558,6 @@ function hideWidgetForGood(node, widget, suffix = '') {
 
 /** 将在节点创建时通过 addDOMWidget 添加到节点 */
 class Editor {
-    id;
     canvasEl;
     /** fabric canvas */
     fcanvas;
@@ -777,20 +600,13 @@ class Editor {
     static deserializeStuff(value) {
         try {
             return JSON.parse(value)
-
-
         } catch (e) {
             console.log("deserializeStuff", e, value);
             return undefined;
         }
-
     }
 
-    /**
-     * 序列化图像位置信息：每张图三个信息 = sig(唯一ID) + 起始点(x1,y1) + 对角点(x2,y2)。
-     * 同时持久化 locked/hidden 状态，切换工作流后按 sig 恢复。
-     * 不缓存图像像素，只保存位置和状态信息。
-     */
+    /** 序列化图像位置（sig + 两点坐标）及 locked/hidden 状态，切换工作流后按 sig 恢复。 */
     static serializeStuff(node) {
         const instance = node.compositorInstance;
         const result = {
@@ -948,10 +764,7 @@ class Editor {
 
     }
 
-    /**
-     * 将 containerDiv 的 CSS 尺寸同步为 fabric canvas 尺寸，
-     * 使 DOM widget 布局稳定（防止重新执行时节点尺寸闪烁）。
-     */
+    /** 将 containerDiv 的 CSS 尺寸同步为 fabric canvas 尺寸，稳定 DOM widget 布局。 */
     syncContainerSize() {
         if (!this.fcanvas || !this.containerDiv) return;
         const w = this.fcanvas.getWidth();
@@ -962,9 +775,8 @@ class Editor {
     }
 
     /**
-     * V3 (Nodes 2.0) 前端尺寸适配：在 comfy-node 元素上同步节点最小尺寸，
-     * 使 DOM 渲染尺寸与 V1 设计保持一致。
-     * V1 前端不存在 comfy-node 元素，直接跳过。
+     * V3 (Nodes 2.0) 尺寸适配：在 comfy-node 元素上同步节点最小尺寸，
+     * 使 DOM 渲染尺寸与 V1 设计保持一致（V1 无 comfy-node 元素，直接跳过）。
      */
     enforceV3Size() {
         try {
@@ -986,8 +798,7 @@ class Editor {
 
     getOldTransform(sig) {
         const ref = this.inputImages[sig];
-        // 用起始点(x1,y1)和对角点(x2,y2)确定图像位置和大小
-        // 三个信息确定一张图：sig(唯一ID) + (x1,y1) + (x2,y2)
+        // 用左上角(x1,y1)与右下角(x2,y2)两点确定图像的位置和大小
         const bounds = ref.getBoundingRect();
         return {
             x1: bounds.left,
@@ -997,10 +808,7 @@ class Editor {
         };
     }
 
-    /**
-     * 用两点坐标 {x1,y1,x2,y2} 恢复图像位置和大小。
-     * (x1,y1) 为左上角，(x2,y2) 为右下角，由此确定位置和缩放。
-     */
+    /** 用两点坐标 {x1,y1,x2,y2}（左上角/右下角）恢复图像的位置和缩放。 */
     applyTransformFromPoints(theImage, points) {
         if (!points || points.x1 == null) return;
         let imgW = theImage.width || 1;
@@ -1028,12 +836,7 @@ class Editor {
         theImage.setCoords();
     }
 
-    /**
-     * 检查 sig 处的图像引用是否不为 null
-     * 引用存储在 "inputImages" 中（以 sig 为 key）
-     * @param sig
-     * @return {boolean}
-     */
+    /** 检查 sig 处的图像引用是否不为 null（引用存储在 inputImages 中，以 sig 为 key）。 */
     hasImageAtIndex(sig) {
         return this.inputImages[sig] != null;
     }
@@ -1060,8 +863,7 @@ class Editor {
 
     addImage(sig, theImage, index) {
         this.inputImages[sig] = theImage;
-        // 根据画布内绿色边框（合成区域 w×h，不含 padding）的最短边等比缩放 image
-        // image 最长边对齐绿色边框最短边，保持原比例，确保能放进绿色边框内
+        // 按合成区域（w×h，不含 padding）最短边等比缩放，确保图像能放进绿色边框内
         const greenW = Number(this.w.value) || 1;
         const greenH = Number(this.h.value) || 1;
         const greenMin = Math.min(greenW, greenH);
@@ -1079,7 +881,7 @@ class Editor {
         imgH = imgH || 1;
         const imgMax = Math.max(imgW, imgH);
         const scale = greenMin / imgMax;
-        // 从左上角开始排列，每张图在 X 和 Y 轴各错位 30 像素，防止重叠
+        // 从左上角排列，每张图在 X/Y 轴各错位 30 像素，防止重叠
         // origin 统一为 left/top，与 transforms 的 {x1,y1,x2,y2} 语义一致
         const idx = (index != null) ? index : Object.keys(this.inputImages).length - 1;
         const offsetStep = 30;
@@ -1102,7 +904,6 @@ class Editor {
 
     replaceImage(sig, theImage) {
         const oldTransform = this.getOldTransform(sig);
-        // 从画布移除旧图像
         this.fcanvas.remove(this.inputImages[sig]);
         // 用两点坐标恢复位置
         this.applyTransformFromPoints(theImage, oldTransform);
@@ -1118,7 +919,7 @@ class Editor {
         } else {
             instance.addImage(sig, theImage, index);
         }
-        // 恢复位置：用两点坐标 {x1,y1,x2,y2}，以及 locked/hidden 状态
+        // 按 sig 恢复位置（两点坐标）及 locked/hidden 状态
         if (shouldRestore) {
             try {
                 if (theImage) {
@@ -1126,7 +927,7 @@ class Editor {
                     if (restoreParams && restoreParams.x1 != null) {
                         instance.applyTransformFromPoints(theImage, restoreParams);
                     }
-                    // 恢复 lock 状态（按 sig 对应）
+                    // 恢复 lock 状态
                     const isLocked = !!(r.locked && r.locked[sig]);
                     theImage.locked = isLocked;
                     instance.applyLock(theImage);
@@ -1138,16 +939,13 @@ class Editor {
             }
         }
 
-        // 无论发生什么，确保图层顺序被强制执行
-        // (compositionArea < bgImage < images < compositionBorder)
+        // 确保图层顺序正确 (compositionArea < bgImage < images < compositionBorder)
         instance.enforceLayerOrder();
     }
 
     /**
-     * 将 bg_image 放置为最底层的图像图层。
-     * 背景图像不可选中、不响应事件，cover 缩放至
-     * 合成区域 (w x h) 并定位在 (padding, padding)。
-     * 它始终位于 compositionArea 之上、所有输入图像之下。
+     * 将 bg_image 作为不可选中的最底层图层（compositionArea 之上、输入图像之下），
+     * cover 铺满合成区域（w×h，偏移 padding）。
      */
     setBgImage(img) {
         if (!img) return;
@@ -1176,15 +974,12 @@ class Editor {
         this.fcanvas.renderAll();
     }
 
-    /**
-     * 将背景图像 cover 缩放并定位，精确填满
-     * 合成区域 (w x h，偏移 padding, padding)。
-     */
+    /** 将背景图像 cover 缩放定位，精确填满合成区域（w×h，偏移 padding）。 */
     fitBgImage() {
         if (!this.bgImage) return;
         const cw = Number(this.w.value) || 1;
         const ch = Number(this.h.value) || 1;
-        // 稳妥获取 bg image 原始尺寸
+        // 优先 getOriginalSize 获取原始尺寸，回退到 width/height
         let iw = this.bgImage.width || 0;
         let ih = this.bgImage.height || 0;
         if ((!iw || !ih) && typeof this.bgImage.getOriginalSize === "function") {
@@ -1196,7 +991,7 @@ class Editor {
         }
         iw = iw || 1;
         ih = ih || 1;
-        // cover 缩放：取较大的缩放比，确保完全覆盖合成区域
+        // cover 缩放：取较大缩放比，确保完全覆盖合成区域
         const scale = Math.max(cw / iw, ch / ih);
         this.bgImage.set({
             left: Number(this.p.value),
@@ -1213,13 +1008,11 @@ class Editor {
     }
 
     /**
-     * 强制执行规范图层顺序：
-     *   compositionArea (index 0) < bgImage < image1..N < compositionBorder (顶层)
+     * 强制执行规范图层顺序（compositionArea < bgImage < images < compositionBorder）。
      * 在任何结构性变更（添加/移除/重排/调整尺寸）后调用。
      */
     enforceLayerOrder() {
         if (!this.fcanvas) return;
-        // 先把 bg 送到底，再把 compositionArea 置于其下
         if (this.bgImage) {
             this.fcanvas.sendToBack(this.bgImage);
         }
@@ -1233,11 +1026,7 @@ class Editor {
         this.fcanvas.renderAll();
     }
 
-    /**
-     * 构建浮动图层工具栏（4 个图标按钮，垂直布局）。
-     * 定位在合成器容器右侧，仅在画布上选中输入图像（image1..N）时显示。
-     * 按钮始终操作当前选中的图像。
-     */
+    /** 构建浮动图层工具栏（4 个图标按钮，垂直布局，操作当前选中的输入图像）。 */
     createLayerToolbar() {
         const toolbar = document.createElement("div");
         toolbar.className = "Yuan_Canvas-layer-toolbar";
@@ -1304,10 +1093,7 @@ class Editor {
         return toolbar;
     }
 
-    /**
-     * 显示工具栏并绑定到当前选中的输入图像。
-     * @param img 选中的输入图像（必须是 image1..N 之一）
-     */
+    /** 显示工具栏并绑定到当前选中的输入图像（必须是输入图像之一）。 */
     showLayerToolbar(img) {
         if (!this.layerToolbar || !img) return;
         this.selectedLayerImage = img;
@@ -1322,10 +1108,7 @@ class Editor {
         this.layerToolbar.style.display = "none";
     }
 
-    /**
-     * 根据选中图像的当前可见性和锁定状态，
-     * 刷新工具栏按钮的图标/标题。
-     */
+    /** 根据选中图像的可见性和锁定状态，刷新工具栏按钮的图标/标题。 */
     refreshLayerToolbar() {
         if (!this.layerToolbar || !this.selectedLayerImage) return;
         const img = this.selectedLayerImage;
@@ -1345,10 +1128,7 @@ class Editor {
         });
     }
 
-    /**
-     * 检查给定 fabric 对象是否为输入图像（image1..N）之一。
-     * 用于决定选中时是否显示图层工具栏。
-     */
+    /** 判断对象是否为输入图像之一（决定选中时是否显示工具栏）。 */
     isInputImage(obj) {
         if (!obj) return false;
         for (const sig in this.inputImages) {
@@ -1357,10 +1137,7 @@ class Editor {
         return false;
     }
 
-    /**
-     * 将当前选中的输入图像上移一层。
-     * 不会越过 compositionBorder（顶层装饰），仅在各 input image 之间调整。
-     */
+    /** 将选中的输入图像上移一层（不越过 compositionBorder）。 */
     bringSelectedToFront() {
         const img = this.selectedLayerImage;
         if (!img) return;
@@ -1370,10 +1147,7 @@ class Editor {
         this.needsUpload = true;
     }
 
-    /**
-     * 将当前选中的输入图像下移一层。
-     * 不会越过 bgImage（底层背景），仅在各 input image 之间调整。
-     */
+    /** 将选中的输入图像下移一层（不越过 bgImage）。 */
     sendSelectedToBack() {
         const img = this.selectedLayerImage;
         if (!img) return;
@@ -1383,16 +1157,13 @@ class Editor {
         this.needsUpload = true;
     }
 
-    /** 切换当前选中输入图像的可见性。
-     *  用 opacity=0 控制隐藏，保持 visible=true/selectable/evented，
-     *  这样隐藏后选中框依旧可见可选中，用户可再次点击 eye 切换显示。
-     */
+    /** 切换选中输入图像的可见性（opacity=0 隐藏，保持可见可选中以便再次切换）。 */
     toggleSelectedVisibility() {
         const img = this.selectedLayerImage;
         if (!img) return;
         const isHidden = img.opacity === 0;
         img.set({ opacity: isHidden ? 1 : 0, visible: true });
-        // 隐藏后保持选中，不 discardActiveObject，用户可点击 eye 切换显示
+        // 隐藏后保持选中，用户可再次点击 eye 切换显示
         this.refreshLayerToolbar();
         this.fcanvas.renderAll();
         this.needsUpload = true;
@@ -1410,10 +1181,7 @@ class Editor {
         this.persistState();
     }
 
-    /**
-     * 立即将当前 transforms/locked/hidden 状态持久化到 fabricDataWidget。
-     * 切换工作流时节点被销毁前，widget 值需为最新，否则状态会丢失。
-     */
+    /** 将当前 transforms/locked/hidden 状态持久化到 fabricDataWidget（切换工作流前需为最新）。 */
     persistState() {
         try {
             const serialized = Editor.serializeStuff(this.node);
@@ -1425,10 +1193,7 @@ class Editor {
         } catch (e) { /* 忽略 */ }
     }
 
-    /**
-     * 根据自定义 `locked` 标志应用 fabric.js 锁定属性。
-     * 参照 pano_stickers 的 Jd() 模式。
-     */
+    /** 根据自定义 `locked` 标志应用 fabric.js 锁定属性（参照 pano_stickers 模式）。 */
     applyLock(img) {
         const locked = !!img.locked;
         img.set({
@@ -1445,13 +1210,7 @@ class Editor {
     }
 
 
-    /**
-     * 初始化一个 fabricJs 实例。
-     * Fabric 是引擎，使操作图像并提取最终合成图像成为可能。
-     * init 参数: http://fabricjs.com/docs/fabric.Canvas.html
-     * @param cavasEl 带 canvas 标签的 dom 元素
-     * @return {fabric.Canvas}
-     */
+    /** 创建 fabric.Canvas 实例（透明背景、ctrlKey 组合键等统一配置）。 */
     static createFabricCanvas(id) {
         const canvasElement = document.getElementById(id);
         const fcanvas = new fabric.Canvas(canvasElement, {
@@ -1524,12 +1283,9 @@ class Editor {
         return this.cblob == undefined
     }
 
-    /** 这个不能是 async，所以用 promise 解析和回调
-     * @params setDone  **已弃用** 当 setDone 为 true 时，会为后端触发 /compositor/done 事件
-     * @params callback  会传给 uploadImage，上传完成时调用
-     * */
+    /** 不能是 async，故用 promise 解析和回调；setDone 已弃用，callback 为上传完成回调。 */
     grabUploadAndSetOutput(instance, setDone, callback) {
-        // 准备图像
+        // 导出合成区域（w×h，偏移 padding）为图像数据
         const img = new Image();
         this.fcanvas.discardActiveObject().renderAll();
         const data = this.fcanvas.toDataURL({
@@ -1542,8 +1298,7 @@ class Editor {
         });
 
         img.src = data;
-        // 完成后，导出图像，用临时名上传以模拟合成
-        // 并更新输出名值
+        // 导出后用临时名上传模拟合成，并更新输出名
         img.onload = (e) => {
 
             const blob = Editor.dataURLToBlob(data);
@@ -1551,22 +1306,16 @@ class Editor {
             if (this.hasNeverRun()) {
                 Editor.uploadImage(blob, this.node.imageNameWidget, this.node.id, false, callback);
             } else {
-                /**
-                 * grabUploadAndSetOutput 回调不能是 async，所以这里无法等待结果和名称，
-                 * 把 widget 也传给 upload image，这样我们就可以直接处理它。
-                 * 不确定运行 "capture on queue" 时是否会出问题
-                 */
+                // 把 widget 传给 uploadImage，上传完成后直接更新输出名
                 Editor.uploadImage(blob, this.node.imageNameWidget, this.node.id, setDone, callback);
             }
 
             this.cblob = blob;
 
-            // 序列化 transforms（图像位置信息）
+            // 有有效 transforms 时才持久化（只保存位置信息，不保存图像数据）
             const serialized = Editor.serializeStuff(this.node);
-            // 有 transforms 时才保存（只保存图像位置信息，不保存图像数据）
             try {
                 const parsed = JSON.parse(serialized);
-                // transforms 是以 sig 为 key 的对象，检查是否有有效值
                 const hasValid = (parsed.transforms && Object.values(parsed.transforms).some((t) => t != null));
                 if (hasValid) {
                     this.node.fabricDataWidget.value = serialized;
@@ -1576,19 +1325,14 @@ class Editor {
     }
 
     continue(setDone) {
-        // 先上传当前 composition（含 transforms），上传完成后再执行工作流。
-        // 这样后端执行时能拿到最新的 composition 图像。
+        // 先上传当前 composition（含 transforms），上传完成后再执行工作流
         this.grabUploadAndSetOutput(this, setDone, () => {
             app.queuePrompt(0, 1);
         });
     }
 
 
-    /**
-     * 在 fabric canvas 中移动激活对象
-     * @param direction [x,y] 坐标数组，范围 -1 +1，0 表示不移动
-     * @param withShift
-     */
+    /** 在 fabric canvas 中移动激活对象；direction 为 [-1,1] 方向向量，withShift 时步长 10。 */
     moveSelected(direction = [], withShift = false) {
         const STEP = withShift ? 10 : 1;
         const activeObject = this.fcanvas.getActiveObject();
@@ -1602,11 +1346,7 @@ class Editor {
         }
     }
 
-    /** 处理 fabric canvas 内的
-     * - 选中
-     * - 滚轮
-     * - 键盘
-     */
+    /** 处理 fabric canvas 内的选中、滚轮与键盘事件。 */
     setupfCanvasEvents(compositorInstance) {
 
         function isSubmit(key, ctl) {
@@ -1696,7 +1436,6 @@ class Editor {
 
                 opt.e.preventDefault();
                 opt.e.stopPropagation();
-                //this.fcanvas.renderAll()
                 this.renderAll()
             } catch (e) {
                 return;
@@ -1705,7 +1444,7 @@ class Editor {
 
         fabric.util.addListener(document.body, 'keydown', function keydownHandler(options) {
 
-            var key = options.which || options.keyCode; // 按键检测
+            var key = options.which || options.keyCode;
             if (isLeft(key)) {
                 this.moveSelected(downDirection(), options.shiftKey);
             } else if (isTop(key)) {
@@ -1721,26 +1460,19 @@ class Editor {
         }.bind(this));
     }
 
-    uploadIfNeeded(compositorInstance,callback = ()=>{console.log("upload if needed")}) {
-
+    uploadIfNeeded(compositorInstance, callback) {
         if (compositorInstance.needsUpload) {
             compositorInstance.needsUpload = false;
-            // 注意：不在此处序列化并覆盖 fabricDataWidget。
-            // 因为调用 uploadIfNeeded 时 inputImages 可能已被 clearInputImages 清空
-            // 且 fabric.Image.fromURL 异步加载尚未完成，此时 serializeStuff 会拿到空 inputImages，
-            // 无条件覆盖会导致 fabricData 中的 transforms 被清空（位置信息丢失）。
-            // grabUploadAndSetOutput 内部已有 serializeStuff + hasValid 保护，由它负责持久化。
+            // 注意：不在此处序列化并覆盖 fabricDataWidget——
+            // 此时 inputImages 可能已被清空、图像异步加载未完成，serializeStuff 会拿到空数据，
+            // 无条件覆盖会把 fabricData 中的 transforms 清空（位置丢失）。
+            // 持久化由 grabUploadAndSetOutput 内部的 serializeStuff + hasValid 保护负责。
             compositorInstance.grabUploadAndSetOutput(compositorInstance, false, callback)
-        } else {
-            console.log("no upload needed to be done");
         }
     }
 
-    /**
-     * 实际导出为输出的 WxH 尺寸区域
-     */
+    /** 实际导出为输出的 WxH 尺寸区域 */
     createCompositionArea() {
-        //p, w, h, node
         return new fabric.Rect({
             left: this.p.value,
             top: this.p.value,
@@ -1751,15 +1483,8 @@ class Editor {
         });
     }
 
-    /**
-     * 一个非交互式矩形，内容透明，外围有彩色边框，
-     * 从外圈框住合成区域，叠加在所有传入图像之上。
-     * 尺寸和位置根据 width、height 和
-     * COMPOSITION_BORDER_SIZE
-     * COMPOSITION_BORDER_COLOR 计算
-     */
+    /** 非交互式透明矩形，外围彩色边框从外圈框住合成区域，叠加在所有输入图像之上。 */
     createCompositionBorder() {
-        // p, w, h, node
         const compositionBorder = new fabric.Rect({
             left: this.p.value - this.COMPOSITION_BORDER_SIZE,
             top: this.p.value - this.COMPOSITION_BORDER_SIZE,
@@ -1769,9 +1494,6 @@ class Editor {
             selectable: false,
             evented: false,
         });
-
-
-        console.log("compositionBorder", compositionBorder, this.COMPOSITION_BORDER_COLOR, this.COMPOSITION_BORDER_SIZE);
 
         compositionBorder.set("strokeWidth", this.COMPOSITION_BORDER_SIZE);
         compositionBorder.set("stroke", this.COMPOSITION_BORDER_COLOR);
@@ -1790,8 +1512,6 @@ class Editor {
     }
 
     initFabric(c) {
-
-
         this.getCompositorSettings()
 
         // wannabe widgets
@@ -1818,33 +1538,19 @@ class Editor {
         this.containerDiv.style.width = initialW + "px";
         this.containerDiv.style.height = initialH + "px";
 
-        if(!c) {
-        this.canvasEl = Editor.createCanvasElement();
-
-
-
-        //this.canvasEl.id = 'test'; // ditor.getRandomCompositorUniqueId();
-        // this.canvasEl.id = Editor.getRandomCompositorUniqueId();
-
-        this.containerDiv.appendChild(this.canvasEl);
-
-
-
-        this.containerDiv.style.overflow = "hidden";
-        this.canvasEl.width = this.w.value + 2 * this.p.value;
-        this.canvasEl.height = this.h.value + 2 * this.p.value;
-
-
-        this.fcanvas = Editor.createFabricCanvas(this.canvasEl);
-    }else{
-        this.containerDiv.style.overflow = "hidden";
-        this.fcanvas = c;
-        this.fcanvas.setWidth(this.w.value + 2 * this.p.value);
-        this.fcanvas.setHeight(this.h.value + 2 * this.p.value);
-
-    }
-
-        console.log("this.fcanvas",this.fcanvas);
+        if (!c) {
+            this.canvasEl = Editor.createCanvasElement();
+            this.containerDiv.appendChild(this.canvasEl);
+            this.containerDiv.style.overflow = "hidden";
+            this.canvasEl.width = this.w.value + 2 * this.p.value;
+            this.canvasEl.height = this.h.value + 2 * this.p.value;
+            this.fcanvas = Editor.createFabricCanvas(this.canvasEl);
+        } else {
+            this.containerDiv.style.overflow = "hidden";
+            this.fcanvas = c;
+            this.fcanvas.setWidth(this.w.value + 2 * this.p.value);
+            this.fcanvas.setHeight(this.h.value + 2 * this.p.value);
+        }
 
         this.compositionArea = this.createCompositionArea();
         this.compositionBorder = this.createCompositionBorder();
