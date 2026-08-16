@@ -7,6 +7,7 @@
 带 ABI 标记门控并先自测再提交，失败则拒绝运行并说明原因。
 """
 
+import asyncio
 import hashlib
 import math
 import os
@@ -15,6 +16,9 @@ import re
 import folder_paths
 import node_helpers
 import torch
+
+from server import PromptServer
+from aiohttp import web
 
 from comfy.nested_tensor import NestedTensor
 import comfy.ldm.minimax.model as mm
@@ -1202,6 +1206,86 @@ def _dir_fingerprint(prefix_path):
     return "missing:%s" % p
 
 
+# ============================================================================
+# 手动上传潜空间：分块上传 .safetensors 到 input/h3_motion_latent/
+# ============================================================================
+
+_MANUAL_UPLOAD_SUBDIR = "h3_motion_latent"
+
+
+def _read_and_write_latent_chunk(file, file_path, mode):
+    chunk_bytes = file.file.read()
+    with open(file_path, mode) as f:
+        f.write(chunk_bytes)
+
+
+@PromptServer.instance.routes.post("/yuan_h3_motion_upload_latent")
+async def _yuan_h3_motion_upload_latent(request):
+    """接收「H3 加载潜空间」节点手动上传的潜空间文件（分块追加写入）。"""
+    post = await request.post()
+    file = post.get("file")
+    filename = post.get("filename")
+    chunk_index = int(post.get("chunk_index"))
+    total_chunks = int(post.get("total_chunks"))
+
+    upload_dir = os.path.join(folder_paths.get_input_directory(),
+                              _MANUAL_UPLOAD_SUBDIR)
+    os.makedirs(upload_dir, exist_ok=True)
+    filename = os.path.basename(filename)
+    if not filename.lower().endswith(".safetensors"):
+        return web.json_response({"error": "仅支持 .safetensors 文件"}, status=400)
+    file_path = os.path.join(upload_dir, filename)
+    if not os.path.realpath(file_path).startswith(os.path.realpath(upload_dir)):
+        return web.json_response({"error": "无效的文件名"}, status=400)
+
+    mode = "ab" if chunk_index > 0 else "wb"
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _read_and_write_latent_chunk,
+                               file, file_path, mode)
+
+    if chunk_index == total_chunks - 1:
+        return web.json_response(
+            {"name": "%s/%s" % (_MANUAL_UPLOAD_SUBDIR, filename)})
+    return web.json_response({"status": "ok"})
+
+
+def _resolve_manual_latent_path(手动上传):
+    """解析「手动上传」输入的潜空间文件路径，返回绝对路径；空输入返回 None。
+
+    支持 input:/output:/temp: 前缀与绝对路径；无前缀时依次在 input、
+    output 目录下查找（上传端点默认存 input/h3_motion_latent/）。
+    """
+    p = (手动上传 or "").strip().strip('"').strip("'")
+    if not p:
+        return None
+    candidates = []
+    matched = False
+    for prefix, base in (
+        ("input:", folder_paths.get_input_directory()),
+        ("output:", folder_paths.get_output_directory()),
+        ("temp:", folder_paths.get_temp_directory()),
+    ):
+        if p.startswith(prefix):
+            candidates.append(os.path.join(base, p[len(prefix):].lstrip("/\\")))
+            matched = True
+            break
+    if not matched:
+        if os.path.isabs(p):
+            candidates.append(p)
+        else:
+            candidates.append(os.path.join(
+                folder_paths.get_input_directory(), p))
+            candidates.append(os.path.join(
+                folder_paths.get_output_directory(), p))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    raise FileNotFoundError(
+        "h3_motion_context: 手动上传的潜空间文件未找到：%r"
+        "（支持 input:/output:/temp: 前缀、绝对路径；无前缀时在 input 与"
+        " output 目录下查找）。" % p)
+
+
 class Yuan_H3MotionContextLoadLatent:
     """为 context_latent 输入加载已保存的 H3 AV 潜空间。
 
@@ -1226,7 +1310,15 @@ class Yuan_H3MotionContextLoadLatent:
                                "节点的命名规则一致。设为 0 时表示链条的第一个"
                                "片段（无前序上下文）：不读取本地文件，输出空"
                                "标记，运动上下文节点识别后条件化直通、裁剪帧"
-                               "数为 0。"}),
+                               "数为 0。手动上传非空时本参数被忽略。"}),
+                "手动上传": ("STRING", {
+                    "default": "",
+                    "tooltip": "通过「上传潜空间」按钮上传 .safetensors 潜空间"
+                               "文件，或手动填写路径（支持 input:/output:/temp: "
+                               "前缀、绝对路径；无前缀时先查 input 再查 output "
+                               "目录）。非空时优先加载该文件，完全忽略存储位置"
+                               "与片段序号（序号为 0 也照样加载）；留空时按"
+                               "存储位置+片段序号正常加载。"}),
             },
         }
 
@@ -1248,7 +1340,16 @@ class Yuan_H3MotionContextLoadLatent:
     CLIP_INDEX_KEY = "_h3_motion_context_clip_index"
 
     @classmethod
-    def IS_CHANGED(cls, 存储位置, 片段序号=1):
+    def IS_CHANGED(cls, 存储位置, 片段序号=1, 手动上传=""):
+        # 手动上传非空：以该文件的 mtime+size 为指纹，忽略存储位置与序号。
+        # 文件未找到等异常返回 NaN：不缓存，保守每次重跑（load 会大声报错）。
+        if (手动上传 or "").strip():
+            try:
+                path = _resolve_manual_latent_path(手动上传)
+                st = os.stat(path)
+                return "manual:%s:%s:%s" % (path, st.st_mtime_ns, st.st_size)
+            except Exception:
+                return float("NaN")
         # 片段序号显式为常量 0 = 第一个片段：输出确定性空标记，无需读文件。
         # 注意 IS_CHANGED 阶段 ComfyUI 对链接输入一律传 None（execution.py
         # 以 execution_list=None 调用），序号来自 GetNode/表达式链路时拿不到
@@ -1265,7 +1366,23 @@ class Yuan_H3MotionContextLoadLatent:
         except Exception:
             return float("NaN")  # 意外失败：永不缓存，保守重跑
 
-    def load(self, 存储位置, 片段序号=1):
+    def load(self, 存储位置, 片段序号=1, 手动上传=""):
+        # 手动上传非空：优先加载该文件，完全忽略存储位置与片段序号
+        # （即使序号为 0 也照样加载，不以第一片段处理）
+        if _st_load is None:
+            raise RuntimeError("h3_motion_context: safetensors is not "
+                               "available; cannot load latents.")
+        manual_path = _resolve_manual_latent_path(手动上传)
+        if manual_path is not None:
+            data = _st_load(manual_path)
+            if "video" not in data or "audio" not in data:
+                raise ValueError(
+                    "h3_motion_context: %s is not an h3_motion_context latent "
+                    "(missing video/audio streams). Was it saved by the stock "
+                    "Save Latent node instead?" % manual_path)
+            # 手动加载无片段序号，不携带 CLIP_INDEX_KEY，
+            # 上下文节点提示为"已关联上下文"
+            return ({"samples": [data["video"], data["audio"]]},)
         # 片段序号 0 = 第一个片段：无前序上下文，不读文件，输出带空标记的
         # 空 latent，上下文节点识别后条件化直通、裁剪 0
         try:
@@ -1276,9 +1393,6 @@ class Yuan_H3MotionContextLoadLatent:
         if idx == 0:
             return ({"samples": [], self.EMPTY_MARKER: True,
                      self.EMPTY_REASON: "first_clip"},)
-        if _st_load is None:
-            raise RuntimeError("h3_motion_context: safetensors is not "
-                               "available; cannot load latents.")
         try:
             path = _resolve_latent_path(_build_load_path(存储位置), idx)
         except FileNotFoundError as e:
