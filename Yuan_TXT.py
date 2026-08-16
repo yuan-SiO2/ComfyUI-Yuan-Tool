@@ -781,8 +781,9 @@ class YUAN_TXTShotReplace:
     # <d>...</d> 台词标签（与引号保护叠加）
     DIALOGUE_TAG_RE = re.compile(r'<d>.*?</d>', re.DOTALL)
 
-    # 台词归属边界标点：名称前必须是句首或句末标点/空白之后（逗号不算，避免「甲对乙说」中的乙误归属）
-    BELONG_BOUNDARY = '。！？!?\n；;'
+    # 台词归属边界标点：名称前必须是句首或句末标点/逗号/空白之后
+    # （「甲对乙说」中的乙由其前的"对"字非边界挡住；「甲转身，低声说」由引导句不含标点挡住，均不会误归属）
+    BELONG_BOUNDARY = '。！？!?\n；;，,'
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -864,7 +865,7 @@ class YUAN_TXTShotReplace:
     def _belong_replace(text, name, sn, mask):
         """台词归属替换：`名称+引导句+冒号+<d>台词` → `(SN)+引导句+冒号+<d>台词`。
 
-        - 名称前必须是句首或句末标点/空白边界（BELONG_BOUNDARY），避免「甲对乙说」中的乙被误归属
+        - 名称前必须是句首或句末标点/逗号/空白边界（BELONG_BOUNDARY），避免「甲对乙说」中的乙被误归属（乙前的"对"字非边界）
         - 引导句不含任何标点（如「低声说」「沉声道」「对柳如烟说」），含逗号/顿号等则跳过特殊规则走普通替换
         - mask 非空时（台词保护开启），名称处于被保护位置则保留原文
         """
