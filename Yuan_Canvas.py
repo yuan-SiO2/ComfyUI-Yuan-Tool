@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from comfy_execution.graph import ExecutionBlocker
 from server import PromptServer
-import web
+from aiohttp import web
 import nodes as comfy_nodes
 
 MAX_RESOLUTION = comfy_nodes.MAX_RESOLUTION
