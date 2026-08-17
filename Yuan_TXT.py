@@ -812,6 +812,17 @@ class YUAN_TXTShotReplace:
                                "● 台词标签：<d>...</d>\n"
                                "关闭时，整段文本正常执行名称替换。",
                 }),
+                "参考音频开关": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "输出(SN)",
+                    "label_off": "输出<Picture N>",
+                    "display_name": "参考音频",
+                    "tooltip": "【参考音频】\n"
+                               "开启后，台词归属特殊规则生效：`名称+引导句+：<d>台词` 中名称替换为归属代号 (SN)"
+                               "（如「沈惊鸿低声说：<d>…</d>」→「(S1)低声说：<d>…</d>」），用于关联参考音频。\n"
+                               "关闭后，不做 (SN) 归属替换，名称走普通替换输出 <Picture N>"
+                               "（如「<Picture 1>低声说：<d>…</d>」）。",
+                }),
             },
         }
 
@@ -887,7 +898,7 @@ class YUAN_TXTShotReplace:
 
         return pattern.sub(repl, text)
 
-    def replace_shot_names(self, 角色道具场景, 分镜序列, 台词开关):
+    def replace_shot_names(self, 角色道具场景, 分镜序列, 台词开关, 参考音频开关):
         pairs = self._parse_picture_names(角色道具场景 or "")
 
         # 按名称长度降序排序（最长匹配优先，避免短名误替换长名中的子串）
@@ -895,12 +906,13 @@ class YUAN_TXTShotReplace:
 
         result = 分镜序列 or ""
 
-        # 特殊规则：台词归属替换 名称+引导句+：<d> → (SN)+引导句+：<d>
-        for name, tag in pairs:
-            sn = self._picture_tag_to_sn(tag)
-            if sn:
-                mask = self._build_protect_mask(result) if 台词开关 else None
-                result = self._belong_replace(result, name, sn, mask)
+        # 特殊规则：台词归属替换 名称+引导句+：<d> → (SN)+引导句+：<d>（参考音频开关关闭时跳过，走普通 <Picture N> 替换）
+        if 参考音频开关:
+            for name, tag in pairs:
+                sn = self._picture_tag_to_sn(tag)
+                if sn:
+                    mask = self._build_protect_mask(result) if 台词开关 else None
+                    result = self._belong_replace(result, name, sn, mask)
 
         # 普通替换：名称 → <Picture N>
         for name, tag in pairs:
