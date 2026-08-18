@@ -71,6 +71,7 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 | 节点 | 说明 |
 |---|---|
 | **RTX 视频放大 (H3)** | 合并 RTX 视频超分辨率 + AV Decode Split + H3 Concat AV Latent 一体节点。支持图像直连或 MiniMax H3 联合 AV latent 输入（自动解码放大后重新合并音频），内置结果缓存。依赖 `nvidia-vfx`（需 NVIDIA RTX 显卡） |
+| **H3 放大** | 纯 3D 卷积主干在 latent 空间放大 MiniMax H3 视频（24 通道），跳过「解码→像素放大→再编码」慢速往返。自动检测设备（优先 CUDA）与模型精度（跟随权重 fp32/fp16/bf16），强制关闭注意力；联合 AV latent 仅放大视频流、音频原样保留；缩放方式按倍数/目标尺寸切换时参数跟随显隐。模型放入 `ComfyUI/models/latent_upscale_models/`，下载：[MiniMax_h3_latent_Upscaler](https://hf-mirror.com/LBH-123-AI/Minimax_h3_latent_Upscaler/tree/main) |
 
 ## 时间轴工作流
 
@@ -108,6 +109,7 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 
 ## 更新记录
 
+- **2026-08-18**：新增「H3 放大」节点（复刻自 Comfyui_Minimax_h3_latent_Upscaler）：纯 3D 卷积在 latent 空间放大 H3 视频，设备自动检测（CUDA 优先）与精度自动检测（跟随模型权重），缩放方式按倍数/目标尺寸切换时参数跟随显隐
 - **2026-08-17**：「分镜角色替换」节点新增「参考音频」开关：开启时台词归属特殊规则输出 `(SN)` 归属代号，关闭时不做 `(SN)` 替换、名称走普通替换输出 `<Picture N>`
 - **2026-08-16**：新增「分镜角色替换」节点：将 JSON提取 角色道具场景中 `<Picture N>：名称` 定义的名称在分镜序列里批量替换为对应 `<Picture N>` 标记，台词保护支持引号与 `<d>...</d>` 标签；台词归属特殊规则：`名称+引导句+：+<d>台词` 中名称替换为 `(SN)` 归属代号
 - **2026-08-11**：新增「H3 运动上下文」「H3 运动裁剪」「H3 保存潜空间」「H3 加载潜空间」4 个节点：实现 MiniMax H3 片段衔接，画面与声音直接从上一片段潜空间切片获取，跳过解码重编码过程；包含布局补丁（解除仅首/末帧关键帧锚点限制）与载荷补丁（关键帧与引用共存），首次运行时自测安装
@@ -128,4 +130,5 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 - [yolain/ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use)
 - [Comfy-Org/Nvidia_RTX_Nodes_ComfyUI](https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI)
 - [NikoDemon80/ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
+- [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
 - [comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI)
