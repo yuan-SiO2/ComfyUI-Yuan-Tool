@@ -796,8 +796,9 @@ class Yuan_H3MotionContext:
                 "音频上下文长度": (["0", "17", "34", "51", "68"], {
                     "default": "17",
                     "tooltip": "从上下文潜空间取尾部声音的帧数，独立于画面"
-                               "窗口。该窗口与固定的视频尾端对齐、随「运动"
-                               "裁剪」一并移除。音频潜空间按 40Hz 连续采样，"
+                               "窗口。窗口尾端与裁剪边界对齐，「运动裁剪」按"
+                               "画面/音频两窗口的较大值整段移除。音频潜空间"
+                               "按 40Hz 连续采样，"
                                "没有 VRF 分组，帧数按 24fps 画面换算"
                                "（40/24 ≈ 5/3）。设为 0 时不从上下文潜空间"
                                "取音频：连接音频 VAE 时固定窗口的内容改为"
@@ -832,6 +833,8 @@ class Yuan_H3MotionContext:
         # 「上下文长度」与「音频上下文长度」都只针对上下文潜空间输入端口：
         # 前者取其尾部画面，后者取其尾部声音。两者都只固定到本片段头部、
         # 由「运动裁剪」整组移除，交付部分的画面与音频由模型全新生成。
+        # 裁剪帧数输出取两窗口的较大值并吸附整组，确保两个固定窗口都被
+        # 整段裁掉（统一时间切点，不做分离差异裁切）。
         # 第一个片段：上下文潜空间是「H3 加载潜空间」片段序号 0 的空标记或
         # 文件未找到的回退空标记。无前序上下文，条件化直通、裁剪 0，
         # 并通过 ui.h3_hint 在节点下方显示提示
@@ -882,6 +885,13 @@ class Yuan_H3MotionContext:
         # 在切片前对齐到整组网格，使切片的帧正好是整 VRF 组覆盖的帧
         run = next(g for g in VIDEO_RUN_GRID if g <= n)
         n = run
+
+        # 裁剪量取画面/音频两固定窗口的较大值并吸附整组：音频窗口可比
+        # 画面窗口长（如 17/68），只裁画面窗口会让固定音频泄漏进交付
+        # 部分；按较大值整段裁掉，两流共用同一时间切点，不做分离差异
+        # 裁切后合并
+        trim_frames = next(
+            g for g in VIDEO_RUN_GRID if g <= max(n, 音频上下文长度))
 
         if n >= frame_count:
             raise ValueError(
@@ -952,14 +962,15 @@ class Yuan_H3MotionContext:
         if audio_ref is not None:
             if audio_mode == "timeline":
                 # 音频窗口尾端与「运动裁剪」的音频裁剪量用同一表达式
-                # (round(span*FRAME_RESCALE))，固定窗口整体落在被裁头部内：
+                # (round(trim_frames*FRAME_RESCALE))，固定窗口整体落在
+                # 被裁头部内：
                 # 既不泄漏（固定内容越过交付边界）也不误删（新生成音频被
                 # 当作固定段）。不用 overhang 外推结束点：overhang 是音频
                 # 网格向上取整的分数余量（<1 步），先加再取整会把窗口推过
                 # 裁剪边界最多 1 步（25ms），且是否越界取决于该片段的
                 # overhang 是否 ≥0.5——124 帧直出 (0.33) 对齐、107 帧裁剪后
                 # (0.67) 越界，表现为部分片段长度处衔接有可听错位。
-                end_frame = float(span if anchor_mode == "head" else 0)
+                end_frame = float(trim_frames if anchor_mode == "head" else 0)
                 end_coord = int(round(end_frame * FRAME_RESCALE))
                 end_frame = end_coord / FRAME_RESCALE
                 audio_ref[MC_AUDIO_KEY] = end_frame
@@ -973,7 +984,7 @@ class Yuan_H3MotionContext:
             # 当前片段自由生成音频（固定的画面可能带出上一片段的声音）
             out = node_helpers.conditioning_set_values(条件化, values)
 
-        trim = span if anchor_mode == "head" else 0
+        trim = trim_frames if anchor_mode == "head" else 0
         # 提示已关联的片段序号（来自加载节点）
         clip_idx = (上下文潜空间.get(Yuan_H3MotionContextLoadLatent.CLIP_INDEX_KEY)
                     if isinstance(上下文潜空间, dict) else None)
@@ -985,14 +996,17 @@ class Yuan_H3MotionContext:
 
 
 class Yuan_H3MotionContextTrim:
-    """直接在 H3 的 AV 潜空间上裁切头部固定的画面与声音，并可选保存。
+    """直接在 H3 的 AV 潜空间上两段式裁切，并可选保存尾段。
 
-    解码路径先把潜空间解成像素帧与波形再裁切，每次衔接都多一次解码和
-    重编码；本节点改为直接对 AV 潜空间切片：视频流裁掉覆盖前 n 帧的
-    latent 步，音频流按 40Hz/24fps = 5/3 同步裁掉对应步数，输出仍是
-    含视频流和音频流的 AV 潜空间，不经过解码/转码。裁剪后的潜空间可
-    同时保存到磁盘，供下一次运行的运动上下文节点加载——即合并了原
-    「H3 保存潜空间」节点的功能，潜空间输出以本节点的裁剪结果为主。
+    第一次裁切：按「裁剪帧数」（「H3 运动上下文」输出的画面/音频固定
+    窗口较大值）从头部整段裁掉多余部分——视频流裁掉覆盖前 n 帧的
+    latent 步，音频流按 40Hz/24fps = 5/3 同步裁掉对应步数，两流共用
+    同一时间切点，不做分离裁切后合并；输出裁头后的交付潜空间（片段 0
+    裁 0 帧即直通），不经过解码/转码。第二次裁切：在交付潜空间的尾部
+    按 max(裁剪帧数, 保存尾部长度) 再切一段，保留后段保存到本地，供
+    下一次运行加载衔接。音视频分离取窗是「H3 加载潜空间 → H3 运动
+    上下文」的事情，本节点只做整段切片——即合并了原「H3 保存潜空间」
+    节点的功能，潜空间输出以本节点的裁剪结果为主。
     """
 
     @classmethod
@@ -1003,11 +1017,14 @@ class Yuan_H3MotionContextTrim:
                     "tooltip": "H3 采样器的 AV 潜空间（同时含视频流与音频流），"
                                "直接在其上裁切。"}),
                 "裁剪帧数": ("INT", {"default": 0, "min": 0, "max": 4096,
-                                "tooltip": "从头部裁掉的画面帧数。非 17 的倍数"
-                                           "会自动向下吸附到最近的整 VRF 组"
-                                           "（17/34/51…），保证剩余潜空间的"
-                                           "时序相位不错位、画面不闪烁；小于"
-                                           "17 时吸附为 0（不裁剪）。"}),
+                                "tooltip": "从头部整段裁掉的画面帧数，连接"
+                                           "「H3 运动上下文」的裁剪帧数输出"
+                                           "（画面/音频固定窗口的较大值）。"
+                                           "非 17 的倍数会自动向下吸附到最近的"
+                                           "整 VRF 组（17/34/51…），保证剩余"
+                                           "潜空间的时序相位不错位、画面不"
+                                           "闪烁；小于 17 时吸附为 0（不裁剪，"
+                                           "片段 0 直通）。"}),
                 "片段序号": ("INT", {
                     "default": 1, "min": 1, "max": 9999,
                     "tooltip": "本片段在链条中的序号。设为 2 时保存到"
@@ -1015,13 +1032,22 @@ class Yuan_H3MotionContextTrim:
                                "「加载潜空间」节点设相同序号即可对应加载。"}),
                 "保存到本地": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "开启时将裁剪后的潜空间保存到本地文件，关闭时"
-                               "仅输出不生成文件。不影响潜空间输出端口。"}),
+                    "tooltip": "开启时将交付潜空间的尾段（长度 = "
+                               "max(裁剪帧数, 保存尾部长度)）保存到本地文件，"
+                               "关闭时仅输出不生成文件。不影响潜空间输出"
+                               "端口。"}),
                 "存储位置": ("STRING", {
                     "default": "H3-Mubu",
                     "tooltip": "保存在 ComfyUI 输出文件夹下的子目录名。"
                                "「加载潜空间」节点使用相同的存储位置即可"
                                "对应加载。"}),
+                "保存尾部长度": (["17", "34", "51", "68"], {
+                    "default": "34",
+                    "tooltip": "保存到本地的尾段长度，与「H3 运动上下文」的"
+                               "上下文长度/音频上下文长度中的较大值保持一致"
+                               "即可（实际保存取 max(裁剪帧数, 本参数)，切点"
+                               "吸附整组边界）。片段 0（裁剪帧数=0）时靠本"
+                               "参数保证仍能保存尾部供下一片段衔接。"}),
             },
         }
 
@@ -1030,12 +1056,13 @@ class Yuan_H3MotionContextTrim:
     FUNCTION = "trim"
     OUTPUT_NODE = True
     CATEGORY = "Yuan Tool/MiniMax"
-    DESCRIPTION = ("直接在 H3 的 AV 潜空间上裁掉头部固定的帧：视频流与音频流"
-                   "同步裁切，输出仍是含视频和音频两流的 AV 潜空间，跳过解码"
-                   "再编码的往返。裁剪后的潜空间可同时保存到磁盘，供下一次"
-                   "运行的运动上下文节点加载。")
+    DESCRIPTION = ("两段式潜空间裁切：第一次按裁剪帧数（画面/音频固定窗口"
+                   "较大值）从头部整段裁掉多余部分，视频流与音频流同一时间"
+                   "切点，输出交付潜空间（片段 0 直通）；第二次从交付尾部"
+                   "切出一段保留后段保存到本地，供下一片段衔接加载。")
 
-    def trim(self, 潜空间, 裁剪帧数, 片段序号=1, 保存到本地=True, 存储位置="H3-Mubu"):
+    def trim(self, 潜空间, 裁剪帧数, 片段序号=1, 保存到本地=True, 存储位置="H3-Mubu",
+             保存尾部长度="34"):
         n = max(0, int(裁剪帧数))
         # 向下吸附到最近的整组（17 的倍数）：非整组裁切会打乱剩余潜空间的
         # VRF 相位导致闪烁；小于 17 时吸附为 0（不裁剪，原样直通）
@@ -1079,9 +1106,14 @@ class Yuan_H3MotionContextTrim:
                        else [video, audio])
         out = dict(潜空间)
         out["samples"] = new_samples
-        # 按需保存裁剪后的潜空间（关闭时跳过，不影响输出端口）
+        # 第二次裁切（按需，关闭时跳过，不影响输出端口）：在第一次裁头
+        # 结果的尾部按 max(裁剪帧数, 保存尾部长度) 再切一段，保留后段
+        # 保存到本地，供下一片段「加载潜空间 → 运动上下文」取尾部窗口；
+        # 音视频分离取窗由那边负责，本节点只做整段切片
         if 保存到本地:
-            _save_av_latent(out, 存储位置, 片段序号)
+            tail_len = max(n, int(保存尾部长度))
+            _save_av_latent(_tail_portion_latent(out, tail_len),
+                            存储位置, 片段序号)
         return (out,)
 
 
@@ -1110,6 +1142,43 @@ def _save_av_latent(latent, 存储位置, 片段序号):
                         % (filename, int(片段序号)))
     _st_save({"video": video, "audio": audio}, path,
              metadata={"format": "h3_motion_context_av_v1"})
+
+
+def _tail_portion_latent(delivered, tail_len):
+    """从交付潜空间（已裁头）的尾部切出至多 tail_len 帧的尾段潜空间。
+
+    保存到本地的只取交付部分的「后段」而非整段：下一片段的运动上下文
+    只需要尾部窗口，文件更小、目录指纹更快。切点对齐整 VRF 组边界
+    （帧数 ≡ 0 mod 17），切出的尾段自身时序相位锚定在步 0，可被
+    「加载潜空间 → 运动上下文」正常取尾部窗口；交付帧数不足时退化为
+    保存整个交付潜空间。
+    """
+    video, audio = _streams_from_latent(delivered)[:2]
+    if video.ndim == 4:
+        video = video.unsqueeze(0)
+    if audio.ndim == 3:
+        audio = audio.unsqueeze(0)
+    total = _pixel_frames(int(video.shape[2]))
+    m = max(0, int(tail_len))
+    m -= m % 17
+    cut = total - m if 0 < m < total else 0
+    cut -= cut % 17  # 切点吸附整组边界（尾段长度随之微调，仍为可达帧数）
+    if cut <= 0:
+        return delivered
+    # cut 为 17 的倍数 → 恰有整数步覆盖，切片后尾段相位锚定在步 0
+    video_t = video[:, :, _steps_for_frames(cut):].clone()
+    audio_t = audio[..., int(round(cut * FRAME_RESCALE)):].clone()
+    # 与交付潜空间同款尾部对齐：音频步数收敛到尾段帧数 × 5/3（向上取整）
+    want = int(math.ceil((total - cut) * FRAME_RESCALE))
+    if int(audio_t.shape[-1]) > want:
+        audio_t = audio_t[..., :want]
+    samples = delivered["samples"]
+    new_samples = (NestedTensor([video_t, audio_t])
+                   if getattr(samples, "is_nested", False)
+                   else [video_t, audio_t])
+    out = dict(delivered)
+    out["samples"] = new_samples
+    return out
 
 
 def _build_load_path(存储位置):
