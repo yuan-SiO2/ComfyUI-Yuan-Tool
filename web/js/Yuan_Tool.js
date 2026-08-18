@@ -431,8 +431,9 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
     };
 }
 
-// ==================== YuanRTXVideoUpscaleH3（RTX 视频放大，resize_type 条件参数）====================
-function registerYuanRTXVideoUpscaleH3(nodeType) {
+// ==================== resize_type 条件参数（RTX 视频放大 / H3 放大通用）====================
+// 缩放方式为「按倍数缩放」时只显示 scale，为「目标尺寸」时只显示 width/height
+function registerResizeTypeConditionalWidgets(nodeType) {
     const UPSCALE_BY = "按倍数缩放";
 
     // 根据 resize_type 切换 scale / width / height 的显隐
@@ -621,7 +622,9 @@ app.registerExtension({
         } else if (nodeData.name === "Yuan_MiniMaxH3Video") {
             registerYuanMiniMaxH3Video(nodeType, buildPortMeta());
         } else if (nodeData.name === "Yuan_RTXVideoUpscaleH3") {
-            registerYuanRTXVideoUpscaleH3(nodeType);
+            registerResizeTypeConditionalWidgets(nodeType);
+        } else if (nodeData.name === "Yuan_H3Upscale3D") {
+            registerResizeTypeConditionalWidgets(nodeType);
         } else if (nodeData.name === "Yuan_H3MotionContext") {
             registerYuanH3MotionContext(nodeType);
         } else if (nodeData.name === "Yuan_H3MotionContextLoadLatent") {
