@@ -35,7 +35,7 @@ class YUAN_TXTJsonExtractor:
                     "default": 1,
                     "min": 1,
                     "step": 1,
-                    "tooltip": "对应分镜序列中的「编号」值，选择该编号的分镜。分镜序列端口整合输出 detailed_description(整体风格) + [Shot N]编号的时间段 + overall_soundscape(环境音) + non_diegetic_music(BGM)，标签与内容之间仅换行不空行；分镜「类型」含武戏时时间段不加 [Shot N] 编号、原行输出；角色道具场景端口先在时间段内容中智能匹配角色和道具档案，再根据该分镜标题智能匹配场景档案，按 角色→道具→场景 顺序输出对应档案的完整描述，整体以 retention_analysis: 开头换行输出，每条描述前加 <Picture N> 序号（从1连续编号）；角色索引/道具索引端口输出匹配到的角色/道具在对应档案中的0基序号（逗号分隔），场景索引端口输出匹配到的场景档案0基序号（未匹配为空），三者均受对应输出开关控制，关时输出空文本；索引时长端口锁定该分镜「类型」字段中的时长（如 武戏：12秒、文戏：8s，单位 s 或无单位均可）。"
+                    "tooltip": "对应分镜序列中的「编号」值，选择该编号的分镜。分镜序列端口整合输出 detailed_description(整体风格) + [Shot N]编号的时间段 + overall_soundscape(环境音) + non_diegetic_music(BGM)，标签与内容之间仅换行不空行；BGM开关关闭时 non_diegetic_music 内容输出 N/A；分镜「类型」含武戏时时间段不加 [Shot N] 编号、原行输出；角色道具场景端口先在时间段内容中智能匹配角色和道具档案，再根据该分镜标题智能匹配场景档案，按 角色→道具→场景 顺序输出对应档案的完整描述，整体以 retention_analysis: 开头换行输出，每条描述前加 <Picture N> 序号（从1连续编号）；角色索引/道具索引端口输出匹配到的角色/道具在对应档案中的0基序号（逗号分隔），场景索引端口输出匹配到的场景档案0基序号（未匹配为空），三者均受对应输出开关控制，关时输出空文本；索引时长端口锁定该分镜「类型」字段中的时长（如 武戏：12秒、文戏：8s，单位 s 或无单位均可）。"
                 }),
                 "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
                     "default": "角色档案",
@@ -61,6 +61,13 @@ class YUAN_TXTJsonExtractor:
                     "label_off": "不输出",
                     "display_name": "场景输出",
                     "tooltip": "同时控制「角色道具场景」端口中的场景描述与「场景索引」端口：开=输出，关=不输出（索引输出空文本）。"
+                }),
+                "BGM开关": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "输出",
+                    "label_off": "N/A",
+                    "display_name": "BGM输出",
+                    "tooltip": "控制「分镜序列」端口中 non_diegetic_music(BGM) 内容：开=正常输出 BGM，关=输出 N/A。"
                 }),
             },
         }
@@ -227,10 +234,11 @@ class YUAN_TXTJsonExtractor:
         return float(m.group(1))
 
     @staticmethod
-    def _build_detailed_description(整体风格, 时间段, 环境音, BGM, 类型=""):
+    def _build_detailed_description(整体风格, 时间段, 环境音, BGM, 类型="", bgm_enabled=True):
         """整合分镜序列：detailed_description(整体风格) → 时间段逐行编号[Shot N] → overall_soundscape(环境音) → non_diegetic_music(BGM)；标签与内容间仅换行不空行。
 
         类型含「武戏」时时间段不加 [Shot N] 编号，原行输出。
+        bgm_enabled=False 时 non_diegetic_music 内容输出 N/A。
         """
         if isinstance(时间段, str):
             shot_lines = 时间段.split("\n") if 时间段.strip() else []
@@ -252,7 +260,10 @@ class YUAN_TXTJsonExtractor:
         if numbered:
             blocks.append("\n\n".join(numbered))
         blocks.append("overall_soundscape:" + ("\n" + 环境音 if 环境音 else ""))
-        blocks.append("non_diegetic_music:" + ("\n" + BGM if BGM else ""))
+        if bgm_enabled:
+            blocks.append("non_diegetic_music:" + ("\n" + BGM if BGM else ""))
+        else:
+            blocks.append("non_diegetic_music:\nN/A")
         return "\n\n".join(blocks)
 
     @staticmethod
@@ -289,7 +300,7 @@ class YUAN_TXTJsonExtractor:
                 return idx
         return -1
 
-    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 角色开关=True, 道具开关=True, 场景开关=True):
+    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 角色开关=True, 道具开关=True, 场景开关=True, BGM开关=True):
         # 形参名必须与输入端口名一致（ComfyUI 按关键字传参）
         data = json
 
@@ -349,8 +360,8 @@ class YUAN_TXTJsonExtractor:
                     matched_type = str(item.get("类型", ""))
                     found_shot = True
                     break
-        # 始终输出整合格式；索引未匹配到分镜时，时间段/环境音/BGM 留空，不报错
-        分镜序列整合 = self._build_detailed_description(整体风格, 时间段, 环境音, BGM, matched_type)
+        # 始终输出整合格式；索引未匹配到分镜时，时间段/环境音/BGM 留空，不报错；BGM开关关闭时 non_diegetic_music 输出 N/A
+        分镜序列整合 = self._build_detailed_description(整体风格, 时间段, 环境音, BGM, matched_type, BGM开关)
 
         # 角色道具场景：未找到分镜输出空；否则按 角色→道具→场景 顺序输出档案完整描述
         # 角色/道具/场景索引：匹配到的档案 0 基序号（角色/道具逗号分隔，场景单个），未匹配为空
