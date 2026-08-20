@@ -227,9 +227,12 @@ function registerYuanTool(nodeType, portMeta) {
 // ==================== Yuan_MiniMaxH3Video（模式切换 + 递进显示动态端口）====================
 // 与后端 MiniMax_H3.py 中的常量保持一致
 const MINIMAX_MODE_REF = "参考图生视频";
+const MINIMAX_MODE_GUIDE = "数字人";
 
 const MINIMAX_I2V_INPUTS = ["first_frame", "last_frame"];
 const MINIMAX_REF_BASE_INPUTS = ["audio_vae", "ref_images"];  // ref_images：图像列表端口（多图 batch）
+// 数字人模式：仅引导端口（audio_vae 与参考模式共用），不显示首/尾帧
+const MINIMAX_GUIDE_INPUTS = ["audio_vae", "guide_image", "guide_audio"];
 // 递进组：前一端口连接后才显示下一个，最多 3 个
 const MINIMAX_REF_CHAINS = [
     ["ref_video_1", "ref_video_2", "ref_video_3"],
@@ -240,6 +243,7 @@ const MINIMAX_ALL_OPTIONAL = [
     ...MINIMAX_I2V_INPUTS,
     ...MINIMAX_REF_BASE_INPUTS,
     ...MINIMAX_REF_CHAINS.flat(),
+    ...MINIMAX_GUIDE_INPUTS,
 ];
 
 const MINIMAX_PORT_TYPES = {
@@ -247,6 +251,8 @@ const MINIMAX_PORT_TYPES = {
     last_frame: "IMAGE",
     audio_vae: "VAE",
     ref_images: "IMAGE",
+    guide_image: "IMAGE",
+    guide_audio: "AUDIO",
     ref_video_1: "IMAGE", ref_video_2: "IMAGE", ref_video_3: "IMAGE",
     ref_video_audio_1: "AUDIO", ref_video_audio_2: "AUDIO", ref_video_audio_3: "AUDIO",
     ref_audio_1: "AUDIO", ref_audio_2: "AUDIO", ref_audio_3: "AUDIO",
@@ -288,6 +294,7 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
             try {
                 const modeWidget = self.widgets.find(w => w.name === "mode");
                 const isRef = !!(modeWidget && modeWidget.value === MINIMAX_MODE_REF);
+                const isGuide = !!(modeWidget && modeWidget.value === MINIMAX_MODE_GUIDE);
 
                 // 计算期望端口集合（有序）
                 const desiredNames = [];
@@ -298,6 +305,8 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
                             if (chainVisible(chain, i)) desiredNames.push(chain[i]);
                         }
                     }
+                } else if (isGuide) {
+                    desiredNames.push(...MINIMAX_GUIDE_INPUTS);
                 } else {
                     desiredNames.push(...MINIMAX_I2V_INPUTS);
                 }
@@ -369,9 +378,11 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
                     }
                 }
 
-                // 第六步：参考图尺寸 widget 显隐（只隐藏不删除，避免 widgets_values 索引错位）
+                // 第六步：参考图尺寸 / 锚定帧 widget 显隐（只隐藏不删除，避免 widgets_values 索引错位）
                 const sizeWidget = self.widgets.find(w => w.name === "ref_image_size");
                 if (sizeWidget) sizeWidget.hidden = !isRef;
+                const guideIdxWidget = self.widgets.find(w => w.name === "guide_frame_idx");
+                if (guideIdxWidget) guideIdxWidget.hidden = !isGuide;
 
                 // 第七步：保持当前宽度不变，只更新高度
                 const currentWidth = self.size ? self.size[0] : self.computeSize()[0];
