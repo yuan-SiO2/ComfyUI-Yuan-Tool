@@ -7,21 +7,90 @@ class AnyType(str):
         return False
 
 
+# ==== 台词保护：引号对常量与掩码构建（JSON提取 / 文本批量替换 / 分镜角色替换 共用） ====
+
+# opening, closing, rank（秩：同秩才能配成一对，避免不同引号互配）
+# 包含 ASCII 半角引号、中文弯引号（""/''）、中文直角引号「」/『』
+QUOTE_PAIRS = [
+    ('"',  '"',  1),
+    ("'",  "'",  2),
+    ("“",  "”",  3),
+    ("‘",  "’",  4),
+    ("「", "」", 5),
+    ("『", "』", 6),
+]
+
+
+def _build_quote_protect_mask(text):
+    """返回与 text 等长的 bool 列表：True 表示该位置在引号对内部（台词保护，不替换）；False 表示可替换。"""
+    n = len(text)
+    mask = [False] * n
+    if n == 0:
+        return mask
+
+    opening_map = {}
+    closing_map = {}
+    for op, cl, rk in QUOTE_PAIRS:
+        opening_map.setdefault(op, []).append((cl, rk))
+        closing_map.setdefault(cl, []).append((op, rk))
+
+    # 栈：存 (rank, closing_char, start_idx)
+    stack = []
+    i = 0
+    while i < n:
+        ch = text[i]
+        # 尝试作为 opening：半角引号 " / ' 既可开也可关，同 rank 未闭合栈顶在则作 closing（优先关闭）
+        if ch in opening_map:
+            if ch in ('"', "'"):
+                expected_rank = 1 if ch == '"' else 2
+                if stack and stack[-1][0] == expected_rank:
+                    _rank, _cl, start = stack.pop()
+                    # 把 [start, i] 全部标记为台词内部（含引号自身）
+                    for k in range(start, i + 1):
+                        mask[k] = True
+                    i += 1
+                    continue
+            (closing_char, rank) = opening_map[ch][0]
+            stack.append((rank, closing_char, i))
+            i += 1
+            continue
+        # 尝试作为 closing：匹配最近未闭合、同 rank 的 opening
+        if ch in closing_map:
+            found = None
+            for si in range(len(stack) - 1, -1, -1):
+                if stack[si][1] == ch:
+                    found = si
+                    break
+            if found is not None:
+                _rank, _cl, start = stack.pop(found)
+                for k in range(start, i + 1):
+                    mask[k] = True
+                i += 1
+                continue
+        # 普通字符或找不到对应开引号的闭引号：跳过
+        i += 1
+    # 文本结束后仍留在栈中的未闭合开引号：不标记（按正常文本处理）
+    return mask
+
+
+# <d>...</d> 台词标签（与引号保护叠加，JSON提取 / 分镜角色替换 共用）
+DIALOGUE_TAG_RE = re.compile(r'<d>.*?</d>', re.DOTALL)
+
+
+def _build_dialogue_protect_mask(text):
+    """完整台词保护掩码：引号对内部 + <d>...</d> 标签内部（含标签自身）。"""
+    mask = _build_quote_protect_mask(text)
+    for m in DIALOGUE_TAG_RE.finditer(text):
+        for k in range(m.start(), m.end()):
+            mask[k] = True
+    return mask
+
+
 # ==== JSON提取：按端口名提取对应字段，全部输出字符串 ====
 
 class YUAN_TXTJsonExtractor:
     # 输出端口名
     OUTPUT_NAMES = ("整体风格", "档案", "档案编码", "分镜序列", "角色道具场景", "角色索引", "道具索引", "场景索引", "索引时长", "场景判断")
-
-    # 台词保护引号对（与文本批量替换节点一致）
-    QUOTE_PAIRS = [
-        ('"',  '"',  1),
-        ("'",  "'",  2),
-        ("“",  "”",  3),
-        ("‘",  "’",  4),
-        ("「", "」", 5),
-        ("『", "』", 6),
-    ]
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -35,7 +104,7 @@ class YUAN_TXTJsonExtractor:
                     "default": 1,
                     "min": 1,
                     "step": 1,
-                    "tooltip": "对应分镜序列中的「编号」值，选择该编号的分镜。分镜序列端口整合输出 detailed_description(整体风格) + [Shot N]编号的时间段 + overall_soundscape(环境音) + non_diegetic_music(BGM)，标签与内容之间仅换行不空行；BGM开关关闭时 non_diegetic_music 内容输出 N/A；分镜「类型」含武戏时时间段不加 [Shot N] 编号、原行输出；角色道具场景端口先在时间段内容中智能匹配角色和道具档案，再根据该分镜标题智能匹配场景档案，按 角色→道具→场景 顺序输出对应档案的完整描述，整体以 retention_analysis: 开头换行输出，每条描述前加 <Picture N> 序号（从1连续编号）；角色索引/道具索引端口输出匹配到的角色/道具在对应档案中的0基序号（逗号分隔），场景索引端口输出匹配到的场景档案0基序号（未匹配为空），三者均受对应输出开关控制，关时输出空文本；索引时长端口锁定该分镜「类型」字段中的时长（如 武戏：12秒、文戏：8s，单位 s 或无单位均可）。"
+                    "tooltip": "对应分镜序列中的「编号」值，选择该编号的分镜。分镜序列端口整合输出 detailed_description(整体风格) + [Shot N]编号的时间段 + overall_soundscape(环境音) + non_diegetic_music(BGM)，标签与内容之间仅换行不空行；BGM开关关闭时 non_diegetic_music 内容输出 N/A；分镜「类型」含武戏时时间段不加 [Shot N] 编号、原行输出；角色道具场景端口先在时间段内容中智能匹配角色和道具档案（台词保护：引号对与 <d>...</d> 标签内出现的名称不匹配、不提取），再根据该分镜标题智能匹配场景档案，按 角色→道具→场景 顺序输出对应档案的完整描述，整体以 retention_analysis: 开头换行输出，每条描述前加 <Picture N> 序号（从1连续编号）；角色索引/道具索引端口输出匹配到的角色/道具在对应档案中的0基序号（逗号分隔），场景索引端口输出匹配到的场景档案0基序号（未匹配为空），三者均受对应输出开关控制，关时输出空文本；索引时长端口锁定该分镜「类型」字段中的时长（如 武戏：12秒、文戏：8s，单位 s 或无单位均可）。"
                 }),
                 "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
                     "default": "角色档案",
@@ -108,60 +177,15 @@ class YUAN_TXTJsonExtractor:
         return s.strip()
 
     @staticmethod
-    def _build_protect_mask(text):
-        """构建台词保护掩码：引号对内部标记为 True（不参与索引匹配）。"""
-        n = len(text)
-        mask = [False] * n
-        if n == 0:
-            return mask
-
-        opening_map = {}
-        closing_map = {}
-        for op, cl, rk in YUAN_TXTJsonExtractor.QUOTE_PAIRS:
-            opening_map.setdefault(op, []).append((cl, rk))
-            closing_map.setdefault(cl, []).append((op, rk))
-
-        stack = []
-        i = 0
-        while i < n:
-            ch = text[i]
-            if ch in opening_map:
-                if ch in ('"', "'"):
-                    expected_rank = 1 if ch == '"' else 2
-                    if stack and stack[-1][0] == expected_rank:
-                        _rank, _cl, start = stack.pop()
-                        for k in range(start, i + 1):
-                            mask[k] = True
-                        i += 1
-                        continue
-                (closing_char, rank) = opening_map[ch][0]
-                stack.append((rank, closing_char, i))
-                i += 1
-                continue
-            if ch in closing_map:
-                found = None
-                for si in range(len(stack) - 1, -1, -1):
-                    if stack[si][1] == ch:
-                        found = si
-                        break
-                if found is not None:
-                    _rank, _cl, start = stack.pop(found)
-                    for k in range(start, i + 1):
-                        mask[k] = True
-                    i += 1
-                    continue
-                i += 1
-                continue
-            i += 1
-        return mask
-
-    @staticmethod
     def _find_appearing_indices(text, char_names, prop_names):
-        """在非保护区域查找出现的角色和道具（最长匹配优先，避免子串误匹配），返回按首次出现位置排序的 (角色索引列表, 道具索引列表)。"""
+        """在非台词区域查找出现的角色和道具（最长匹配优先，避免子串误匹配），返回按首次出现位置排序的 (角色索引列表, 道具索引列表)。
+
+        台词保护：引号对与 <d>...</d> 标签内部出现的名称不匹配、不提取。
+        """
         if not text:
             return [], []
 
-        mask = YUAN_TXTJsonExtractor._build_protect_mask(text)
+        mask = _build_dialogue_protect_mask(text)
         n = len(text)
 
         # 收集所有名称：(name, type, index, length)
@@ -613,18 +637,6 @@ class YUAN_TXTListNumber:
 
 class YUAN_TXTReplace:
 
-    # 台词（说话）引号对：按顺序匹配，遇到 opening 标记进入"台词内部"，遇到同类型的 closing 标记退出
-    # 包含 ASCII 半角引号、中文弯引号（""/''）、中文直角引号「」/『』
-    QUOTE_PAIRS = [
-        # opening, closing, rank（秩：同秩才能配成一对，用于避免不同引号互配）
-        ('"',  '"',  1),
-        ("'",  "'",  2),
-        ("“",  "”",  3),
-        ("‘",  "’",  4),
-        ("「", "」", 5),
-        ("『", "』", 6),
-    ]
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -665,65 +677,6 @@ class YUAN_TXTReplace:
     OUTPUT_NODE = True
 
     @staticmethod
-    def _build_protect_mask(text):
-        """返回与 text 等长的 bool 列表：True 表示该位置在引号对内部（台词保护，不替换）；False 表示可替换。"""
-        n = len(text)
-        mask = [False] * n
-        if n == 0:
-            return mask
-
-        # opening_map['"'] = [(closing, rank)]
-        opening_map = {}
-        closing_map = {}
-        for op, cl, rk in YUAN_TXTReplace.QUOTE_PAIRS:
-            opening_map.setdefault(op, []).append((cl, rk))
-            closing_map.setdefault(cl, []).append((op, rk))
-
-        # 栈：存 (rank, closing_char, start_idx)
-        stack = []
-        i = 0
-        while i < n:
-            ch = text[i]
-            # 尝试作为 opening：只匹配一种（取列表第一个，即秩最高的映射；QUOTE_PAIRS 已按用户期望序唯一定义，每个 opening 唯一）
-            if ch in opening_map:
-                # 半角引号 " / ' 既可开也可关：存在同 rank 未闭合栈顶则作 closing（优先关闭），否则作 opening
-                if ch in ('"', "'"):
-                    expected_rank = 1 if ch == '"' else 2
-                    if stack and stack[-1][0] == expected_rank:
-                        _rank, _cl, start = stack.pop()
-                        # 把 [start, i] 全部标记为台词内部（含引号自身）
-                        for k in range(start, i + 1):
-                            mask[k] = True
-                        i += 1
-                        continue
-                # 其他引号：直接开
-                (closing_char, rank) = opening_map[ch][0]
-                stack.append((rank, closing_char, i))
-                i += 1
-                continue
-            # 尝试作为 closing
-            if ch in closing_map:
-                found = None
-                # 匹配最近未闭合、同 rank 的 opening
-                for si in range(len(stack) - 1, -1, -1):
-                    if stack[si][1] == ch:
-                        found = si
-                        break
-                if found is not None:
-                    _rank, _cl, start = stack.pop(found)
-                    for k in range(start, i + 1):
-                        mask[k] = True
-                    i += 1
-                    continue
-                # 找不到对应开引号的闭引号：普通字符，跳过
-                i += 1
-                continue
-            i += 1
-        # 文本结束后仍留在栈中的未闭合开引号：不标记（保持 False，按正常文本处理）
-
-        return mask
-
-    @staticmethod
     def _replace_with_protect(text, find_str, replace_str, mask):
         """仅在 mask[i]==False 的位置允许替换 find_str -> replace_str；find_str 任一字符被保护则整段跳过。"""
         if not find_str:
@@ -760,7 +713,7 @@ class YUAN_TXTReplace:
         # 台词开关：mask 作为开关标志（替换过程中每次重建掩码）
         mask = None
         if 台词开关:
-            mask = YUAN_TXTReplace._build_protect_mask(text)
+            mask = _build_quote_protect_mask(text)
 
         # 配对查找/替换，过滤空查找串
         pairs = []
@@ -778,7 +731,7 @@ class YUAN_TXTReplace:
         for find_str, replace_str in pairs:
             if mask is not None:
                 result = YUAN_TXTReplace._replace_with_protect(result, find_str, replace_str,
-                                                                YUAN_TXTReplace._build_protect_mask(result))
+                                                                _build_quote_protect_mask(result))
             else:
                 result = result.replace(find_str, replace_str)
 
@@ -789,12 +742,29 @@ class YUAN_TXTReplace:
 
 class YUAN_TXTShotReplace:
 
-    # <d>...</d> 台词标签（与引号保护叠加）
-    DIALOGUE_TAG_RE = re.compile(r'<d>.*?</d>', re.DOTALL)
-
-    # 台词归属边界标点：名称前必须是句首或句末标点/逗号/空白之后
-    # （「甲对乙说」中的乙由其前的"对"字非边界挡住；「甲转身，低声说」由引导句不含标点挡住，均不会误归属）
+    # 台词归属边界标点：说话者前必须是句首/句末标点/逗号/空白边界，或紧跟 </d> 之后
+    # （「甲对乙说」中的乙由其前的"对"字非边界挡住；「甲看向乙，乙说道」中的乙由逗号边界放行、
+    #   归属竞争时离冒号最近者胜；</d>台词结束后紧跟的下一个说话者由 </d> 边界放行，
+    #   而「盯住<Picture 2>急道」中的 <Picture 2> 前是标签结束符">"而非 </d>，不会被放行误归属）
     BELONG_BOUNDARY = '。！？!?\n；;，,'
+
+    @staticmethod
+    def _build_belong_pattern(name):
+        """构建台词归属匹配 pattern：`说话者(<Audio M>)?+引导句+冒号+<d>台词`。
+
+        说话者可为名称或 <Picture N> 标记；可选的已有 <Audio M>（输出重入时）会被跳过并重写新编号。
+        引导句允许逗号/顿号等多动作描述（如「在蒲团前刹住脚步，胸口起伏，仰头急道」），
+        但不得跨句（。！？!?；;换行）、跨冒号（天然不会吞并其他台词）。
+        """
+        boundary = YUAN_TXTShotReplace.BELONG_BOUNDARY
+        return re.compile(
+            r'(?:(?<=</d>)|(?<![^\s' + boundary + r']))'  # 说话者前边界：句末标点/逗号/空白 或 </d> 之后
+            r'(' + re.escape(name) + r')'        # 组1：说话者（名称或 <Picture N>）
+            r'(?:<Audio \d+>)?'                  # 可选：已有的 <Audio M>（重入时跳过，替换时重写）
+            r'([^。！？!?；;\n\r：:]*?)'          # 组2：引导句（允许逗号顿号，不得跨句/跨冒号）
+            r'[：:]\s*'                          # 冒号+可选空白
+            r'(?=<d>)'                           # 紧跟台词标签
+        )
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -809,7 +779,9 @@ class YUAN_TXTShotReplace:
                     "forceInput": True,
                     "multiline": True,
                     "tooltip": "接入 JSON提取节点的「分镜序列」输出。文本中出现的角色/道具/场景名称将被替换为对应的 <Picture N> 标记（最长匹配优先），其余内容原样保留。\n"
-                               "【台词归属特殊规则】名称后紧跟引导句+冒号+<d>台词时（如「沈惊鸿低声说：<d>…</d>」），名称替换为台词归属代号 (SN)（如「(S1)低声说：<d>…</d>」）而非 <Picture N>。"
+                               "【台词归属特殊规则】说话者（名称或 <Picture N> 标记）后跟引导句+冒号+<d>台词时（如「沈惊鸿低声说：<d>…</d>」「<Picture 1>刹住脚步，胸口起伏，仰头急道：<d>…</d>」，引导句可含逗号等多动作描述），说话者替换为 <Picture N> 后追加 <Audio M> 音频标记；同一台词有多个候选说话者时（如「甲看向乙，乙说道：」）取离冒号最近者为说话者。\n"
+                               "【兜底追溯】标准规则未命中时（说话者被「将/把」等字挡住，如「炽红火光将<Picture 4>…发抖：<d>…</d>」；或承前省略主语「他怒道：」），从冒号往前追溯最近的未保护 <Picture N> 标记或名称作为说话者（引号内/<d>内候选跳过）。\n"
+                               "<Audio M> 按说话角色在分镜序列中首次说话的出现顺序编号：第一个说话的角色 <Audio 1>，第二个 <Audio 2>，第三个 <Audio 3>，最多三个。"
                 }),
                 "台词开关": ("BOOLEAN", {
                     "default": True,
@@ -825,20 +797,33 @@ class YUAN_TXTShotReplace:
                 }),
                 "参考音频开关": ("BOOLEAN", {
                     "default": True,
-                    "label_on": "输出(SN)",
+                    "label_on": "输出<Audio M>",
                     "label_off": "输出<Picture N>",
                     "display_name": "参考音频",
                     "tooltip": "【参考音频】\n"
-                               "开启后，台词归属特殊规则生效：`名称+引导句+：<d>台词` 中名称替换为归属代号 (SN)"
-                               "（如「沈惊鸿低声说：<d>…</d>」→「(S1)低声说：<d>…</d>」），用于关联参考音频。\n"
-                               "关闭后，不做 (SN) 归属替换，名称走普通替换输出 <Picture N>"
-                               "（如「<Picture 1>低声说：<d>…</d>」）。",
+                               "开启后，台词归属特殊规则生效：`说话者+引导句+：<d>台词` 中说话者替换为 `<Picture N><Audio M>`\n"
+                               "（如「沈惊鸿低声说：<d>…</d>」→「<Picture 1><Audio 1>低声说：<d>…</d>」），用于关联参考音频。\n"
+                               "引导句允许逗号等多动作描述（如「刹住脚步，胸口起伏，仰头急道：」）；同一台词有多个候选说话者时（如「甲看向乙，乙说道：」）取离冒号最近者为说话者。\n"
+                               "标准规则未命中时兜底追溯：从冒号往前追溯最近的未保护 <Picture N> 标记或名称作为说话者（说话者被「将/把」等字挡住或承前省略主语时生效，引号内/<d>内候选跳过）。\n"
+                               "<Audio M> 按说话角色首次说话的出现顺序编号：第一个说话的角色 <Audio 1>，第二个 <Audio 2>，第三个 <Audio 3>，最多三个。\n"
+                               "超过三个时不报错，第4个及以后的说话角色仍正常替换为 <Picture N>，只是不追加 <Audio M> 标记。\n"
+                               "关闭后，不追加 <Audio M>，名称走普通替换输出 <Picture N>"
+                               "（如「<Picture 1>低声说：<d>…</d>」），音色索引输出为空。",
+                }),
+                "角色索引": ("STRING", {
+                    "forceInput": True,
+                    "multiline": True,
+                    "tooltip": "接入 JSON提取节点的「角色索引」输出。逗号分隔的数字串，第 N 个数字对应 <Picture N> 的音色索引，\n"
+                               "如「0,4,1」：0 对应 <Picture 1>、4 对应 <Picture 2>、1 对应 <Picture 3>。\n"
+                               "【音色索引输出】按说话顺序重新排列：只输出实际说话的角色对应的索引，未说话的角色不输出。\n"
+                               "如 <Picture 3> 第一个说话、<Picture 2> 第二个说话、<Picture 1> 未说话，则音色索引输出「1,4」。\n"
+                               "未连线或为空时，音色索引输出为空（不影响 <Audio M> 标记的追加）。",
                 }),
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("分镜序列",)
+    RETURN_TYPES = ("STRING", "STRING",)
+    RETURN_NAMES = ("分镜序列", "音色索引",)
     FUNCTION = "replace_shot_names"
     CATEGORY = "Yuan Tool/文本"
     OUTPUT_NODE = True
@@ -870,60 +855,144 @@ class YUAN_TXTShotReplace:
 
     @staticmethod
     def _build_protect_mask(text):
-        """台词保护掩码：引号对内部（复用文本批量替换）+ <d>...</d> 标签内部（含标签自身）。"""
-        mask = YUAN_TXTReplace._build_protect_mask(text)
-        for m in YUAN_TXTShotReplace.DIALOGUE_TAG_RE.finditer(text):
-            for k in range(m.start(), m.end()):
-                mask[k] = True
-        return mask
+        """台词保护掩码：引号对内部 + <d>...</d> 标签内部（含标签自身），调用模块级共享实现。"""
+        return _build_dialogue_protect_mask(text)
 
     @staticmethod
-    def _picture_tag_to_sn(tag):
-        """<Picture N> → (SN)；非标准标记返回 None。"""
-        m = re.match(r'^<Picture (\d+)>$', tag)
-        return f"(S{m.group(1)})" if m else None
+    def _parse_voice_indices(text):
+        """解析角色索引串（如「0,4,1」）为整数列表；容错中文逗号/空格/非法项，返回 []。"""
+        if not text:
+            return []
+        values = []
+        for part in re.split(r'[,，]', str(text)):
+            part = part.strip()
+            if part and re.fullmatch(r'-?\d+', part):
+                values.append(int(part))
+        return values
 
     @staticmethod
-    def _belong_replace(text, name, sn, mask):
-        """台词归属替换：`名称+引导句+冒号+<d>台词` → `(SN)+引导句+冒号+<d>台词`。
+    def _scan_speaking_order(text, pairs, protect_enabled):
+        """扫描分镜序列，按说话角色首次说话的出现顺序分配 <Audio M> 编号（最多3个）。
 
-        - 名称前必须是句首或句末标点/逗号/空白边界（BELONG_BOUNDARY），避免「甲对乙说」中的乙被误归属（乙前的"对"字非边界）
-        - 引导句不含任何标点（如「低声说」「沉声道」「对柳如烟说」），含逗号/顿号等则跳过特殊规则走普通替换
-        - mask 非空时（台词保护开启），名称处于被保护位置则保留原文
+        说话的两种形式都识别（只有说话的才有 <Audio M>）：
+        - 名称形式：`名称+引导句+冒号+<d>台词`（如「沈惊鸿低声道：<d>…</d>」）
+        - 标记形式：`<Picture N>+引导句+冒号+<d>台词`（如「<Picture 1>低声道：<d>…</d>」）
+
+        归属竞争：同一台词（冒号+<d>）有多个候选说话者时（如「甲看向乙，乙说道：」中，
+        甲的引导句「看向乙，乙说道」与乙的引导句「说道」同时命中），取离冒号最近者；
+        起点相同时取名称更长者（防「林」抢先于「林小雨」）。
+
+        兜底追溯：标准规则未命中的台词（说话者被「将/把/被」等非边界字挡住，
+        如「炽红火光将<Picture 4>半边脸映得凶厉，…发抖：<d>」；或承前省略主语「他怒道：」），
+        从冒号往前追溯最近的未被保护的 <Picture N> 标记或名称作为说话者
+        （不限句界；处于引号内/<d>内的候选跳过继续往前；无候选则该台词无归属）。
+
+        返回 (audio_by_tag, speaking_tags, winners)：
+        - audio_by_tag：{<Picture N> 标记: "<Audio M>"}；超过3个不同说话角色的部分不分配
+        - speaking_tags：[<Picture N> 标记...] 按 <Audio 1/2/3> 分配顺序（最多3个），用于音色索引输出
+        - winners：[(台词目标位置, 替换起点, 替换终点, <Picture N> 标记)] 按台词出现顺序，
+          替换区间 [起点, 终点) 覆盖说话者及已有 <Audio M>（重入时重写），用于位置化替换
+
+        - 同一角色（同一 <Picture N>）无论以名称还是标记形式说话，只按首次出现分配一个编号
+        - 台词保护开启时，处于被保护位置（引号内/<d>内）的不算说话
         """
-        boundary = YUAN_TXTShotReplace.BELONG_BOUNDARY
-        pattern = re.compile(
-            r'(?<![^\s' + boundary + r'])'      # 名称前边界：句首/句末标点/空白
-            r'(' + re.escape(name) + r')'        # 组1：名称
-            r'[^' + boundary + r'，,、：:]*?'    # 引导句（不含任何标点，非贪婪）
-            r'[：:]\s*'                          # 冒号+可选空白
-            r'(?=<d>)'                           # 紧跟台词标签
-        )
+        mask = YUAN_TXTShotReplace._build_protect_mask(text) if protect_enabled else None
+        # 待匹配的「说话者」形式：名称 + <Picture N> 标记（去重）
+        forms = []
+        for name, tag in pairs:
+            forms.append((name, tag))
+        for _name, tag in pairs:
+            if (tag, tag) not in forms:
+                forms.append((tag, tag))
 
-        def repl(m):
-            if mask is not None:
-                for k in range(m.start(1), m.end(1)):
-                    if mask[k]:
-                        return m.group(0)
-            return sn + m.group(0)[len(name):]
+        # 收集所有候选命中：(台词目标位置, 说话者起点, 说话者终点, 替换终点, 标记)
+        hits = []
+        for form, tag in forms:
+            for m in YUAN_TXTShotReplace._build_belong_pattern(form).finditer(text):
+                if mask is not None:
+                    if any(mask[k] for k in range(m.start(1), m.end(1))):
+                        continue
+                hits.append((m.end(), m.start(1), m.end(1), m.start(2), tag))
+        # 同一台词目标的候选者竞争：离冒号最近（起点最大）者胜，起点相同取名称更长者
+        by_target = {}
+        for end, s1, e1, s2, tag in hits:
+            cur = by_target.get(end)
+            if cur is None or (s1, e1) > (cur[1], cur[2]):
+                by_target[end] = (end, s1, e1, s2, tag)
 
-        return pattern.sub(repl, text)
+        # 兜底追溯：标准规则未命中的台词目标，从冒号往前追溯最近的未保护候选
+        # 候选 pattern 含可选的已有 <Audio M>（重入时替换区间覆盖、重写编号）
+        backtrack_pats = [
+            (re.compile(re.escape(form) + r'(?:<Audio \d+>)?'), tag)
+            for form, tag in forms
+        ]
+        for m in re.finditer(r'[：:]\s*(?=<d>)', text):
+            target = m.end()
+            if target in by_target:
+                continue
+            best = None  # (起点, 终点, 标记)
+            for pat, tag in backtrack_pats:
+                for bm in pat.finditer(text, 0, target):
+                    s, e = bm.start(), bm.end()
+                    if mask is not None and any(mask[k] for k in range(s, e)):
+                        continue  # 引号内/<d>内的候选跳过，继续往前追溯
+                    if best is None or (s, e) > (best[0], best[1]):
+                        best = (s, e, tag)
+            if best is not None:
+                by_target[target] = (target, best[0], best[1], best[1], best[2])
 
-    def replace_shot_names(self, 角色道具场景, 分镜序列, 台词开关, 参考音频开关):
+        winners = sorted(by_target.values(), key=lambda x: x[0])
+
+        audio_by_tag = {}
+        speaking_tags = []
+        next_num = 1
+        for _end, _s1, _e1, _s2, tag in winners:
+            if tag not in audio_by_tag:
+                if next_num <= 3:
+                    audio_by_tag[tag] = f"<Audio {next_num}>"
+                    speaking_tags.append(tag)
+                    next_num += 1
+        return audio_by_tag, speaking_tags, winners
+
+    def replace_shot_names(self, 角色道具场景, 分镜序列, 台词开关, 参考音频开关, 角色索引):
         pairs = self._parse_picture_names(角色道具场景 or "")
 
         # 按名称长度降序排序（最长匹配优先，避免短名误替换长名中的子串）
         pairs.sort(key=lambda x: -len(x[0]))
 
         result = 分镜序列 or ""
+        音色索引 = ""
 
-        # 特殊规则：台词归属替换 名称+引导句+：<d> → (SN)+引导句+：<d>（参考音频开关关闭时跳过，走普通 <Picture N> 替换）
+        # 特殊规则：只有说话的角色才有 <Audio M>（最多3个，按首次说话顺序编号）
+        # 两种说话形式都处理：名称+引导句+：<d> 与 <Picture N>+引导句+：<d>
+        # 参考音频开关关闭时跳过，走普通 <Picture N> 替换
         if 参考音频开关:
-            for name, tag in pairs:
-                sn = self._picture_tag_to_sn(tag)
-                if sn:
-                    mask = self._build_protect_mask(result) if 台词开关 else None
-                    result = self._belong_replace(result, name, sn, mask)
+            audio_by_tag, speaking_tags, winners = self._scan_speaking_order(result, pairs, 台词开关)
+            # 位置化替换（从右往左，避免位置偏移）：说话者及已有 <Audio M> → <Picture N><Audio M>
+            # 追溯命中的区间可能与标准命中的区间重叠（同一说话者先标准命中、后句承前省略又追溯到它），
+            # 同角色同标记，重叠区间跳过即可（内容一致，二次替换反而错位）
+            replaced_ranges = []
+            for _end, s1, _e1, s2, tag in sorted(winners, key=lambda x: -x[0]):
+                audio = audio_by_tag.get(tag)
+                if audio:
+                    if any(s1 < re_ and s2 > rs for rs, re_ in replaced_ranges):
+                        continue
+                    result = result[:s1] + tag + audio + result[s2:]
+                    replaced_ranges.append((s1, s2))
+
+            # 音色索引：按说话顺序（<Audio 1/2/3> 分配顺序）取各角色 <Picture N> 对应的角色索引值
+            # （第 N 个数字对应 <Picture N>）；未说话的角色不输出，索引越界的跳过
+            if speaking_tags:
+                indices = self._parse_voice_indices(角色索引)
+                if indices:
+                    values = []
+                    for tag in speaking_tags:
+                        m = re.match(r'^<Picture (\d+)>$', tag)
+                        if m:
+                            n = int(m.group(1))
+                            if 1 <= n <= len(indices):
+                                values.append(str(indices[n - 1]))
+                    音色索引 = ",".join(values)
 
         # 普通替换：名称 → <Picture N>
         for name, tag in pairs:
@@ -933,7 +1002,7 @@ class YUAN_TXTShotReplace:
             else:
                 result = result.replace(name, tag)
 
-        return (result,)
+        return (result, 音色索引)
 
 
 # ==== 文本处理（分段） ====

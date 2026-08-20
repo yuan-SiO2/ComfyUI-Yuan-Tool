@@ -1431,10 +1431,6 @@ class YuanCLIPTimeline:
                     "default": True,
                     "tooltip": "开启则使用时间轴运动引导（IC-LoRA 视频分段），关闭则忽略。"
                 }),
-                "音频修复": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "是否用生成的音频对音轨中的空白间隙进行修复。"
-                }),
                 "覆盖音频": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "使用 IC-LoRA 视频的音频，而非使用音轨。"
@@ -1492,7 +1488,7 @@ class YuanCLIPTimeline:
                         引导强度="", 起始帧=0,
                         自定义宽度=0, 自定义高度=0, 缩放方式="maintain aspect ratio",
                         整除数=32, 图像压缩=0, 使用自定义音频=False,
-                        使用自定义运动=True, 音频修复=True, 覆盖音频=False,
+                        使用自定义运动=True, 覆盖音频=False,
                         段落图像=None,
                         运动图像=None,
                         运动图像帧数=16,

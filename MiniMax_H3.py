@@ -1,6 +1,7 @@
-"""MiniMax H3 节点（汉化版）：图生视频 / 参考图生视频，构建 AV 联合潜空间与任务条件。
+"""MiniMax H3 节点（汉化版）：图生视频 / 参考图生视频 / 数字人，构建 AV 联合潜空间与任务条件。
 
-复刻自 comfy_extras/nodes_minimax_h3.py，合并为单个节点 Yuan_MiniMaxH3Video，
+复刻自 comfy_extras/nodes_minimax_h3.py（MiniMaxH3ImageToVideo /
+MiniMaxH3ReferenceToVideo / MiniMaxH3AddGuide），合并为单个节点 Yuan_MiniMaxH3Video，
 通过"模式"下拉框切换，node_id 加 "Yuan_" 前缀避免与原生节点冲突。
 """
 
@@ -15,6 +16,12 @@ import comfy.nested_tensor
 import comfy.utils
 import node_helpers
 
+try:
+    from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
+except Exception:  # 旧版 ComfyUI 无 H3 模型模块时用相同数值兜底
+    FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+    FRAME_RESCALE = 5.0 / 3.0
+
 CANVAS_MULTIPLE = 32
 BASE_SHORT_EDGE = 768
 MAX_PIXELS = 768 * 1344
@@ -28,6 +35,7 @@ REF_AUDIO_PORTS = 3   # 参考音频最大数量
 
 MODE_IMAGE_TO_VIDEO = "图生视频"
 MODE_REFERENCE = "参考图生视频"
+MODE_GUIDE = "数字人"
 
 
 def align_frame_count(n):
@@ -86,11 +94,44 @@ def _encode_ref_audio(audio_vae, audio):
     return z, z.shape[-1]
 
 
+def _is_empty_audio(audio, audio_vae=None):
+    """空音频检测：未接入、无有效采样，或时长不足一个音频 latent 帧（800 采样≈25ms@32kHz）。
+
+    分流节点在列表不足时会输出 1ms 静音占位；这类空音频不参与传递，等同未连接该端口。
+    否则音频 VAE 编码前会把长度裁剪成压缩率的整数倍，不足一帧会得到 0 长度张量并崩溃。
+    """
+    if not isinstance(audio, dict):
+        return True
+    waveform = audio.get("waveform")
+    if not isinstance(waveform, torch.Tensor) or waveform.numel() == 0 or waveform.shape[-1] == 0:
+        return True
+    samples = waveform.shape[-1]
+    vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
+    sr = audio.get("sample_rate") or vae_sr
+    try:
+        length = samples * float(vae_sr) / float(sr)
+    except (TypeError, ValueError, ZeroDivisionError):
+        length = float(samples)
+    try:
+        frame = audio_vae.spacial_compression_encode()
+    except Exception:
+        frame = getattr(audio_vae, "downscale_ratio", 800)
+    if isinstance(frame, (list, tuple)):
+        frame = frame[-1] if frame else 800
+    try:
+        frame = max(1, int(frame))
+    except (TypeError, ValueError):
+        frame = 800
+    return length < frame
+
+
 class YuanMiniMaxH3Video:
-    """MiniMax-H3 视频生成（图生视频 / 参考图生视频）。
+    """MiniMax-H3 视频生成（图生视频 / 参考图生视频 / 数字人）。
 
     图生视频：提示词（+ 可选首帧/尾帧关键帧）生成正向条件与音视频联合潜空间。
     参考图生视频：提示词 + <Picture i> / <Video k> / <Audio j> 参考条件。
+    数字人：把引导图像/音频锚定到任意帧（复刻官方 MiniMaxH3AddGuide）。
+    引导 latent 写入 minimax_keyframes，每个采样步重新注入、从不去噪。
 
     参考内容按固定顺序进入：先图像，再视频（每个视频的音轨 <Audio j> 标记
     紧跟在对应 <Video k> 之前），最后是独立音频。每种类型的编号从 1 开始，
@@ -102,7 +143,7 @@ class YuanMiniMaxH3Video:
     OUTPUT_TOOLTIPS = ("正向条件（含关键帧/参考潜空间）", "视频+音频联合潜空间")
     FUNCTION = "execute"
     CATEGORY = "Yuan Tool/MiniMax"
-    DESCRIPTION = "MiniMax-H3 视频生成：图生视频（首/尾帧关键帧）或参考图生视频（<Picture>/<Video>/<Audio> 参考）。"
+    DESCRIPTION = "MiniMax-H3 视频生成：图生视频（首/尾帧关键帧）、参考图生视频（<Picture>/<Video>/<Audio> 参考）或数字人（引导图像/音频锚定到任意帧）。"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -124,8 +165,15 @@ class YuanMiniMaxH3Video:
                                   "tooltip": "用于编码参考音频的音频 VAE 模型"}),
             "ref_image_size": (["匹配", "最大"], {"default": "匹配", "display_name": "参考图尺寸",
                 "tooltip": "参考图像尺寸策略。'匹配'：将每张参考图（仅缩小、保持宽高比）缩放到生成画面的像素面积；'最大'：使用参考管线的 2048px 短边以获得最佳主体保真度。参考标记会贯穿每个采样步，'最大' 模式可能慢数倍。"}),
+            "guide_frame_idx": ("INT", {"default": 0, "min": -9999, "max": 9999, "display_name": "锚定帧",
+                "tooltip": "引导图像/音频锚定的帧位置（仅数字人模式）。负数从视频末尾倒数，如 -1 表示最后一帧"}),
             "ref_images": image_port(
                 "参考图像", f"参考图像列表（可连接多张图像，最多 {REF_IMAGE_PORTS} 张，超出自动切断）"),
+            # ---- 数字人模式（Add Guide）----
+            "guide_image": image_port("引导图像",
+                "锚定到指定帧的图像或多帧片段（仅数字人模式）。单帧图像直接锚定；多帧批次作为短片锚定，自动向下对齐到 17k+5 帧网格（5、22、39…），不足 5 帧只取首帧"),
+            "guide_audio": audio_port("引导音频",
+                "从锚定帧起对齐的语音/音轨（仅数字人模式），超出视频剩余时长自动截断"),
         }
         for i in range(1, REF_VIDEO_PORTS + 1):
             optional[f"ref_video_{i}"] = image_port(
@@ -139,8 +187,8 @@ class YuanMiniMaxH3Video:
 
         return {
             "required": {
-                "mode": ([MODE_IMAGE_TO_VIDEO, MODE_REFERENCE], {"default": MODE_IMAGE_TO_VIDEO,
-                    "display_name": "模式", "tooltip": "生成模式：图生视频（首/尾帧关键帧）或参考图生视频（<Picture>/<Video>/<Audio> 参考）"}),
+                "mode": ([MODE_IMAGE_TO_VIDEO, MODE_REFERENCE, MODE_GUIDE], {"default": MODE_IMAGE_TO_VIDEO,
+                    "display_name": "模式", "tooltip": "生成模式：图生视频（首/尾帧关键帧）、参考图生视频（<Picture>/<Video>/<Audio> 参考）或数字人（引导图像/音频锚定到任意帧，复刻官方 Add Guide）"}),
                 "clip": ("CLIP", {"display_name": "CLIP", "tooltip": "用于编码提示词的 CLIP 模型"}),
                 "vae": ("VAE", {"display_name": "VAE", "tooltip": "用于编码关键帧/参考图像的 VAE 模型"}),
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True, "display_name": "提示词",
@@ -159,11 +207,18 @@ class YuanMiniMaxH3Video:
     def execute(self, mode, clip, vae, prompt, width, height, length,
                 first_frame=None, last_frame=None,
                 audio_vae=None, ref_image_size="match", ref_images=None,
+                guide_frame_idx=0, guide_image=None, guide_audio=None,
                 **kwargs):
         if mode == MODE_REFERENCE:
             return self._execute_reference(
                 clip, vae, audio_vae, prompt, width, height, length,
                 ref_image_size, ref_images, kwargs)
+        if mode == MODE_GUIDE:
+            # 数字人：纯引导锚定（不处理首/尾帧，对应端口在该模式下不显示）
+            cond, latent = self._execute_image_to_video(clip, vae, prompt, width, height, length,
+                                                        None, None)
+            return (self._apply_guide(cond, latent, vae, audio_vae,
+                                      guide_image, guide_audio, guide_frame_idx), latent)
         return self._execute_image_to_video(clip, vae, prompt, width, height, length,
                                             first_frame, last_frame)
 
@@ -191,11 +246,68 @@ class YuanMiniMaxH3Video:
         if keyframes:
             for kf in keyframes:
                 kf["latent"] = vae.encode(kf.pop("image"))
-            cond = node_helpers.conditioning_set_values(cond, {
-                "minimax_keyframes": keyframes,
-                "minimax_frame_count": frame_count,
-            })
+            # minimax_frame_count 必须随关键帧一起写入：布局层靠它识别末帧锚点，
+            # 缺失时接尾帧图像会在采样时报 "only first/last keyframe anchors are supported"
+            cond = node_helpers.conditioning_set_values(cond, {"minimax_keyframes": keyframes,
+                                                               "minimax_frame_count": frame_count})
         return (cond, latent)
+
+    # ---- 数字人（Add Guide：任意帧锚定图像/音频引导）----
+    def _apply_guide(self, cond, latent, vae, audio_vae, image, audio, frame_idx):
+        """把引导图像/音频锚定到任意像素帧，追加进 minimax_keyframes（复刻官方 MiniMaxH3AddGuide）。"""
+        # 空音频（静音占位等）不参与传递，等同未连接该端口
+        if _is_empty_audio(audio, audio_vae):
+            audio = None
+        if image is None and audio is None:
+            raise ValueError("数字人模式需要至少连接引导图像（guide_image）或引导音频（guide_audio）")
+
+        samples = latent["samples"]
+        video = samples.tensors[0]
+        height = video.shape[3] * 16
+        width = video.shape[4] * 16
+        # 由视频潜空间反推总帧数：首 token 1 帧，其后每 token 4 帧，5 个一组循环
+        frame_count = sum(FRAME_PER_TOKEN[k % 5] for k in range(video.shape[2]))
+
+        # 引导图像：单帧直接锚定；多帧（>=5）作为短片，向下对齐到 17k+5 帧网格
+        guide_frames = 1
+        if image is not None:
+            guide_frames = image.shape[0]
+            if guide_frames < 5:
+                guide_frames = 1
+            else:
+                while guide_frames % 17 != 5:
+                    guide_frames -= 1
+
+        resolved_frame_index = frame_idx if frame_idx >= 0 else frame_count + frame_idx
+        if resolved_frame_index < 0 or resolved_frame_index + guide_frames > frame_count:
+            if guide_frames == 1:
+                raise ValueError(f"锚定帧 {frame_idx} 超出视频的 {frame_count} 帧范围")
+            raise ValueError(f"{guide_frames} 帧的引导片段在锚定帧 {frame_idx} 处放不进 {frame_count} 帧的视频")
+
+        keyframe = {"resolved_frame_index": resolved_frame_index}
+        if image is not None:
+            # 保持宽高比的覆盖裁剪到画布
+            frames = _resize(image[:guide_frames], width, height, "center")
+            keyframe["latent"] = vae.encode(frames)
+
+        if audio is not None:
+            if audio_vae is None:
+                raise ValueError("锚定引导音频需要连接音频 VAE（audio_vae）端口")
+            audio_latent, audio_rt = _encode_ref_audio(audio_vae, audio)
+            # 视频与音频共享同一时间轴：每个像素帧占 FRAME_RESCALE 个音频 latent 帧
+            max_rt = math.floor(samples.tensors[1].shape[-1] - FRAME_RESCALE * resolved_frame_index)
+            if max_rt < 1:
+                raise ValueError(f"锚定帧 {frame_idx} 已越过视频音频轨的末尾")
+            if audio_rt > max_rt:
+                audio_latent = audio_latent[..., :max_rt].clone()
+            keyframe["audio_latent"] = audio_latent
+
+        # 写入 minimax_keyframes（数字人模式下引导是唯一关键帧）
+        keyframes = list(cond[0][1].get("minimax_keyframes", []))
+        keyframes.append(keyframe)
+        # 同样补写 minimax_frame_count：末帧锚定（frame_idx=-1）时布局层需要它识别末帧锚点
+        return node_helpers.conditioning_set_values(cond, {"minimax_keyframes": keyframes,
+                                                           "minimax_frame_count": frame_count})
 
     # ---- 参考图生视频（ref2va）----
     def _execute_reference(self, clip, vae, audio_vae, prompt, width, height, length,
@@ -249,7 +361,8 @@ class YuanMiniMaxH3Video:
             frames = frames[:n]
             z = vae.encode(frames)
             audio_latent, ref_audio_t = (None, 0)
-            if soundtrack is not None:
+            # 空音频（静音占位等）不参与传递，等同未连接该端口，视频按无音轨处理
+            if not _is_empty_audio(soundtrack, audio_vae):
                 audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
                 # 音轨获得独立的 <Audio j> 标记，在 <Video k> 之前输出
                 ref_items.append({"type": "audio"})
@@ -265,7 +378,8 @@ class YuanMiniMaxH3Video:
         # 3. 独立参考音频：ref_audio_1..N
         for i in range(1, REF_AUDIO_PORTS + 1):
             audio = kwargs.get(f"ref_audio_{i}")
-            if audio is None:
+            # 空音频（静音占位等）不参与传递，等同未连接该端口
+            if _is_empty_audio(audio, audio_vae):
                 continue
             audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)
             ref_items.append({"type": "audio"})
