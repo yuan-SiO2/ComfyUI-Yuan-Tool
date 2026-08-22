@@ -1,6 +1,6 @@
 """Yuan Tool · 色彩匹配 节点
 
-复刻自 ComfyUI-KJNodes 的 ColorMatch，基于 color-matcher 库实现跨图像色彩迁移（自动色彩校正、调色、光线/色温统一）。
+基于 color-matcher 库实现跨图像色彩迁移（自动色彩校正、调色、光线/色温统一）。
 """
 
 import os

@@ -1,6 +1,6 @@
 """Yuan Tool · 加载批量图像 节点（多滑轨版）
 
-复刻自 WhatDreamsCost-ComfyUI 的 MultiImageLoader，支持最多 20 个独立滑轨，
+支持最多 20 个独立滑轨，
 每滑轨单独加载批量图像并独立输出；使用 lanczos 插值将宽高向上取整到 16 的倍数。
 前端通过 tracks_data（JSON 字符串）维护滑轨数据。
 

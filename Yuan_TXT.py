@@ -367,7 +367,6 @@ class YUAN_TXTJsonExtractor:
         分镜序列数据 = data.get("分镜序列", [])
         分镜序列文本 = ""
         时间段 = []
-        分镜序列整合 = ""
         环境音 = ""
         BGM = ""
         matched_title = ""
@@ -622,9 +621,6 @@ class YUAN_TXTListNumber:
             numbered = f"{编号前缀}{num}{编号后缀}{line}"
             results.append(numbered)
 
-        if not results:
-            return ([""], next_num)
-
         if 输出模式 == "合并文本":
             separator = 合并间隔符.replace("\\n", "\n")
             merged = separator.join(results)
@@ -710,10 +706,8 @@ class YUAN_TXTReplace:
         find_lines = 查找文本.split("\n")
         replace_lines = 替换文本.split("\n")
 
-        # 台词开关：mask 作为开关标志（替换过程中每次重建掩码）
-        mask = None
-        if 台词开关:
-            mask = _build_quote_protect_mask(text)
+        # 台词开关：开启时逐轮以当前文本重建保护掩码进行保护替换
+        protect = bool(台词开关)
 
         # 配对查找/替换，过滤空查找串
         pairs = []
@@ -729,7 +723,7 @@ class YUAN_TXTReplace:
 
         result = text
         for find_str, replace_str in pairs:
-            if mask is not None:
+            if protect:
                 result = YUAN_TXTReplace._replace_with_protect(result, find_str, replace_str,
                                                                 _build_quote_protect_mask(result))
             else:
@@ -1080,7 +1074,7 @@ class YUAN_TXTParagraphSplitter:
         num_title_pattern = r'^(?:[一二三四五六七八九十百千万]+、|\d+\. |[a-zA-Z]+\. )'
         if re.match(num_title_pattern, line_stripped): return True
         if last_char in (':', '：'): return len(line_stripped) > 1
-        if not last_char in (':', '：') and not re.search(r'[^\u4e00-\u9fa5a-zA-Z0-9]', last_char): return True
+        if not re.search(r'[^\u4e00-\u9fa5a-zA-Z0-9]', last_char): return True
         return False
 
     def _convert_to_str(self, val):

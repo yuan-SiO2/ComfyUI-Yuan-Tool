@@ -1,7 +1,6 @@
-"""H3 运动上下文相关节点（Yuan Tool 本地化版），复刻自 Yuan Tool 的 nodes.py。
+"""H3 运动上下文相关节点。
 
-包含 3 个节点：H3 加载潜空间 / H3 运动上下文 / H3 运动裁剪（合并了原
-「H3 保存潜空间」）。片段衔接时直接从上一片段潜空间切片视频与音频尾部，
+包含 3 个节点：H3 加载潜空间 / H3 运动上下文 / H3 运动裁剪。片段衔接时直接从上一片段潜空间切片视频与音频尾部，
 跳过解码/重编码。布局补丁解除仅首/末帧关键帧锚点限制，载荷补丁让固定
 视频与固定音频共存；两补丁均在节点首次运行时安装（避免影响无关 H3 图），
 带 ABI 标记门控并先自测再提交，失败则拒绝运行并说明原因。
@@ -41,7 +40,7 @@ MC_AUDIO_KEY = "motion_context_audio_end_frame"
 
 
 # ============================================================================
-# 布局补丁 (原 patch_layout.py)
+# 布局补丁
 # 解除 MiniMax H3 仅首/末帧关键帧锚点的限制
 # ============================================================================
 
@@ -138,7 +137,7 @@ def _cond_t(text_len, latent_t, frame_count, p):
 def _fixup(layout, text_len, latent_t, frame_count, keyframes, refs=None):
     """把条件行时间坐标重写为通用位置公式。
 
-    参考块对锚点的补偿取自目标实际落点（_target_origin），不再读 refs 计算。
+    参考块对锚点的补偿取自目标实际落点（_target_origin）。
     """
     offset = _target_origin(layout) - float(text_len)
     if offset and any(kf.get(MC_KEY) is None for kf in keyframes):
@@ -454,7 +453,7 @@ def _layout_patch_applied():
 
 
 # ============================================================================
-# 载荷补丁 (原 patch_payload.py)
+# 载荷补丁
 # 让关键帧和引用可以共存
 # ============================================================================
 
@@ -606,8 +605,6 @@ AUDIO_HZ = 40.0
 # 退化子组片段的下限。
 VIDEO_RUN_GRID = (68, 51, 34, 17, 5)
 
-# 以下设置曾是控件，每个都只有唯一正确答案，展示错误选项只是噪音。
-# 落选分支仍保留在下方代码中：改动常量即可复现它们造成的故障。
 #   ANCHOR_MODE "head" 把固定段放在片段开头（由裁剪节点移除）；"before"
 #               放在负时间轴上无需裁剪，但坐标与文本行碰撞，会削弱锚点
 #               并使输出变暗。
@@ -1025,9 +1022,8 @@ class Yuan_H3MotionContextTrim:
     第二次裁切：在交付潜空间的尾部按字符串中的长度再切一段（状态 1 时
     =裁剪长度；状态 0 时固定 17 帧），保留后段保存到本地（是否保存由
     「保存到本地」开关控制），供下一次运行加载衔接。音视频分离取窗是
-    「H3 加载潜空间 → H3 运动上下文」的事情，本节点只做整段切片——
-    即合并了原「H3 保存潜空间」节点的功能，潜空间输出以本节点的裁剪
-    结果为主。
+    「H3 加载潜空间 → H3 运动上下文」的事情，本节点只做整段切片，
+    潜空间输出以本节点的裁剪结果为主。
     """
 
     @classmethod
@@ -1078,7 +1074,7 @@ class Yuan_H3MotionContextTrim:
         # 解析「H3 运动上下文」输出的裁剪帧数字符串"状态:长度"：
         #   "1:34"=启用上下文 → 头部裁 34 帧，尾段保存 34 帧
         #   "0:17"=未启用/无上下文 → 不裁头，尾段仍保存 17 帧供衔接
-        # 兼容纯数字输入（旧工作流/手填）→ 按启用语义：n=tail=该值
+        # 兼容纯数字输入（手填）→ 按启用语义：n=tail=该值
         s = str(裁剪帧数).strip()
         if ":" in s:
             state_str, _, len_str = s.partition(":")
@@ -1262,8 +1258,7 @@ def _resolve_prefix(dir_part, prefix, idx):
     """按文件名前缀解析潜空间文件（与保存节点的 filename_prefix 一致）。
 
     例：prefix="latent", idx=2 → latent_00002_.safetensors；同时兼容
-    云端导出带任意后缀的文件名（latent_00002_etaar_1786585381.safetensors）
-    及旧版命名（latent_00002.safetensors / latent_clip002.safetensors）。
+    云端导出带任意后缀的文件名（latent_00002_etaar_1786585381.safetensors）。
     """
     pat = re.compile(r"^%s_%05d(?:_[^.]*)?\.safetensors$"
                      % (re.escape(prefix), int(idx)))
@@ -1283,9 +1278,8 @@ def _dir_fingerprint(prefix_path):
     """目录级综合指纹：对 prefix_path 所在目录下所有 prefix_*.safetensors
     按「文件名 + 内容」计算 SHA256，任一文件新增/覆盖/删除都会改变指纹。
 
-    用于「加载潜空间」的 IS_CHANGED：该阶段 ComfyUI 对链接输入一律传
-    None（execution.py 以 execution_list=None 调用、链接输入被 mark_missing
-    置空），片段序号来自 GetNode/表达式链路时拿不到真实值，因此退化为对
+    用于「加载潜空间」的 IS_CHANGED：该阶段链接输入拿不到真实值，
+    片段序号来自 GetNode/表达式链路时不可用，因此对
     整个存储目录做指纹——新片段保存（内容变化）→ 指纹变化 → 下游重跑；
     同一片段重试（内容不变）→ 缓存命中。目录不存在时返回确定性 "missing"
     标记（可缓存），首次保存出现文件后指纹变化自然触发重跑。
@@ -1459,11 +1453,9 @@ class Yuan_H3MotionContextLoadLatent:
             except Exception:
                 return float("NaN")
         # 片段序号显式为常量 0 = 第一个片段：输出确定性空标记，无需读文件。
-        # 注意 IS_CHANGED 阶段 ComfyUI 对链接输入一律传 None（execution.py
-        # 以 execution_list=None 调用），序号来自 GetNode/表达式链路时拿不到
-        # 真实值（int(None) 抛异常），故不再依赖序号，改对存储目录下全部
-        # latent 文件做综合指纹：内容变化 → 指纹变化 → 下游重跑；同一片段
-        # 重试内容不变 → 缓存命中。
+        # IS_CHANGED 阶段序号来自 GetNode/表达式链路时拿不到真实值，
+        # 故对存储目录下全部 latent 文件做综合指纹：内容变化 → 指纹变化
+        # → 下游重跑；同一片段重试内容不变 → 缓存命中。
         try:
             if int(片段序号) == 0:
                 return 0

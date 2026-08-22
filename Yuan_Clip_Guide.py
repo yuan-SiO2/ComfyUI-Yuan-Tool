@@ -1,6 +1,6 @@
 """Yuan 引导注入节点：将图像/视频帧作为引导关键帧注入视频 latent。
 
-复刻自 ComfyUI-Yuan-Director 的 LTXVAddGuide，支持图像引导、视频分段引导（IC-LoRA）与 Ref Guidance 参考特征引导。
+支持图像引导、视频分段引导（IC-LoRA）与 Ref Guidance 参考特征引导。
 """
 
 import os
@@ -514,7 +514,7 @@ class YuanClipGuide:
 
     @classmethod
     def _msr_slot_embedding(cls, slot_id, state, device, dtype):
-        """复刻原生 MSR 的 Fourier-MLP slot embedding 计算（slot_id 从 1 起）。"""
+        """MSR 的 Fourier-MLP slot embedding 计算（slot_id 从 1 起）。"""
         frequencies = state["frequencies"].to(device=device, dtype=torch.float32)
         slot_value = torch.tensor(float(slot_id), device=device, dtype=torch.float32)
         scaled = slot_value / 16.0

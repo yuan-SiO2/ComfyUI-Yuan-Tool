@@ -1,6 +1,5 @@
 """Yuan Tool · H3 放大 (3D) 节点
 
-复刻自 Comfyui_Minimax_h3_latent_Upscaler 的 Minimax H3 Latent Upscaler (3D)：
 纯 3D 卷积主干在 latent 空间放大 Minimax H3 视频（24 通道），跳过「解码 → 像素放大
 → 再编码」的慢速往返，并避免直接对 latent 插值带来的鬼影/重影。
 
@@ -39,7 +38,7 @@ UPSCALE_BY = "按倍数缩放"
 UPSCALE_TARGET = "目标尺寸"
 
 # ==========================================
-# Minimax H3 归一化参数（来自训练代码，24 通道）
+# Minimax H3 归一化参数（24 通道）
 # ==========================================
 LATENTS_MEAN = [
     0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075,
@@ -66,7 +65,7 @@ def _make_norm_tensors(device, dtype):
 
 
 # ==========================================
-# 3D 网络组件（与训练代码一致）
+# 3D 网络组件
 # ==========================================
 def normalization(channels):
     return nn.GroupNorm(32, channels)
@@ -152,7 +151,7 @@ class TemporalConv(nn.Module):
 
 
 # ==========================================
-# 纯 3D 主干网络（与训练代码一致）
+# 纯 3D 主干网络
 # ==========================================
 class LatentResizer3D(nn.Module):
     def __init__(self, in_channels=24, in_blocks=12, out_blocks=12,
@@ -258,7 +257,6 @@ def _load_raw_sd(path):
 
 
 def _extract_upscaler_sd(sd):
-    # 兼容之前可能包含 'upscaler.' 前缀的合并权重
     if any(k.startswith("upscaler.") for k in sd):
         return {k[len("upscaler."):]: v for k, v in sd.items() if k.startswith("upscaler.")}
     return sd
@@ -377,8 +375,8 @@ def load_model(name, device):
 class Yuan_H3Upscale3D:
     """H3 放大 (3D) 节点：纯 3D 卷积在 latent 空间放大 Minimax H3 视频。
 
-    支持「按倍数缩放」与「目标尺寸」两种缩放方式（借鉴 RTX 视频放大 (H3) 的
-    交互模式）；时间维度保持不变，仅放大空间分辨率（H×W）。
+    支持「按倍数缩放」与「目标尺寸」两种缩放方式；时间维度保持不变，
+    仅放大空间分辨率（H×W）。
     """
 
     @classmethod

@@ -1,6 +1,6 @@
 """Yuan Tool · 画布 节点
 
-复刻自 ComfyUI-Yuan 的 Yuan_Canvas 节点，自包含的合成器（V3）：
+自包含的合成器（V3）：
 - 接收最多 8 张图像，在内嵌的 fabric.js 编辑器中可视化放置、旋转、缩放
 - 前端合成后的图像会回传后端，作为单个 IMAGE 输出
 
@@ -13,7 +13,6 @@ import numpy as np
 import torch
 from comfy_execution.graph import ExecutionBlocker
 from server import PromptServer
-from aiohttp import web
 import nodes as comfy_nodes
 
 MAX_RESOLUTION = comfy_nodes.MAX_RESOLUTION
@@ -69,19 +68,9 @@ def _save_images_batch_with_sig(images_tensor):
     return entries
 
 
-routes = PromptServer.instance.routes
-
-
-@routes.post('/compositor/done')
-async def receivedDone(request):
-    """前端合成完成后的回调端点（保留兼容，无实际处理）。"""
-    return web.json_response({})
-
-
 class Yuan_Canvas:
     """自包含的合成器（V3）节点：接收最多 8 张图像在 fabric.js 编辑器中可视化编辑，合成后作为单个 IMAGE 输出。"""
 
-    result = None
     configCache = None
 
     @classmethod
@@ -114,7 +103,7 @@ class Yuan_Canvas:
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("合成图像",)
-    OUTPUT_TOOLTIPS = ("前端合成完成后导出的最终图像（PNG）。配置变化时节点会阻塞等待合成。",)
+    OUTPUT_TOOLTIPS = ("前端合成完成后导出的最终图像（PNG）。尚无合成结果时节点会阻塞等待合成。",)
     FUNCTION = "composite"
     CATEGORY = "Yuan Tool/画布"
 
@@ -123,7 +112,7 @@ class Yuan_Canvas:
         "- 将一组图像（batch）作为独立图层传入\n"
         "- 在内嵌编辑器中可视化放置、旋转、缩放\n"
         "- 缓冲区（padding）可用于暂存不想导出的素材\n"
-        "- 配置变化时节点会暂停，便于你构建合成，随后继续执行"
+        "- continue 仅刷新画布读取上游输入；合成结果自动上传，直接运行/预览即可输出"
     )
 
     def composite(self, **kwargs):
@@ -136,7 +125,7 @@ class Yuan_Canvas:
         height = kwargs.get('height', 512)
         padding = kwargs.get('padding', 100)
 
-        # 后端不处理图像数据，前端直接从上游节点获取图像（参考全景预览节点的 ERP_image 端口）。
+        # 后端不处理图像数据，前端直接从上游节点获取图像。
         # 图像内容签名仅用于 config 变更检测和 IS_CHANGED。
         bg_image = kwargs.get('bg_image')
         images_tensor = kwargs.get('images')
@@ -167,7 +156,6 @@ class Yuan_Canvas:
             "config_node_id": [node_id],
             "node_id": [node_id],
             "fabricData": [fabricData],
-            "awaited": [self.result],
             "configChanged": [configChanged],
             "images_entries": images_entries,
             "bg_entries": bg_entries,
@@ -178,8 +166,9 @@ class Yuan_Canvas:
         PromptServer.instance.send_sync("compositor_init", detail)
 
         imageExists = folder_paths.exists_annotated_filepath(imageName)
-        # 当配置变化或尚无合成图像时阻塞执行
-        if imageName == "new.png" or not imageExists or configChanged:
+        # 仅在尚无合成图像时阻塞执行（等待前端合成上传）；
+        # 配置变化不再阻塞：continue 仅刷新画布，合成结果由前端自动上传，直接运行/预览即可输出
+        if imageName == "new.png" or not imageExists:
             blocker_result = tuple([ExecutionBlocker(None)] * len(self.RETURN_TYPES))
             return {
                 "ui": ui,

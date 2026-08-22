@@ -1,8 +1,7 @@
-"""MiniMax H3 节点（汉化版）：图生视频 / 参考图生视频 / 数字人，构建 AV 联合潜空间与任务条件。
+"""MiniMax H3 节点：图生视频 / 参考图生视频 / 数字人，构建 AV 联合潜空间与任务条件。
 
-复刻自 comfy_extras/nodes_minimax_h3.py（MiniMaxH3ImageToVideo /
-MiniMaxH3ReferenceToVideo / MiniMaxH3AddGuide），合并为单个节点 Yuan_MiniMaxH3Video，
-通过"模式"下拉框切换，node_id 加 "Yuan_" 前缀避免与原生节点冲突。
+合并为单个节点 Yuan_MiniMaxH3Video，通过"模式"下拉框切换，
+node_id 加 "Yuan_" 前缀避免与原生节点冲突。
 """
 
 import math
@@ -130,7 +129,7 @@ class YuanMiniMaxH3Video:
 
     图生视频：提示词（+ 可选首帧/尾帧关键帧）生成正向条件与音视频联合潜空间。
     参考图生视频：提示词 + <Picture i> / <Video k> / <Audio j> 参考条件。
-    数字人：把引导图像/音频锚定到任意帧（复刻官方 MiniMaxH3AddGuide）。
+    数字人：把引导图像/音频锚定到任意帧。
     引导 latent 写入 minimax_keyframes，每个采样步重新注入、从不去噪。
 
     参考内容按固定顺序进入：先图像，再视频（每个视频的音轨 <Audio j> 标记
@@ -254,7 +253,7 @@ class YuanMiniMaxH3Video:
 
     # ---- 数字人（Add Guide：任意帧锚定图像/音频引导）----
     def _apply_guide(self, cond, latent, vae, audio_vae, image, audio, frame_idx):
-        """把引导图像/音频锚定到任意像素帧，追加进 minimax_keyframes（复刻官方 MiniMaxH3AddGuide）。"""
+        """把引导图像/音频锚定到任意像素帧，追加进 minimax_keyframes。"""
         # 空音频（静音占位等）不参与传递，等同未连接该端口
         if _is_empty_audio(audio, audio_vae):
             audio = None
@@ -319,7 +318,7 @@ class YuanMiniMaxH3Video:
 
         ref_items = []   # 供分词器按请求顺序呈现
         ref_blocks = []  # 供 DiT 负载，顺序一致
-        # 参考图尺寸下拉框选项已汉化（见 INPUT_TYPES），这里还原为内部处理用的英文 key
+        # 参考图尺寸下拉框选项为中文（见 INPUT_TYPES），这里还原为内部处理用的英文 key
         _match_mode = "match" if ref_image_size in ("匹配", "match") else "max"
 
         # 1. 参考图像：ref_images 列表端口（batch 多图，最多 REF_IMAGE_PORTS 张，超出自动切断）

@@ -1,6 +1,5 @@
 """
-Yuan CLIP Timeline - 视觉时间轴提示词编码节点（PromptRelay Timeline 复刻，
-集成 LTXV 视频/音频空潜空间自动生成）。
+Yuan CLIP Timeline - 视觉时间轴提示词编码节点（集成 LTXV 视频/音频空潜空间自动生成）。
 """
 
 import json
@@ -725,7 +724,7 @@ def _build_motion_guide_data(tdata: dict, start_frame: int, duration_frames: int
 
 
 # ==============================================================================
-# prompt_relay.py 核心函数
+# 核心函数
 # ==============================================================================
 
 def build_temporal_cost(q_token_idx, Lq, Lk, device, dtype, tokens_per_frame):
@@ -1045,7 +1044,7 @@ def distribute_segment_lengths(num_segments, latent_frames, specified_lengths=No
 
 
 # ==============================================================================
-# patches.py 模型补丁函数
+# 模型补丁函数
 # ==============================================================================
 
 def _make_masked_override(prev_override):
@@ -1111,7 +1110,7 @@ def apply_patches(model_clone, mask_fn):
 
 
 # ==============================================================================
-# nodes.py 编码函数
+# 编码函数
 # ==============================================================================
 
 def _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames):
@@ -1880,8 +1879,6 @@ class YuanCLIPTimeline:
             tdata, start_frame, max_frames, float(fps), guide_strength,
             cw, ch, resize_method, divisible_by, img_compression,
         )
-
-        # （参考图像已通过 frameFiles 合并段统一走 IC-LoRA 视频路径）
 
         # --- 自动生成 LTXV 潜空间（未连接 latent 输入时；max_frames 已对齐 stride 8，直接使用） ---
         ltxv_length = max_frames

@@ -1,6 +1,6 @@
 """Yuan Tool · Yuan 音频列表 / Yuan 音频分流 节点
 
-Yuan 音频列表：从输入目录加载音频文件（复刻原生 LoadAudio 的 PyAV 解码），
+Yuan 音频列表：从输入目录加载音频文件（PyAV 解码），
 按筛选索引（逗号分隔、从 0 起、支持单选/多选）输出 AUDIO 列表，上限 30 个。
 
 Yuan 音频分流：一个列表输入，按索引顺序分配到多个输出端口（默认 2，上限 30）。
@@ -26,7 +26,7 @@ _AUDIO_EXTS = {
 
 
 def _f32_pcm(wav: torch.Tensor) -> torch.Tensor:
-    """转为 float32 PCM（复刻原生 f32_pcm）。"""
+    """转为 float32 PCM。"""
     if wav.dtype.is_floating_point:
         return wav
     if wav.dtype == torch.int16:
