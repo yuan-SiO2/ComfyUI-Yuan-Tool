@@ -393,7 +393,7 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
             }
         };
 
-        // 调度到下一 tick 再同步（与 YuanTool 同源修复）：links 可能尚未挂到 input.link 上，立即执行会误判端口
+        // 调度到下一 tick 再同步：links 可能尚未挂到 input.link 上，立即执行会误判端口
         const scheduleSync = () => {
             clearTimeout(self._syncTimer);
             self._syncTimer = setTimeout(syncPortsReal, 0);
@@ -448,7 +448,7 @@ function registerResizeTypeConditionalWidgets(nodeType) {
     const UPSCALE_BY = "按倍数缩放";
 
     // 根据 resize_type 切换 scale / width / height 的显隐
-    // 只隐藏不删除，避免 widgets_values 索引错位（与 MiniMax H3 ref_image_size 同源惯例）
+    // 只隐藏不删除，避免 widgets_values 索引错位
     const syncResizeWidgets = (self) => {
         const resizeWidget = self.widgets.find(w => w.name === "resize_type");
         if (!resizeWidget) return;
@@ -546,8 +546,8 @@ function registerYuanH3MotionContext(nodeType) {
 // ==================== Yuan_H3MotionContextLoadLatent（H3 加载潜空间：手动上传按钮）====================
 
 async function yuanH3LatentUploadFile(file, onProgress) {
-    // 分块上传潜空间文件到后端 /yuan_h3_motion_upload_latent（与时间轴节点同款策略，
-    // 避免单次请求超出服务端 body 上限），最后一块的响应携带 {"name": "..."}
+    // 分块上传潜空间文件到后端 /yuan_h3_motion_upload_latent
+    // （避免单次请求超出服务端 body 上限），最后一块的响应携带 {"name": "..."}
     const CHUNK_SIZE = 4 * 1024 * 1024;
     const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
     let lastResp = null;

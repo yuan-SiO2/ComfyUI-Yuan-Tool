@@ -4,24 +4,14 @@
  * 合成结果上传后端作为节点 IMAGE 输出，并持久化位置信息以在工作流切换后恢复。
  */
 import { fabric } from "./fabric.js";
+import { getApi, findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput, imageSourceFromCandidate, lookupNodeOutputEntry } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 
-/** 从 window.comfyAPI 获取 api 实例（兼容不同 ComfyUI 版本） */
-function getApi() {
-    try {
-        const c = window.comfyAPI;
-        if (c && c.api) {
-            if (c.api.api && typeof c.api.api.apiURL === "function") return c.api.api;
-            if (typeof c.api.apiURL === "function") return c.api.api;
-        }
-    } catch (_) {}
-    return null;
-}
 const api = getApi();
 
 
-// 图层面板使用的 SVG 图标路径（参考 comfyui_pano_stickers）
+// 图层面板使用的 SVG 图标路径
 const LAYER_ICONS = {
     bring_front: "<path stroke='none' d='M0 0h24v24H0z' fill='none' /><path d='M12 4l-8 4l8 4l8 -4l-8 -4' /><path d='M8 14l-4 2l8 4l8 -4l-4 -2' /><path d='M8 10l-4 2l8 4l8 -4l-4 -2' />",
     send_back: "<path stroke='none' d='M0 0h24v24H0z' fill='none' /><path d='M4 8l8 4l8 -4l-8 -4l-8 4' /><path d='M12 16l-4 -2l-4 2l8 4l8 -4l-4 -2l-4 2' /><path d='M8 10l-4 2l4 2m8 0l4 -2l-4 -2' />",
@@ -42,65 +32,6 @@ function isYuan_Canvas(node) {
 
 function getCompositorWidget(node, widgetName) {
     return node.widgets.find((w) => w.name === widgetName);
-}
-
-/**
- * 将 ComfyUI 图像 UI 条目（{filename, subfolder, type, storage}）转为 /view URL。
- * 参考自 ComfyUI-Yuan-Tool 的全景预览节点前端实现。
- */
-function comfyImageEntryToUrl(entry) {
-    if (!entry || typeof entry !== "object") return "";
-    const filename = String(entry.filename || "").trim();
-    if (!filename) return "";
-    const params = new URLSearchParams();
-    params.set("filename", filename);
-    const viewType = String(
-        entry.storage
-        || (String(entry.type || "").trim().toLowerCase() === "comfy_image" ? "output" : entry.type)
-        || "output"
-    );
-    params.set("type", viewType);
-    if (entry.subfolder) params.set("subfolder", String(entry.subfolder));
-    return api ? api.apiURL(`/view?${params.toString()}`) : `/view?${params.toString()}`;
-}
-
-/**
- * 从 ComfyUI 图像 UI 条目、字符串或数组中提取 /view URL。
- * 参考自 ComfyUI-Yuan-Tool 的全景预览节点前端实现。
- */
-function imageSourceFromCandidate(candidate) {
-    if (!candidate) return "";
-    if (typeof candidate === "string") return String(candidate).trim();
-    if (Array.isArray(candidate)) {
-        if (candidate.length === 0) return "";
-        if (candidate.length === 1) return imageSourceFromCandidate(candidate[0]);
-        const filename = typeof candidate[0] === "string" ? String(candidate[0]).trim() : "";
-        if (filename) {
-            return comfyImageEntryToUrl({
-                filename,
-                subfolder: String(candidate[1] || "").trim(),
-                type: String(candidate[2] || "output").trim() || "output",
-            });
-        }
-        for (const e of candidate) {
-            const s = imageSourceFromCandidate(e);
-            if (s) return s;
-        }
-        return "";
-    }
-    if (typeof candidate?.src === "string" && candidate.src) return candidate.src;
-    if (typeof candidate?.url === "string" && candidate.url) return candidate.url;
-    return comfyImageEntryToUrl(candidate);
-}
-
-function lookupNodeOutputEntry(nodeId) {
-    const store = app?.nodeOutputs;
-    if (!store || nodeId == null) return null;
-    const raw = String(nodeId);
-    if (store instanceof Map) {
-        return store.get(nodeId) || store.get(raw) || store.get(Number(raw)) || null;
-    }
-    return store[nodeId] || store[raw] || null;
 }
 
 /** 从上游连接节点获取图像 URL 列表（支持 batch，不缓存图像信息）。 */
@@ -155,14 +86,14 @@ function getUpstreamImageUrls(node, inputName) {
     if (originNode) {
         const imgs = Array.isArray(originNode?.imgs) ? originNode.imgs : [];
         for (const c of imgs) {
-            const s = imageSourceFromCandidate(c);
+            const s = imageSourceFromCandidate(c, api);
             if (s) urls.push(s);
         }
     }
     if (urls.length > 0) return urls;
 
     // 3) 上游节点的 nodeOutputs（上游为 OUTPUT_NODE 时含 batch 多张图像，但最易被缓存污染）
-    const originOutputs = lookupNodeOutputEntry(originId);
+    const originOutputs = lookupNodeOutputEntry(app, originId);
     const candidateGroups = [
         originOutputs?.images,
         originOutputs?.ui?.images,
@@ -170,7 +101,7 @@ function getUpstreamImageUrls(node, inputName) {
     for (const g of candidateGroups) {
         if (!Array.isArray(g)) continue;
         for (const c of g) {
-            const s = imageSourceFromCandidate(c);
+            const s = imageSourceFromCandidate(c, api);
             if (s) urls.push(s);
         }
         if (urls.length > 0) return urls;
@@ -182,7 +113,7 @@ function getUpstreamImageUrls(node, inputName) {
         nodeUrls = typeof app?.getNodeImageUrls === "function" ? (app.getNodeImageUrls(originNode) || []) : [];
     } catch (_) { nodeUrls = []; }
     for (const c of nodeUrls) {
-        const s = imageSourceFromCandidate(c);
+        const s = imageSourceFromCandidate(c, api);
         if (s) urls.push(s);
     }
     if (urls.length > 0) return urls;
@@ -232,6 +163,89 @@ function computeFabricImageSig(fabricImg) {
     }
 }
 
+/** 解析注解文件名（如 'compositor/xxx.png [temp]'）为 {filename, subfolder, type}。 */
+function parseAnnotatedImageName(name) {
+    let n = String(name || "").trim();
+    let type = "input";
+    for (const t of ["output", "input", "temp"]) {
+        const suffix = `[${t}]`;
+        if (n.endsWith(suffix)) {
+            n = n.slice(0, -suffix.length).trim();
+            type = t;
+            break;
+        }
+    }
+    n = n.replace(/\\/g, "/");
+    const idx = n.lastIndexOf("/");
+    return {
+        filename: idx > -1 ? n.slice(idx + 1) : n,
+        subfolder: idx > -1 ? n.slice(0, idx) : "",
+        type,
+    };
+}
+
+/** 检查合成图文件是否存在于后端（HEAD /view）。 */
+async function compositionFileExists(node) {
+    const value = String(node?.imageNameWidget?.value || "").trim();
+    if (!value || value === "new.png") return false;
+    const { filename, subfolder, type } = parseAnnotatedImageName(value);
+    if (!filename) return false;
+    try {
+        const url = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(subfolder)}&type=${type}`);
+        const res = await fetch(url, { method: "HEAD" });
+        return res.ok;
+    } catch (_) {
+        return true; // 检查失败时保守认为存在，避免无谓重复上传
+    }
+}
+
+/** 等待画布图像加载沉淀（上限约 5 秒）。 */
+async function waitForImageLoads(instance) {
+    for (let i = 0; i < 50; i++) {
+        if (!((instance._pendingImageLoads || 0) > 0)) return;
+        await new Promise((r) => setTimeout(r, 100));
+    }
+}
+
+/**
+ * 排队前确保所有画布节点的合成图已上传：
+ * 画布有内容且（有未上传修改 / 无合成文件名 / 合成文件已被清理）时，
+ * 先等待图像加载沉淀并上传合成结果，再继续排队。
+ * 这样运行工作流时合成图像输出端口直接给出图像，外接预览节点直接显示，
+ * 无需手动点「更新画布」等按钮。
+ */
+async function ensureCanvasesUploadedBeforeQueue() {
+    const graphNodes = app?.graph?._nodes || [];
+    const uploads = [];
+    for (const node of graphNodes) {
+        const instance = node?.compositorInstance;
+        if (!instance || node?.constructor?.comfyClass !== "Yuan_Canvas") continue;
+        // 画布上没有任何内容时无法合成（后端阻塞等待用户构建合成）
+        const hasContent = !!instance.bgImage || Object.keys(instance.inputImages || {}).length > 0;
+        if (!hasContent) continue;
+        const imageNameValue = String(node.imageNameWidget?.value || "").trim();
+        const missing = !imageNameValue || imageNameValue === "new.png";
+        if (!instance.needsUpload && !missing) {
+            const exists = await compositionFileExists(node);
+            if (exists) continue;
+        }
+        // 等待图像加载沉淀，并取消待定的自动上传定时器（避免并发重复上传）
+        await waitForImageLoads(instance);
+        if (instance._autoUploadTimer) clearTimeout(instance._autoUploadTimer);
+        uploads.push(new Promise((resolve) => {
+            let settled = false;
+            const finish = () => { if (!settled) { settled = true; resolve(); } };
+            try {
+                instance.needsUpload = false;
+                instance._autoUploadWanted = false;
+                instance.grabUploadAndSetOutput(instance, finish);
+                setTimeout(finish, 15000); // 兜底：上传卡死时不阻塞排队
+            } catch (_) { finish(); }
+        }));
+    }
+    if (uploads.length > 0) await Promise.all(uploads);
+}
+
 /** 注册扩展，可介入节点生命周期（api 事件与扩展钩子的详细调用顺序见 ComfyUI 文档）。 */
 app.registerExtension({
     name: "Comfy.Yuan_Canvas",
@@ -241,8 +255,6 @@ app.registerExtension({
     },
     /** 启动流程末尾调用，用于注册事件监听与全局 UI 操作。 */
     async setup(app) {
-        Editor.addCompositorSettings();
-
         /** 当节点"返回"一个 ui 元素时，通常在处理末尾 */
         function executedMessageHandler(event, a, b) {
             const e = event.detail.output;
@@ -281,82 +293,67 @@ app.registerExtension({
 
             // 画布上是否已有图像
             const hasImagesOnCanvas = Object.keys(instance.inputImages).length > 0;
+            // 合成结果是否缺失（尚无上传的合成图像）
+            const imageNameWidget = getCompositorWidget(node, "imageName");
+            const imageNameValue = String(imageNameWidget?.value || "").trim();
+            const compositionMissing = !imageNameValue || imageNameValue === "new.png";
 
-            // configChanged 为 false 且画布已有图像时保持原位不重载；
-            // 画布为空时（如切换工作流再返回）需要从上游重新加载
-            if (!instance.configChanged && hasImagesOnCanvas) {
+            // configChanged 为 false、画布已有图像且已有合成结果时保持原位不重载；
+            // 画布为空（如切换工作流再返回）或合成结果缺失时需要重新加载
+            if (!instance.configChanged && hasImagesOnCanvas && !compositionMissing) {
                 return;
             }
 
-            // 清空前先把当前 transforms 持久化，避免 clearInputImages 导致位置丢失
-            try {
-                const currentSerialized = Editor.serializeStuff(node);
-                const currentParsed = JSON.parse(currentSerialized);
-                const hasValid = (currentParsed.transforms && Object.values(currentParsed.transforms).some((t) => t != null));
-                if (hasValid) {
-                    node.fabricDataWidget.value = currentSerialized;
-                }
-            } catch (e) { /* 忽略 */ }
+            // 图像加载沉淀后自动上传合成结果，保证直接运行/预览即可输出合成图像
+            const wantUpload = !!instance.configChanged || compositionMissing;
+
+            // 刷新前先把当前 transforms 持久化，避免位置丢失
+            instance.persistState();
 
             const restore = Editor.deserializeStuff(node.fabricDataWidget.value);
             const shouldRestore = restore ?? false;
 
-            // config 变化时清空旧图层；未变化且画布为空时无需清空
-            if (instance.configChanged) {
-                instance.clearInputImages();
-            }
-
             // 从后端 UI 输出获取 bg_image，fallback 到上游节点获取
             let bgEntries = Array.isArray(e.bg_entries) ? e.bg_entries : [];
-            bgEntries = bgEntries.filter((entry) => entry && entry.sig && imageSourceFromCandidate(entry));
+            bgEntries = bgEntries.filter((entry) => entry && entry.sig && imageSourceFromCandidate(entry, api));
 
             if (bgEntries.length > 0) {
-                const bgUrl = imageSourceFromCandidate(bgEntries[0]);
+                const bgUrl = imageSourceFromCandidate(bgEntries[0], api);
                 if (bgUrl) {
-                    fabric.Image.fromURL(bgUrl, function (oImg) {
+                    instance._loadTrackedImage(bgUrl, function (oImg) {
                         node.compositorInstance.setBgImage(oImg);
-                    }, { crossOrigin: "anonymous" });
+                    }, wantUpload);
                 }
             } else {
                 const bgUrls = getUpstreamImageUrls(node, "bg_image");
                 const bgUrl = bgUrls.length > 0 ? bgUrls[0] : null;
                 if (bgUrl) {
-                    fabric.Image.fromURL(bgUrl, function (oImg) {
+                    instance._loadTrackedImage(bgUrl, function (oImg) {
                         node.compositorInstance.setBgImage(oImg);
-                    }, { crossOrigin: "anonymous" });
+                    }, wantUpload);
                 }
             }
 
             // 优先从后端 images_entries（含 sig）获取图像，fallback 从上游节点获取（前端计算 sig）
             let imageEntries = Array.isArray(e.images_entries) ? e.images_entries : [];
-            imageEntries = imageEntries.filter((entry) => entry && entry.sig && imageSourceFromCandidate(entry));
+            imageEntries = imageEntries.filter((entry) => entry && entry.sig && imageSourceFromCandidate(entry, api));
 
+            let sources = [];
             if (imageEntries.length > 0) {
                 // 从后端 UI 输出获取（含 sig）
-                imageEntries.forEach((entry, index) => {
-                    const url = imageSourceFromCandidate(entry);
-                    if (!url) return;
-                    const sig = entry.sig;
-                    fabric.Image.fromURL(url, function (oImg) {
-                        if (!oImg || !oImg.width) return;
-                        node.compositorInstance.addOrReplaceImage(oImg, sig, nodeId, restore, shouldRestore, index);
-                    }, { crossOrigin: "anonymous" });
-                });
+                sources = imageEntries
+                    .map((entry) => ({ url: imageSourceFromCandidate(entry, api), sig: entry.sig }))
+                    .filter((s) => s.url);
             } else {
-                // fallback：后端未执行时从上游获取（前端计算 sig）
-                const upstreamImageUrls = getUpstreamImageUrls(node, "images");
-                upstreamImageUrls.forEach((url, index) => {
-                    if (!url) return;
-                    fabric.Image.fromURL(url, function (oImg) {
-                        if (!oImg || !oImg.width) return;
-                        const sig = computeFabricImageSig(oImg) || `upstream_${index}`;
-                        node.compositorInstance.addOrReplaceImage(oImg, sig, nodeId, restore, shouldRestore, index);
-                    }, { crossOrigin: "anonymous" });
-                });
+                // fallback：后端未执行时从上游获取
+                sources = getUpstreamImageUrls(node, "images")
+                    .filter(Boolean)
+                    .map((url) => ({ url, sig: null }));
             }
 
-            // 不在执行回调时调用 uploadIfNeeded：此时图像异步加载未完成，导出会得到空图；
-            // 上传应在用户点击 continue 时进行（continue 方法中先上传再执行）
+            // 按内容增量刷新图层：内容未变的图层保持原位（位置/锁定/隐藏状态不丢），
+            // 新图像加入画布，上游已不存在的图层移除
+            instance.reconcileLayers(sources, restore, shouldRestore, wantUpload, true);
         }
 
         // 注意：不监听 "executed" 事件。
@@ -366,6 +363,19 @@ app.registerExtension({
         // 第二次的 clearInputImages 会清空第一次刚恢复的图像并重新异步加载，
         // 复杂的异步时序会导致 transforms 丢失（位置信息清零）。
         api.addEventListener("compositor_init", executedMessageHandler);
+
+        // 拦截 app.queuePrompt：排队前确保画布节点合成图已上传，
+        // 运行时合成图像输出端口直接给出图像（外接预览节点直接显示），无需点「更新画布」
+        if (typeof app.queuePrompt === "function" && !app.__yuanCanvasQueuePatched) {
+            app.__yuanCanvasQueuePatched = true;
+            const origQueuePrompt = app.queuePrompt.bind(app);
+            app.queuePrompt = async function (...args) {
+                try {
+                    await ensureCanvasesUploadedBeforeQueue();
+                } catch (_) { /* 上传失败不阻塞排队 */ }
+                return origQueuePrompt(...args);
+            };
+        }
     },
     /** 网页加载（或重载）时调用，可劫持 app / graph（LiteGraph）修改 Comfy 核心行为。 */
     async init(args) {
@@ -401,27 +411,27 @@ app.registerExtension({
         const restore = Editor.deserializeStuff(node.fabricDataWidget.value);
         const shouldRestore = restore ?? false;
 
+        // 合成结果缺失时，图像加载沉淀后自动上传合成结果，保证直接运行/预览即可输出
+        const imageNameWidget = getCompositorWidget(node, "imageName");
+        const imageNameValue = String(imageNameWidget?.value || "").trim();
+        const compositionMissing = !imageNameValue || imageNameValue === "new.png";
+
         // bg_image：单张图像，直接从上游获取
         const bgUrls = getUpstreamImageUrls(node, "bg_image");
         const bgUrl = bgUrls.length > 0 ? bgUrls[0] : null;
         if (bgUrl) {
-            fabric.Image.fromURL(bgUrl, function (oImg) {
+            instance._loadTrackedImage(bgUrl, (oImg) => {
                 if (oImg && oImg.width) {
                     instance.setBgImage(oImg);
                 }
-            }, { crossOrigin: "anonymous" });
+            }, compositionMissing);
         }
 
-        // images：batch 多张图像，按 sig 恢复 transforms
-        const upstreamImageUrls = getUpstreamImageUrls(node, "images");
-        upstreamImageUrls.forEach((url, index) => {
-            if (!url) return;
-            fabric.Image.fromURL(url, function (oImg) {
-                if (!oImg || !oImg.width) return;
-                const sig = computeFabricImageSig(oImg) || `upstream_${index}`;
-                instance.addOrReplaceImage(oImg, sig, node.id, restore, shouldRestore, index);
-            }, { crossOrigin: "anonymous" });
-        });
+        // images：batch 多张图像，按内容增量刷新，按 sig 恢复 transforms
+        const sources = getUpstreamImageUrls(node, "images")
+            .filter(Boolean)
+            .map((url) => ({ url, sig: null }));
+        instance.reconcileLayers(sources, restore, shouldRestore, compositionMissing, false);
 
         // 刷新 firstRun 时间戳，保证下次手动执行时 IS_CHANGED 返回新值以重新拉取图像
         if (node.fabricDataWidget) {
@@ -514,11 +524,16 @@ app.registerExtension({
                 ? widget.computeLayoutSize.bind(widget) : null;
             widget.computeLayoutSize = (targetNode) => {
                 const p = prevCLS ? (prevCLS(targetNode) || {}) : {};
-                const size = compositorInstance.calculateNodeSize();
+                // DOM widget 行的布局尺寸 = 画布自身尺寸（w+2p × h+2p），
+                // 不得返回整节点尺寸（含标题/端口/按钮余量）：那会把 DOM 行撑高，
+                // 「更新画布」按钮与画布之间出现超过暂存边距的大段空白。
+                // 节点整体最小尺寸由 enforceV3Size 的 node.min_size/comfy-node min-height 负责。
+                const cw = compositorInstance.fcanvas ? compositorInstance.fcanvas.getWidth() : 0;
+                const ch = compositorInstance.fcanvas ? compositorInstance.fcanvas.getHeight() : 0;
                 return {
                     ...p,
-                    minWidth: Math.max(size[0], Number(p.minWidth || 0)),
-                    minHeight: Math.max(size[1], Number(p.minHeight || 0)),
+                    minWidth: Math.max(cw, Number(p.minWidth || 0)),
+                    minHeight: Math.max(ch, Number(p.minHeight || 0)),
                 };
             };
             compositorInstance.enforceV3Size();
@@ -528,19 +543,26 @@ app.registerExtension({
         // 移除 fabricData / imageName 的占位端口（避免节点被端口拉长）
         if (compositorInstance.v3NodeElement) {
             for (const name of ["fabricData", "imageName"]) {
-                const slot = node.findInputSlot(name);
-                if (slot >= 0 && !node.inputs[slot].link) {
-                    node.removeInput(slot);
-                }
+                removeV3PlaceholderInput(node, name);
             }
         }
 
         // grabUploadAndSetOutput 回调不能是 async，故把 widget 传给 uploadImage 直接处理
-        node.continue = node.addWidget("button", "continue", "continue", compositorInstance.continue.bind(compositorInstance));
+        // 「更新画布」按钮仅刷新画布（读取上游输入），不触发工作流执行
+        node.continue = node.addWidget("button", "更新画布", "更新画布", compositorInstance.continue.bind(compositorInstance));
+
+        // 节点移除时清理挂载在 document.body 上的键盘监听（setupfCanvasEvents 注册）
+        const origOnRemoved = node.onRemoved;
+        node.onRemoved = function () {
+            if (compositorInstance._bodyKeydownHandler) {
+                document.body.removeEventListener("keydown", compositorInstance._bodyKeydownHandler);
+                compositorInstance._bodyKeydownHandler = null;
+            }
+            if (origOnRemoved) origOnRemoved.apply(this, arguments);
+        };
     },
 });
 
-// 来自 melmass
 function hideWidgetForGood(node, widget, suffix = '') {
     widget.origType = widget.type
     widget.origComputeSize = widget.computeSize
@@ -558,13 +580,10 @@ function hideWidgetForGood(node, widget, suffix = '') {
 
 /** 将在节点创建时通过 addDOMWidget 添加到节点 */
 class Editor {
-    canvasEl;
     /** fabric canvas */
     fcanvas;
     /** 传给 addDomWidget 的 dom 元素 */
     containerDiv;
-    /** 上一张图像，可能只需要其哈希 */
-    cblob;
     /** fcanvas 中选中的对象，用于操作事件 */
     selected;
 
@@ -634,76 +653,6 @@ class Editor {
     }
 
 
-    static addCanvasBorderColorSetting() {
-        app.extensionManager.setting.set({
-            id: "Yuan_Canvas.Canvas.BORDER_COLOR",
-            name: "Border Color",
-            tooltip: "give an hex code with alpha, e.g.: #00b300b0, it's the area controlled by 'padding' size outside the  output that will not be exported but used for manipulation",
-            type: "text",
-            defaultValue: "#00b300b0",
-            onChange: (newVal, oldVal) => {
-            },
-        });
-    }
-
-    static addCompositionBorderColorSetting() {
-        app.extensionManager.setting.set({
-            id: "Yuan_Canvas.Composition.BORDER_COLOR",
-            name: "Border Color (not rendered)",
-            type: "text",
-            tooltip: "give hex code with alpha eg.: #00b300b0, this will help identifying what is withing the output",
-            defaultValue: "#00b300b0",
-            onChange: (newVal, oldVal) => {
-            },
-        });
-    }
-
-    static addCompositionBorderSizeSetting() {
-        app.extensionManager.setting.set({
-            id: "Yuan_Canvas.Composition.BORDER_SIZE",
-            name: "Border Size",
-            type: "slider",
-            attrs: {
-                min: 0,
-                max: 2,
-                step: 1
-            },
-            defaultValue: 2,
-            tooltip: "Border size, 0 for invisible, overlayed and unselectable, not part of the node ouptut",
-
-            onChange: (newVal, oldVal) => {
-            },
-        });
-    }
-
-    static addCompositionBackgroundColorSetting() {
-        app.extensionManager.setting.set({
-            id: "Yuan_Canvas.Composition.BACKGROUND_COLOR",
-            name: "Background Color - Output",
-            type: "text",
-            tooltip: "give hex code with alpha eg.: #00b300b0, this will help identifying what is withing the output",
-            defaultValue: "rgba(0,0,0,0.2)",
-            onChange: (newVal, oldVal) => {
-            },
-        });
-    }
-
-    static addCompositorSettings() {
-        Editor.addCanvasBorderColorSetting();
-        Editor.addCompositionBorderColorSetting();
-        Editor.addCompositionBorderSizeSetting();
-        Editor.addCompositionBackgroundColorSetting();
-    }
-
-    getCompositorSettings() {
-    }
-
-    static getRandomCompositorUniqueId() {
-        const randomUniqueIds = new Uint32Array(10);
-        const compositorId = 'c_' + self.crypto.getRandomValues(randomUniqueIds)[0] + '_' + self.crypto.getRandomValues(randomUniqueIds)[1];
-        return compositorId;
-    }
-
     static createCompositorContainerDiv() {
         const container = document.createElement("div");
         container.style.backgroundColor = "rgba(15,0,25,0.25)";
@@ -711,12 +660,6 @@ class Editor {
         // 需要设置 position: relative，浮动图层工具栏才能相对此容器定位
         container.style.position = "relative";
         return container;
-    }
-
-    static createCanvasElement() {
-        const canvas = document.createElement("canvas");
-        canvas.id = Editor.getRandomCompositorUniqueId();
-        return canvas;
     }
 
     onHeightChange(value) {
@@ -742,8 +685,6 @@ class Editor {
     }
 
     onPaddingChange(padding) {
-
-        // value 即 padding 值
         this.compositionArea.setHeight(this.h.value);
         this.compositionArea.setWidth(this.w.value);
         this.compositionArea.setLeft(padding);
@@ -781,18 +722,11 @@ class Editor {
     enforceV3Size() {
         try {
             const size = this.calculateNodeSize();
-            let el = this.containerDiv?.parentElement;
-            while (el) {
-                if ((el.tagName && el.tagName.toLowerCase().includes('comfy-node')) ||
-                    (el.classList && el.classList.contains('comfy-node'))) break;
-                el = el.parentElement || (el.getRootNode ? el.getRootNode().host : null);
-            }
+            const el = findComfyNodeEl(this.containerDiv?.parentElement);
             if (!el || !this.node) return;
             this.v3NodeElement = el;
             this.node.min_size = size;
-            el.style.removeProperty("min-width");
-            el.style.setProperty("min-width", size[0] + "px", "important");
-            el.style.setProperty("min-height", size[1] + "px", "important");
+            enforceV3MinSize(el, size[0], size[1]);
         } catch (_) {}
     }
 
@@ -1193,7 +1127,7 @@ class Editor {
         } catch (e) { /* 忽略 */ }
     }
 
-    /** 根据自定义 `locked` 标志应用 fabric.js 锁定属性（参照 pano_stickers 模式）。 */
+    /** 根据自定义 locked 标志应用 fabric.js 锁定属性。 */
     applyLock(img) {
         const locked = !!img.locked;
         img.set({
@@ -1203,28 +1137,12 @@ class Editor {
             lockScalingX: locked,
             lockScalingY: locked,
             hasControls: !locked,
-            // 保持可选，用户仍可点击选中（与 pano_stickers 行为一致）
+            // 保持可选，用户仍可点击选中
             selectable: true,
             evented: true,
         });
     }
 
-
-    /** 创建 fabric.Canvas 实例（透明背景、ctrlKey 组合键等统一配置）。 */
-    static createFabricCanvas(id) {
-        const canvasElement = document.getElementById(id);
-        const fcanvas = new fabric.Canvas(canvasElement, {
-            backgroundColor: 'transparent',
-            selectionColor: 'transparent',
-            selectionLineWidth: 1,
-            preserveObjectStacking: true,
-            altSelectionKey: "ctrlKey",
-            altActionKey: "ctrlKey",
-            centeredKey: "altKey",
-        });
-
-        return fcanvas;
-    }
 
     /** 将 data URL 转为 blob */
     static dataURLToBlob = (dataURL) => {
@@ -1237,7 +1155,7 @@ class Editor {
         }
         return new Blob([new Uint8Array(array)], {type: mime});
     }
-    static uploadImage = (blob, imageNameWidget, node_id, setDone, callback) => {
+    static uploadImage = (blob, imageNameWidget, node_id, callback) => {
         const node = app.graph.getNodeById(node_id);
 
         node.compositorInstance.compositionBorder.set("stroke", "orange");
@@ -1259,32 +1177,19 @@ class Editor {
             const outputValue = `compositor/${name} [temp]`;
             imageNameWidget.value = outputValue;
 
-            const body = new FormData();
-            body.append('filename', outputValue);
-            body.append('node_id', node_id);
-            body.append('overwrite', "true");
-
-
             node.compositorInstance.compositionBorder.set("stroke", node.compositorInstance.COMPOSITION_BORDER_COLOR);
             node.compositorInstance.fcanvas.renderAll();
 
             node.setDirtyCanvas(true, true);
             if (callback) callback()
-            // 已弃用，不再需要
-            if (setDone) api.fetchApi("/compositor/done", {method: "POST", body});
 
         }, () => {
             console.log("some error")
         });
     }
 
-    /** 若内存中没有 blob，说明是首次运行 */
-    hasNeverRun() {
-        return this.cblob == undefined
-    }
-
-    /** 不能是 async，故用 promise 解析和回调；setDone 已弃用，callback 为上传完成回调。 */
-    grabUploadAndSetOutput(instance, setDone, callback) {
+    /** 不能是 async，故用 promise 解析和回调；callback 为上传完成回调。 */
+    grabUploadAndSetOutput(instance, callback) {
         // 导出合成区域（w×h，偏移 padding）为图像数据
         const img = new Image();
         this.fcanvas.discardActiveObject().renderAll();
@@ -1298,19 +1203,13 @@ class Editor {
         });
 
         img.src = data;
-        // 导出后用临时名上传模拟合成，并更新输出名
+        // 导出后用临时名上传模拟合成，上传完成后直接更新输出名
         img.onload = (e) => {
 
             const blob = Editor.dataURLToBlob(data);
 
-            if (this.hasNeverRun()) {
-                Editor.uploadImage(blob, this.node.imageNameWidget, this.node.id, false, callback);
-            } else {
-                // 把 widget 传给 uploadImage，上传完成后直接更新输出名
-                Editor.uploadImage(blob, this.node.imageNameWidget, this.node.id, setDone, callback);
-            }
-
-            this.cblob = blob;
+            // 把 widget 传给 uploadImage，上传完成后直接更新输出名
+            Editor.uploadImage(blob, this.node.imageNameWidget, this.node.id, callback);
 
             // 有有效 transforms 时才持久化（只保存位置信息，不保存图像数据）
             const serialized = Editor.serializeStuff(this.node);
@@ -1324,13 +1223,160 @@ class Editor {
         }
     }
 
-    continue(setDone) {
-        // 先上传当前 composition（含 transforms），上传完成后再执行工作流
-        this.grabUploadAndSetOutput(this, setDone, () => {
-            app.queuePrompt(0, 1);
+    continue() {
+        // continue 仅更新画布：从上游输入重新读取图像，不触发工作流执行。
+        // 合成结果在图像加载沉淀后自动上传，直接运行/预览即可输出合成图像。
+        this.refreshFromUpstream();
+    }
+
+    /** 从上游节点重新读取 bg_image 与 images，按内容增量更新画布（不执行工作流）。 */
+    refreshFromUpstream() {
+        const node = this.node;
+        this.persistState();
+        const restore = Editor.deserializeStuff(node.fabricDataWidget.value);
+        const shouldRestore = restore ?? false;
+
+        // 背景图：从上游重新读取并 cover 铺满
+        const bgUrls = getUpstreamImageUrls(node, "bg_image");
+        const bgUrl = bgUrls.length > 0 ? bgUrls[0] : null;
+        if (bgUrl) {
+            this._loadTrackedImage(bgUrl, (oImg) => {
+                if (oImg && oImg.width) {
+                    this.setBgImage(oImg);
+                }
+            }, true);
+        }
+
+        // 图层图像：按内容增量刷新（内容未变的保持原位）
+        const sources = getUpstreamImageUrls(node, "images")
+            .filter(Boolean)
+            .map((url) => ({ url, sig: null }));
+        this.reconcileLayers(sources, restore, shouldRestore, true, false);
+    }
+
+    /**
+     * 按内容增量刷新画布图层：
+     * - 内容未变的图层保持原样（位置/锁定/隐藏状态不丢，不重新加载）
+     * - 上游新增的图像加入画布（按 sig 从 fabricData 恢复历史位置）
+     * - 上游已不存在的图层移出画布
+     * sources: [{url, sig}]，sig 为来源提供的键（后端 sig），可为 null（用内容签名作 key）
+     * clearWhenEmpty：sources 为空时是否清空全部图层（执行回调可信；主动刷新时保守保留）
+     */
+    reconcileLayers(sources, restoreData, shouldRestore, wantUpload, clearWhenEmpty) {
+        if (!this.fcanvas) return;
+        if (!sources || sources.length === 0) {
+            if (clearWhenEmpty) {
+                this.clearInputImages();
+                this.enforceLayerOrder();
+                this.fcanvas.renderAll();
+            }
+            return;
+        }
+
+        // 现有图层的内容签名（缓存到对象上，避免重复计算）
+        const existingSigToKey = {};
+        for (const key in this.inputImages) {
+            const img = this.inputImages[key];
+            if (!img) continue;
+            if (!img._yuanContentSig) img._yuanContentSig = computeFabricImageSig(img);
+            if (img._yuanContentSig) existingSigToKey[img._yuanContentSig] = key;
+        }
+
+        const incomingSigs = new Set();
+        let pending = sources.length;
+        const settle = () => {
+            pending -= 1;
+            if (pending > 0) return;
+            // 移除上游已不存在的图层
+            let removed = false;
+            for (const key in this.inputImages) {
+                const img = this.inputImages[key];
+                if (!img || !img._yuanContentSig) continue; // 无法识别内容的保守保留
+                if (incomingSigs.has(img._yuanContentSig)) continue;
+                try { this.fcanvas.remove(img); } catch (e) { /* 忽略 */ }
+                delete this.inputImages[key];
+                removed = true;
+            }
+            if (removed) {
+                this.hideLayerToolbar();
+                this.enforceLayerOrder();
+                this.fcanvas.renderAll();
+            }
+        };
+
+        sources.forEach((src, index) => {
+            if (!src || !src.url) {
+                settle();
+                return;
+            }
+            this._loadTrackedImage(src.url, (oImg) => {
+                try {
+                    if (!oImg || !oImg.width) return;
+                    const contentSig = computeFabricImageSig(oImg);
+                    if (!contentSig) return;
+                    if (incomingSigs.has(contentSig)) return; // 上游重复内容只保留一份
+                    incomingSigs.add(contentSig);
+                    if (!(contentSig in existingSigToKey)) {
+                        // 新内容：加入画布；key 优先用来源 sig，便于下次按 sig 恢复位置
+                        oImg._yuanContentSig = contentSig;
+                        this.addOrReplaceImage(oImg, src.sig || contentSig, this.node.id, restoreData, shouldRestore, index);
+                    }
+                    // 内容未变：保留现有图层（位置/锁定/隐藏状态原样）
+                } finally {
+                    settle();
+                }
+            }, wantUpload);
         });
     }
 
+    /**
+     * 加载图像并跟踪加载状态：完成后通知 _imageLoadActivity；
+     * wantUpload 为 true 时，所有图像加载沉淀后自动上传当前合成结果。
+     */
+    _loadTrackedImage(url, onReady, wantUpload) {
+        if (!url) return;
+        if (wantUpload) this._autoUploadWanted = true;
+        this._pendingImageLoads = (this._pendingImageLoads || 0) + 1;
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            this._pendingImageLoads = Math.max(0, (this._pendingImageLoads || 1) - 1);
+            this._imageLoadActivity();
+        };
+        // 加载异常未回调时兜底解除计数（约 8 秒）
+        setTimeout(done, 8000);
+        fabric.Image.fromURL(url, (oImg) => {
+            try {
+                if (onReady) onReady(oImg);
+            } finally {
+                done();
+                this._imageLoadActivity();
+            }
+        }, { crossOrigin: "anonymous" });
+    }
+
+    /** 图像加载活动：所有加载沉淀后（约 300ms 无新活动）自动上传合成结果。 */
+    _imageLoadActivity() {
+        clearTimeout(this._autoUploadTimer);
+        this._autoUploadTimer = setTimeout(() => {
+            if ((this._pendingImageLoads || 0) > 0) {
+                // 仍有图像在加载：稍后重试（上限约 3 秒，防个别加载失败卡住自动上传）
+                this._autoUploadRetries = (this._autoUploadRetries || 0) + 1;
+                if (this._autoUploadRetries <= 10) this._imageLoadActivity();
+                return;
+            }
+            this._autoUploadRetries = 0;
+            const wanted = !!this._autoUploadWanted;
+            this._autoUploadWanted = false;
+            if (!wanted || !this.fcanvas || !this.node) return;
+            // 画布上没有任何内容时不导出（避免上传空合成图）
+            const hasContent = !!this.bgImage || Object.keys(this.inputImages).length > 0;
+            if (!hasContent) return;
+            this.needsUpload = false;
+            this.grabUploadAndSetOutput(this);
+        }, 300);
+    }
 
     /** 在 fabric canvas 中移动激活对象；direction 为 [-1,1] 方向向量，withShift 时步长 10。 */
     moveSelected(direction = [], withShift = false) {
@@ -1426,8 +1472,9 @@ class Editor {
 
         this.fcanvas.on('mouse:wheel', function (opt) {
             try {
+                // 必须先判空再取 selected[0]（原顺序下空值已在上一行抛异常，判空恒不可达）
+                if (!this.selected) return;
                 if (opt.target.cacheKey !== this.selected[0].cacheKey) return;
-                if (!this.selected) return
 
                 const sign = Math.sign(opt.e.deltaY);
                 opt.target.scaleX = opt.target.scaleX + (sign * 0.01);
@@ -1442,7 +1489,7 @@ class Editor {
             }
         })
 
-        fabric.util.addListener(document.body, 'keydown', function keydownHandler(options) {
+        const keydownHandler = function (options) {
 
             var key = options.which || options.keyCode;
             if (isLeft(key)) {
@@ -1457,7 +1504,10 @@ class Editor {
 
                 compositorInstance.uploadIfNeeded(compositorInstance);
             }
-        }.bind(this));
+        }.bind(this);
+        // 挂在 document.body 上（不随画布 GC），保存引用供节点移除时清理
+        this._bodyKeydownHandler = keydownHandler;
+        fabric.util.addListener(document.body, 'keydown', keydownHandler);
     }
 
     uploadIfNeeded(compositorInstance, callback) {
@@ -1467,7 +1517,7 @@ class Editor {
             // 此时 inputImages 可能已被清空、图像异步加载未完成，serializeStuff 会拿到空数据，
             // 无条件覆盖会把 fabricData 中的 transforms 清空（位置丢失）。
             // 持久化由 grabUploadAndSetOutput 内部的 serializeStuff + hasValid 保护负责。
-            compositorInstance.grabUploadAndSetOutput(compositorInstance, false, callback)
+            compositorInstance.grabUploadAndSetOutput(compositorInstance, callback)
         }
     }
 
@@ -1507,13 +1557,10 @@ class Editor {
         const ch = this.fcanvas.getHeight();
         const cw = this.fcanvas.getWidth();
         // 余量：标题栏+端口+widgets+continue按钮+边框
-        // 之前 +91 不够导致绿色边框底部被截断
         return [cw + 28, ch + 160];
     }
 
     initFabric(c) {
-        this.getCompositorSettings()
-
         // wannabe widgets
         this.w = {
             value: 512, callback: (value, graphCanvas, node) => {
@@ -1538,19 +1585,10 @@ class Editor {
         this.containerDiv.style.width = initialW + "px";
         this.containerDiv.style.height = initialH + "px";
 
-        if (!c) {
-            this.canvasEl = Editor.createCanvasElement();
-            this.containerDiv.appendChild(this.canvasEl);
-            this.containerDiv.style.overflow = "hidden";
-            this.canvasEl.width = this.w.value + 2 * this.p.value;
-            this.canvasEl.height = this.h.value + 2 * this.p.value;
-            this.fcanvas = Editor.createFabricCanvas(this.canvasEl);
-        } else {
-            this.containerDiv.style.overflow = "hidden";
-            this.fcanvas = c;
-            this.fcanvas.setWidth(this.w.value + 2 * this.p.value);
-            this.fcanvas.setHeight(this.h.value + 2 * this.p.value);
-        }
+        this.containerDiv.style.overflow = "hidden";
+        this.fcanvas = c;
+        this.fcanvas.setWidth(this.w.value + 2 * this.p.value);
+        this.fcanvas.setHeight(this.h.value + 2 * this.p.value);
 
         this.compositionArea = this.createCompositionArea();
         this.compositionBorder = this.createCompositionBorder();

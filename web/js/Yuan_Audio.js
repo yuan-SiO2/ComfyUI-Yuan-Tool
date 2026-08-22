@@ -662,7 +662,7 @@
                 }
             }
 
-            // --- 8. 从输入目录添加音频（复刻原生加载音频的文件列表） ---
+            // --- 8. 从输入目录添加音频 ---
             async function openFilePicker() {
                 let files = [];
                 try {

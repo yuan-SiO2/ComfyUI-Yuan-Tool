@@ -32,14 +32,14 @@
 
     const DEG2RAD = Math.PI / 180;
 
-    // 交互参数（复刻 GJJ 360 全景浏览器的操作手感）
-    const DRAG_SENSITIVITY = 0.34;   // deg / px（≈ GJJ 的 0.006 rad/px，固定灵敏度）
+    // 交互参数
+    const DRAG_SENSITIVITY = 0.34;   // deg / px（固定灵敏度）
     const WHEEL_ZOOM_OUT = 1.08;     // 滚轮放大方向（deltaY>0）的乘数
     const WHEEL_ZOOM_IN = 0.92;      // 滚轮缩小方向（deltaY<0）的乘数
     const FOV_MIN = 22.5;            // ≈ π/8 rad
     const FOV_MAX = 165.6;           // ≈ π*0.92 rad
-    const FOV_DEFAULT = 82;          // ≈ π/2.2 rad（GJJ 默认 FOV）
-    const PITCH_LIMIT = 88.3;        // ≈ π/2 - 0.03 rad（GJJ 极点安全余量）
+    const FOV_DEFAULT = 82;          // ≈ π/2.2 rad
+    const PITCH_LIMIT = 88.3;        // ≈ π/2 - 0.03 rad（极点安全余量）
     const SYNC_DEBOUNCE_MS = 150;    // 视图数据同步防抖
     const DPR_MAX = 1.5;             // 限制 DPR 以降低 GPU 负载
 
@@ -708,7 +708,7 @@
                 const dy = ev.clientY - this.lastY;
                 this.lastX = ev.clientX;
                 this.lastY = ev.clientY;
-                // 复刻 GJJ：grab 约定，拖右 → 视角左移；拖下 → 视角上抬
+                // grab 约定：拖右 → 视角左移；拖下 → 视角上抬
                 const dYaw = -dx * DRAG_SENSITIVITY;
                 const dPitch = dy * DRAG_SENSITIVITY;
                 this._applyDelta(dYaw, dPitch);
@@ -732,7 +732,7 @@
             root.addEventListener("wheel", (ev) => {
                 const delta = Number(ev.deltaY ?? ev.wheelDeltaY ?? 0);
                 if (delta !== 0) {
-                    // 复刻 GJJ：乘法缩放，deltaY>0 放大（×1.08），deltaY<0 缩小（×0.92）
+                    // 乘法缩放：deltaY>0 放大（×1.08），deltaY<0 缩小（×0.92）
                     const factor = delta > 0 ? WHEEL_ZOOM_OUT : WHEEL_ZOOM_IN;
                     this.view.fov = clamp(this.view.fov * factor, FOV_MIN, FOV_MAX);
                     this.requestDraw();
@@ -756,7 +756,7 @@
         }
 
         _applyDelta(dYaw, dPitch) {
-            // 复刻 GJJ：固定灵敏度，无动态缩放，直接 1:1 映射
+            // 固定灵敏度，无动态缩放，直接 1:1 映射
             this.view.yaw = this._wrapYaw(this.view.yaw + dYaw);
             this.view.pitch = clamp(this.view.pitch + dPitch, -PITCH_LIMIT, PITCH_LIMIT);
         }
@@ -964,7 +964,7 @@
             }
 
             this.inTick = false;
-            // 复刻 GJJ：无惯性，仅在需要重绘或视频播放时持续 RAF
+            // 无惯性，仅在需要重绘或视频播放时持续 RAF
             const shouldContinue = this.needsDraw
                 || this.queued
                 || (this.img instanceof HTMLVideoElement && !this.img.paused && !this.img.ended);
@@ -1018,7 +1018,7 @@
     name: "ComfyUI-Yuan-Tool.Panorama",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== PREVIEW_NODE) return;
-        // 复刻 GJJ 360 全景生成器：节点自带 WebGL 预览，关闭默认输出预览避免重复
+        // 节点自带 WebGL 预览，关闭默认输出预览避免重复
         nodeData.output_preview = false;
         if (Array.isArray(nodeData.outputs)) {
             for (const output of nodeData.outputs) output.preview = false;

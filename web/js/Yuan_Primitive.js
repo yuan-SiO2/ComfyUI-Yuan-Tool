@@ -1,21 +1,14 @@
-// ==================== 复刻原生 Primitive 节点 → Yuan Tool/选项 ====================
-// 在原生 PrimitiveNode 之上做完整隔离，适配各整合包前端版本（含 1.48.x）：
-//   隔离1 注册名/标题：type="YuanPrimitive"，实例 title 强制设为 Yuan 的标题，
-//          防止原生实例字段把标题覆盖回 "Primitive"、或被 V3 的
-//          type==="PrimitiveNode" 判定误收进原生 primitive 集合；
-//   隔离2 COMBO 判定增强：兼容全部 spec 形态（数组式 / "COMBO" 合并式 /
-//          options 对象式），COMBO 一律生成 Yes/No 互斥开关，绝不回落
-//          super._createWidget（那会退化为原生下拉+「生成后控制」样式）；
-//   隔离3 写回兜底：comfyAPI.widgetValuePropagation.applyFirstWidgetValueToGraph
-//          缺失或签名变化时，用内置实现直接把选中值写入目标 widget，
-//          兼容 V2(graph.links[id]) 与 V3(graph._links.get(id)) 两种链接容器；
-//   隔离4 原生类缺失兜底：老整合包无 window.comfyAPI.widgetInputs.PrimitiveNode
-//          时注册最小基类，节点仍可用（仅失去原生生命周期，需手动连一次线）。
-// 非 COMBO 输入仍走原生行为。
+// 「选项」节点（YuanPrimitive）：基于原生 PrimitiveNode 的隔离实现，
+// COMBO 输入展开为 Yes/No 互斥开关并写回目标节点，非 COMBO 输入保持原生行为；标题/端口名汉化。
 const { app } = window.comfyAPI.app;
 
 const YUAN_PRIMITIVE_TYPE = "YuanPrimitive";
-const YUAN_PRIMITIVE_TITLE = "选项 (Primitive)";
+const YUAN_PRIMITIVE_TITLE = "选项";
+const YUAN_PRIMITIVE_OUTPUT_NAME = "连接到选项输入";
+const YUAN_PRIMITIVE_DESCRIPTION =
+    "把输出端口连接到任意下拉选项输入端口（如「MiniMax-H3 视频生成」的「模式」），" +
+    "即自动读回该输入的全部选项并展开为一组互斥开关（Yes/No），点选开关即可切换取值并写回目标节点。" +
+    "非下拉输入（数值/文本等）保持原生 Primitive 行为。本节点为 Yuan Tool 前端节点，与官方 Primitive 相互独立。";
 
 app.registerExtension({
     name: "Comfy.Yuan.Primitive.Options",
@@ -27,7 +20,7 @@ app.registerExtension({
             return;
         }
 
-        // 隔离4：原生类缺失时的最小基类（不依赖 comfyAPI.widgetInputs）
+        // 原生类缺失时的最小基类（不依赖 comfyAPI.widgetInputs）
         const Base = PrimitiveNode ?? class {
             constructor() {
                 this.outputs = [];
@@ -45,11 +38,11 @@ app.registerExtension({
         class YuanPrimitive extends Base {
             constructor(title) {
                 super(title);
-                // 隔离1：强制实例标题，防原生实例字段/父类构造把标题改回 "Primitive"
+                // 强制实例标题，防止被父类构造改回 "Primitive"
                 this.title = YUAN_PRIMITIVE_TITLE;
                 this.serialize_widgets = true;
                 this.isVirtualNode = true;
-                if (!this.outputs?.length) this.addOutput("connect to widget input", "*");
+                if (!this.outputs?.length) this.addOutput(YUAN_PRIMITIVE_OUTPUT_NAME, "*");
             }
 
             // 从任意 spec 形态中提取 COMBO 选项数组；非 COMBO 返回 null
@@ -77,7 +70,7 @@ app.registerExtension({
                     if (typeof this._finalizeWidget === "function") {
                         this._finalizeWidget(s, w, h, r);
                     } else {
-                        // 隔离4兜底：内置基类无原生私有方法，手动恢复尺寸
+                        // 内置基类无原生私有方法，手动恢复尺寸
                         this.size = [w, h];
                         this.setSize?.(this.computeSize?.() ?? this.size);
                         if (r) this.applyToGraph();
@@ -138,7 +131,7 @@ app.registerExtension({
                 return null;
             }
 
-            // 隔离3：把选中值写入目标 widget 的内置兜底，
+            // 把选中值写入目标 widget 的内置兜底，
             // 兼容 V2 links 数组与 V3 links Map 两种容器
             _applyValueFallback(selected) {
                 const graph = this.graph;
@@ -171,7 +164,7 @@ app.registerExtension({
                 if (typeof apply === "function") {
                     apply(this, links, () => selected);
                 } else {
-                    // 隔离3：API 缺失时兜底，保证开关点击始终生效
+                    // API 缺失时兜底，保证开关点击始终生效
                     this._applyValueFallback(selected);
                     for (const l of links) {
                         const link = typeof l === "number"
@@ -190,14 +183,30 @@ app.registerExtension({
             }
         }
 
-        // 与官方一致的注册姿势；重复注册（前端热重载）仅替换，无副作用
+        // 重复注册（前端热重载）仅替换，无副作用
         LiteGraph.registerNodeType(
             YUAN_PRIMITIVE_TYPE,
-            Object.assign(YuanPrimitive, { title: YUAN_PRIMITIVE_TITLE })
+            Object.assign(YuanPrimitive, {
+                title: YUAN_PRIMITIVE_TITLE,
+                // 静态 description：前端为纯前端注册节点生成节点定义时读取
+                // （updateVueAppNodeDefs: description = r.description ?? "Frontend only node for ..."）
+                description: YUAN_PRIMITIVE_DESCRIPTION,
+            })
         );
         YuanPrimitive.category = "Yuan Tool/选项";
         if (!PrimitiveNode) {
             console.warn("[YuanTool] 未获取到原生 PrimitiveNode，'选项' 节点已用内置基类注册（功能受限：连接后请手动点击开关写入）。");
+        }
+    },
+
+    // 汉化 V3 节点库/搜索：前端为纯前端注册节点生成的定义默认
+    // display_name=类型名（"YuanPrimitive"），注册进 Vue 应用前改写为中文
+    beforeRegisterVueAppNodeDefs(defs) {
+        if (!Array.isArray(defs)) return;
+        const def = defs.find((d) => d && d.name === YUAN_PRIMITIVE_TYPE);
+        if (def) {
+            def.display_name = YUAN_PRIMITIVE_TITLE;
+            def.description = YUAN_PRIMITIVE_DESCRIPTION;
         }
     },
 });

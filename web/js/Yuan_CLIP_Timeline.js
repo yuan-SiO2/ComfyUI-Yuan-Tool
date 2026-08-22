@@ -132,15 +132,6 @@ const STYLES = `
 .yuan-clip-tl-properties select:disabled {
   opacity: 0.55; cursor: not-allowed;
 }
-.yuan-clip-tl-btn-row { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
-.yuan-clip-tl-mini-btn {
-  background: #3a3a3a; color: #eee; border: 1px solid #555;
-  border-radius: 3px; padding: 4px 10px; cursor: pointer; font-size: 11px;
-  white-space: nowrap; transition: background 0.15s;
-}
-.yuan-clip-tl-mini-btn:hover { background: #4a4a4a; }
-.yuan-clip-tl-mini-btn.danger { background: #5a3030; border-color: #7a4040; }
-.yuan-clip-tl-mini-btn.danger:hover { background: #6a3838; }
 .yuan-clip-tl-strength-row { display: flex; gap: 6px; align-items: center; }
 .yuan-clip-tl-strength-val {
   font-size: 10px; color: #aaa; min-width: 32px; text-align: right;
@@ -148,10 +139,6 @@ const STYLES = `
 }
 .yuan-clip-tl-checkbox-label {
   display: flex; align-items: center; gap: 5px; cursor: pointer; font-size: 11px; color: #ddd;
-}
-.yuan-clip-tl-file-name {
-  font-size: 10px; color: #888; word-break: break-all; padding: 2px 4px;
-  background: #1e1e1e; border-radius: 2px;
 }
 .yuan-clip-tl-image-preview {
   max-width: 100%; max-height: 110px; border: 1px solid #444; border-radius: 3px;
@@ -226,6 +213,56 @@ function pickColor(existingColors) {
   const idx = existingColors.size;
   const hue = (idx * 137.508) % 360;
   return `hsl(${hue.toFixed(0)}, 55%, 55%)`;
+}
+
+// 构建 /view 图像 URL，支持类型前缀：output:subfolder/filename 或 input:subfolder/filename（默认 input）
+function buildViewUrl(file) {
+  if (!file) return null;
+  let type = 'input';
+  let path = file.replace(/\\/g, '/');
+  const colonIdx = path.indexOf(':');
+  if (colonIdx > 0 && colonIdx < 10) {
+    const prefix = path.slice(0, colonIdx);
+    if (prefix === 'output' || prefix === 'input' || prefix === 'temp') {
+      type = prefix;
+      path = path.slice(colonIdx + 1);
+    }
+  }
+  const parts = path.split('/');
+  const filename = parts.pop();
+  const subfolder = parts.join('/');
+  let url = `/view?filename=${encodeURIComponent(filename)}&type=${type}`;
+  if (subfolder) url += `&subfolder=${encodeURIComponent(subfolder)}`;
+  return url;
+}
+
+// 从连接到 全局提示词 输入槽的上游节点读取文本（widget 值优先，回退候选 widget）
+function readUpstreamGlobalPrompt(node) {
+  if (!node || !node.graph) return null;
+  const inputIdx = node.findInputSlot ? node.findInputSlot("全局提示词") : -1;
+  if (inputIdx < 0) return null;
+  const linkId = node.inputs[inputIdx]?.link;
+  if (linkId == null || linkId === -1) return null;
+  // V3 前端 graph.links 为 Map，V2 为数组，两种容器取值兼容
+  const link = node.graph.links.get?.(linkId) ?? node.graph.links[linkId];
+  if (!link) return null;
+  const srcNode = node.graph.getNodeById(link.origin_id);
+  if (!srcNode) return null;
+  const candidates = [];
+  for (const w of (srcNode.widgets || [])) {
+    if (w.type === "customtext" || w.name === "string" || (w.name && /^(text|prompt|string|multiline|global_prompt)$/i.test(w.name))) {
+      candidates.push(w);
+    }
+  }
+  if (candidates.length === 0) {
+    for (const w of (srcNode.widgets || [])) {
+      if (!w.hidden && typeof w.value === "string" && w.value.trim()) candidates.push(w);
+    }
+  }
+  if (candidates.length === 0) return null;
+  const stringW = candidates.find(w => w.name === "string");
+  if (stringW && stringW.value?.trim()) return stringW.value;
+  return candidates.map(w => w.value).filter(v => typeof v === "string" && v.trim()).join("\n") || null;
 }
 
 function injectStyles() {
@@ -576,7 +613,8 @@ class TimelineEditor {
     this.container.addEventListener("pointerleave", () => { this._mouseOver = false; });
 
     // 键盘快捷键：Ctrl+C 复制、Ctrl+V 粘贴、Delete/Backspace 删除
-    document.addEventListener("keydown", (e) => {
+    // handler 保存为 _keyHandler，destroy() 时移除，避免 document 级监听泄漏
+    this._keyHandler = (e) => {
       if (!this._mouseOver) return;
       // 焦点在输入框/文本域/选择框时不拦截，避免影响属性面板编辑
       const ae = document.activeElement;
@@ -594,7 +632,8 @@ class TimelineEditor {
         e.preventDefault(); e.stopPropagation();
         if (!this.promptLocked) this._deleteSelectedAny();
       }
-    });
+    };
+    document.addEventListener("keydown", this._keyHandler);
 
     this.addBtn.addEventListener("click", () => { if (!this.promptLocked) this.addSegment(); });
     this.deleteBtn.addEventListener("click", () => { if (!this.promptLocked) this.deleteSelected(); });
@@ -655,7 +694,7 @@ class TimelineEditor {
         // 优先使用 widget 值，若为空则尝试从上游连接节点读取
         const val = this.globalPromptWidget.value || "";
         if (!val.trim()) {
-          const upstream = this._readConnectedGlobalPrompt();
+          const upstream = readUpstreamGlobalPrompt(this.node);
           if (upstream) {
             this.timeline.global_prompt = upstream;
           } else {
@@ -697,24 +736,7 @@ class TimelineEditor {
   }
 
   _buildImageUrl(file) {
-    if (!file) return null;
-    // 支持类型前缀：output:subfolder/filename 或 input:subfolder/filename（默认 input）
-    let type = 'input';
-    let path = file.replace(/\\/g, '/');
-    const colonIdx = path.indexOf(':');
-    if (colonIdx > 0 && colonIdx < 10) {
-      const prefix = path.slice(0, colonIdx);
-      if (prefix === 'output' || prefix === 'input' || prefix === 'temp') {
-        type = prefix;
-        path = path.slice(colonIdx + 1);
-      }
-    }
-    const parts = path.split('/');
-    const filename = parts.pop();
-    const subfolder = parts.join('/');
-    let url = `/view?filename=${encodeURIComponent(filename)}&type=${type}`;
-    if (subfolder) url += `&subfolder=${encodeURIComponent(subfolder)}`;
-    return url;
+    return buildViewUrl(file);
   }
 
   _loadImageForSeg(idx) {
@@ -773,29 +795,35 @@ class TimelineEditor {
     for (const i of validKeys) this._loadImageForSeg(i);
   }
 
-  // ── 段落图像 端口支持：实时读取上游节点图像（类似 文本输入 实时映射） ──
+  // ── 段落图像 端口支持：实时读取上游节点图像 ──
 
   hasSegmentImagesConnected() {
     const input = this.node.inputs?.find(i => i.name === "段落图像");
     return !!(input && input.link != null);
   }
 
-  // 获取 segment_images 连接的上游节点
-  _getUpstreamNode() {
+  // 按输入槽名获取连接的上游节点（段落图像/运动图像/音频输入 共用）
+  _getUpstreamNodeBySlot(slotName) {
     const node = this.node;
     if (!node || !node.graph) return null;
-    const inputIdx = node.findInputSlot ? node.findInputSlot("段落图像") : -1;
+    const inputIdx = node.findInputSlot ? node.findInputSlot(slotName) : -1;
     if (inputIdx < 0) return null;
     const linkId = node.inputs[inputIdx]?.link;
     if (linkId == null) return null;
-    const link = node.graph.links[linkId];
+    // V3 前端 graph.links 为 Map，V2 为数组，两种容器取值兼容
+    const link = node.graph.links.get?.(linkId) ?? node.graph.links[linkId];
     if (!link) return null;
     return node.graph.getNodeById(link.origin_id);
   }
 
+  // 获取 segment_images 连接的上游节点
+  _getUpstreamNode() {
+    return this._getUpstreamNodeBySlot("段落图像");
+  }
+
   // 从上游节点实时获取图像列表（nodeOutputs 优先，回退到 srcNode.imgs / widget）
-  _getUpstreamSegmentImages() {
-    const srcNode = this._getUpstreamNode();
+  // 段落图像 与 运动图像 两个端口共用同一读取逻辑
+  _readUpstreamImages(srcNode) {
     if (!srcNode) return null;
 
     const comfyApi = app.api || window.comfyAPI?.api?.api || window.api || window.comfyAPI?.api;
@@ -890,6 +918,10 @@ class TimelineEditor {
     return null;
   }
 
+  _getUpstreamSegmentImages() {
+    return this._readUpstreamImages(this._getUpstreamNode());
+  }
+
   // 将上游图像实时分配到时间段段落（第1张→第1段、第2张→第2段……）
   _applyUpstreamSegmentImages() {
     // 锁定状态下拒绝上游数据，完全以时间轴编辑器内的数据为准
@@ -938,101 +970,11 @@ class TimelineEditor {
   }
 
   _getUpstreamMotionNode() {
-    const node = this.node;
-    if (!node || !node.graph) return null;
-    const inputIdx = node.findInputSlot ? node.findInputSlot("运动图像") : -1;
-    if (inputIdx < 0) return null;
-    const linkId = node.inputs[inputIdx]?.link;
-    if (linkId == null) return null;
-    const link = node.graph.links[linkId];
-    if (!link) return null;
-    return node.graph.getNodeById(link.origin_id);
+    return this._getUpstreamNodeBySlot("运动图像");
   }
 
   _getUpstreamMotionImages() {
-    const srcNode = this._getUpstreamMotionNode();
-    if (!srcNode) return null;
-
-    const comfyApi = app.api || window.comfyAPI?.api?.api || window.api || window.comfyAPI?.api;
-
-    // 方式1：从 ComfyUI nodeOutputs 获取
-    const nodeOutputs = comfyApi?.nodeOutputs || {};
-    const outputs = nodeOutputs[String(srcNode.id)] || nodeOutputs[srcNode.id];
-    if (outputs?.images?.length > 0) {
-      return outputs.images.map(img => ({
-        filename: img.filename,
-        subfolder: img.subfolder || "",
-        type: img.type || "output",
-      }));
-    }
-
-    // 方式2：从 srcNode.imgs 获取（节点已加载的渲染缩略图，无需执行）
-    if (srcNode.imgs?.length) {
-      return srcNode.imgs.map((img, i) => {
-        let src = null;
-        if (typeof img === 'string') src = img;
-        else if (img instanceof HTMLImageElement) src = img.currentSrc || img.src;
-        else if (img?.src) src = img.src;
-        if (src) {
-          const url = new URL(src, window.location.origin);
-          const fname = url.searchParams.get('filename') || '';
-          const ftype = url.searchParams.get('type') || 'input';
-          const fsub = url.searchParams.get('subfolder') || '';
-          if (fname) return { filename: fname, subfolder: fsub, type: ftype };
-        }
-        return null;
-      }).filter(Boolean);
-    }
-
-    // 方式3：从上游节点 widget 读取
-    const widgetNames = ["image", "images", "image_paths", "file", "files", "dirpath"];
-    const imgWidgets = (srcNode.widgets || []).filter(w =>
-      widgetNames.includes(w.name) || /^(image|img|file|path|folder|directory)/i.test(w.name)
-    );
-    for (const w of imgWidgets) {
-      const val = w.value;
-      if (!val) continue;
-      if (typeof val === "string") {
-        const trimmed = val.trim();
-        if (!trimmed) continue;
-        if (trimmed.includes("\n")) {
-          const lines = trimmed.split("\n").map(l => l.trim()).filter(l => l.length > 0);
-          if (lines.length > 0) {
-            return lines.map(line => {
-              const norm = line.replace(/\\/g, '/');
-              const parts = norm.split('/');
-              const filename = parts.pop();
-              const subfolder = parts.join('/');
-              return { filename, subfolder, type: "input" };
-            });
-          }
-        }
-        const norm = trimmed.replace(/\\/g, '/');
-        const parts = norm.split('/');
-        const filename = parts.pop();
-        const subfolder = parts.join('/');
-        return [{ filename, subfolder, type: "input" }];
-      }
-      if (typeof val === "object" && val.filename) {
-        return [{ filename: val.filename, subfolder: val.subfolder || "", type: val.type || "input" }];
-      }
-      if (Array.isArray(val) && val.length > 0) {
-        return val.map(v => {
-          if (typeof v === "string") {
-            const norm = v.replace(/\\/g, '/');
-            const parts = norm.split('/');
-            const fn = parts.pop();
-            return { filename: fn, subfolder: parts.join('/'), type: "input" };
-          }
-          if (typeof v === "object" && v.filename) {
-            return { filename: v.filename, subfolder: v.subfolder || "", type: v.type || "input" };
-          }
-          return null;
-        }).filter(Boolean);
-      }
-    }
-
-    return null;
+    return this._readUpstreamImages(this._getUpstreamMotionNode());
   }
 
   // 将上游图像分配到 IC-LoRA 轨道：多张图像合并为单个段，携带 frameFiles 走 IC-LoRA 视频路径
@@ -1064,7 +1006,7 @@ class TimelineEditor {
 
       // 描述字段：按顺序对应 @图X=描述；无对应角色定义时为空
       const charDesc = (i < chars.length) ? chars[i].desc : "";
-      // 显式绑定 @图X 编号（第 i 张图对应 @图(i+1)），后端据此反查，不再依赖数组下标
+      // 显式绑定 @图X 编号（第 i 张图对应 @图(i+1)），后端据此反查，不依赖数组下标
       const seg = {
         videoFile: ref,
         frameFiles: [ref],
@@ -1145,15 +1087,7 @@ class TimelineEditor {
   }
 
   _getUpstreamAudioInputNode() {
-    const node = this.node;
-    if (!node || !node.graph) return null;
-    const inputIdx = node.findInputSlot ? node.findInputSlot("音频输入") : -1;
-    if (inputIdx < 0) return null;
-    const linkId = node.inputs[inputIdx]?.link;
-    if (linkId == null) return null;
-    const link = node.graph.links[linkId];
-    if (!link) return null;
-    return node.graph.getNodeById(link.origin_id);
+    return this._getUpstreamNodeBySlot("音频输入");
   }
 
   _getUpstreamAudioInputId() {
@@ -1240,7 +1174,7 @@ class TimelineEditor {
       return true;
     }
 
-    // 场景2：前端主动从上游获取（连接时/上游执行完成时，参考运动图像同步创建段）
+    // 场景2：前端主动从上游获取（连接时/上游执行完成时）
     const audioInfo = this._getUpstreamAudioInput();
     if (!audioInfo) return false;
 
@@ -1258,7 +1192,7 @@ class TimelineEditor {
       }
     }
 
-    // 同步创建段（使用默认长度，后续异步更新真实长度）——参考运动图像的同步创建模式
+    // 同步创建段（使用默认长度，后续异步更新真实长度）
     const defaultLen = Math.max(MIN_SEGMENT_LENGTH, Math.floor(max / 4));
     const slot = this._findFreeSlot(existing, defaultLen, max);
     const { start, length: segLen } = slot;
@@ -1930,8 +1864,7 @@ class TimelineEditor {
       backAllocated += len;
     }
     // 修正源段长度以吸收舍入误差，保持总长精确
-    segs[sourceIdx].length = totalLen - frontAllocated - backAllocated;
-    segs[sourceIdx].length = Math.max(MIN_SEGMENT_LENGTH, segs[sourceIdx].length);
+    segs[sourceIdx].length = Math.max(MIN_SEGMENT_LENGTH, totalLen - frontAllocated - backAllocated);
     let cursor = 0;
     for (const seg of segs) { seg.start = cursor; cursor += seg.length; }
     // 源段中心跨越相邻段中心时交换顺序（实现重排）
@@ -2237,10 +2170,10 @@ class TimelineEditor {
         });
         if (result?.name) {
           const seg = this.timeline.motionSegments[idx];
+          // 清除旧缩略图缓存（须在赋新值前删除旧键）
+          this._videoThumbCache.delete(seg.videoFile);
           seg.videoFile = result.name;
           seg.trimStart = 0.0;
-          // 清除旧缩略图缓存
-          this._videoThumbCache.delete(seg.videoFile);
           this.commitChanges();
           this.updateUIFromSelection();
           this.render();
@@ -2292,12 +2225,12 @@ class TimelineEditor {
             } catch (_) { peaks = []; }
           }
           const seg = this.timeline.audioSegments[idx];
+          // 清除旧波形缓存（须在赋新值前删除旧键）
+          this._audioBufferCache.delete(seg.audioFile);
           seg.audioFile = audioName;
           seg.audioB64 = "";
           seg.fileName = file.name;
           seg.trimStart = 0.0;
-          // 清除旧波形缓存
-          this._audioBufferCache.delete(audioName);
           this.audioPeaksCache.set(audioName, peaks || []);
           this.commitChanges();
           this.updateUIFromSelection();
@@ -2314,7 +2247,7 @@ class TimelineEditor {
     input.click();
   }
 
-  // ── 物理碰撞分配：在已有段中找第一个能放下新长度的空位（参考 LTX Director 算法） ──
+  // ── 物理碰撞分配：在已有段中找第一个能放下新长度的空位 ──
   // 返回 { start, length }，length 可能被截断以适应总长度
   _findFreeSlot(segments, desiredLength, max) {
     if (!Array.isArray(segments)) segments = [];
@@ -2670,7 +2603,7 @@ class TimelineEditor {
   // ── text_input 智能分配 ──
 
   // 获取应保留的 motionSegments/audioSegments：优先从现有 timeline，其次从 timelineDataWidget 解析
-  // 避免 _buildTimelineFromLines 重建 segments 时清空 motion/audio 轨道（切换工作流丢失 bug 的根因）
+  // 避免 _buildTimelineFromLines 重建 segments 时清空 motion/audio 轨道
   _preservedMotionAudio() {
     let motionSegments = [];
     let audioSegments = [];
@@ -2772,7 +2705,8 @@ class TimelineEditor {
     if (inputIdx < 0) return null;
     const linkId = node.inputs[inputIdx]?.link;
     if (linkId == null) return null;
-    const link = node.graph.links[linkId];
+    // V3 前端 graph.links 为 Map，V2 为数组，两种容器取值兼容
+    const link = node.graph.links.get?.(linkId) ?? node.graph.links[linkId];
     if (!link) return null;
     const srcNode = node.graph.getNodeById(link.origin_id);
     if (!srcNode) return null;
@@ -2799,40 +2733,10 @@ class TimelineEditor {
     return this._readConnectedTextInput();
   }
 
-  // ── 全局提示词 上游连接读取（与 文本输入 保持一致） ──
-
-  _readConnectedGlobalPrompt() {
-    const node = this.node;
-    if (!node || !node.graph) return null;
-    const inputIdx = node.findInputSlot ? node.findInputSlot("全局提示词") : -1;
-    if (inputIdx < 0) return null;
-    const linkId = node.inputs[inputIdx]?.link;
-    if (linkId == null || linkId === -1) return null;
-    const link = node.graph.links[linkId];
-    if (!link) return null;
-    const srcNode = node.graph.getNodeById(link.origin_id);
-    if (!srcNode) return null;
-    const candidates = [];
-    for (const w of (srcNode.widgets || [])) {
-      if (w.type === "customtext" || w.name === "string" || (w.name && /^(text|prompt|string|multiline|global_prompt)$/i.test(w.name))) {
-        candidates.push(w);
-      }
-    }
-    if (candidates.length === 0) {
-      for (const w of (srcNode.widgets || [])) {
-        if (!w.hidden && typeof w.value === "string" && w.value.trim()) candidates.push(w);
-      }
-    }
-    if (candidates.length === 0) return null;
-    const stringW = candidates.find(w => w.name === "string");
-    if (stringW && stringW.value?.trim()) return stringW.value;
-    return candidates.map(w => w.value).filter(v => typeof v === "string" && v.trim()).join("\n") || null;
-  }
-
   _syncGlobalPromptFromUpstream() {
     // 锁定状态下拒绝上游数据，完全以时间轴编辑器内的数据为准
     if (this.promptLocked) return;
-    const upstream = this._readConnectedGlobalPrompt();
+    const upstream = readUpstreamGlobalPrompt(this.node);
     if (upstream && upstream.trim()) {
       this.timeline.global_prompt = upstream;
       // 同时更新 widget 值（如果 widget 存在且未被隐藏）
@@ -3124,7 +3028,7 @@ class TimelineEditor {
       grid.appendChild(f);
     };
 
-    // 描述（独占一行，参考主轨段落提示词编辑方法）
+    // 描述（独占一行）
     const descTextarea = document.createElement("textarea");
     descTextarea.value = seg.description || "";
     descTextarea.readOnly = this.promptLocked;
@@ -3972,6 +3876,10 @@ class TimelineEditor {
   }
 
   destroy() {
+    if (this._keyHandler) {
+      document.removeEventListener("keydown", this._keyHandler);
+      this._keyHandler = null;
+    }
     this.resizeObserver?.disconnect();
     if (this._textCommitTimer) {
       clearTimeout(this._textCommitTimer);
@@ -4236,7 +4144,7 @@ app.registerExtension({
           }
         }, isConnect ? 150 : 50);
       }
-      // 段落图像 连接时，实时读取上游节点图像（类似 文本输入 实时映射）
+      // 段落图像 连接时，实时读取上游节点图像
       if (ioSlot?.name === "段落图像" && isConnect) {
         setTimeout(() => this._timelineEditor?._applyUpstreamSegmentImages(), 100);
       }
@@ -4244,7 +4152,7 @@ app.registerExtension({
       if (ioSlot?.name === "运动图像" && isConnect) {
         setTimeout(() => this._timelineEditor?._applyUpstreamMotionImages(), 100);
       }
-      // 音频输入 连接时，主动从上游读取音频并添加到音频轨道（参考运动图像）
+      // 音频输入 连接时，主动从上游读取音频并添加到音频轨道
       if (ioSlot?.name === "音频输入" && isConnect) {
         setTimeout(() => this._timelineEditor?._applyUpstreamAudioInput(), 100);
       }
@@ -4254,7 +4162,7 @@ app.registerExtension({
 });
 
 // ============================================================================
-// @ 标记自动补全扩展（复刻自 ComfyUI-Yuan-Tool 注入了@图像和视觉模型）
+// @ 标记自动补全扩展
 // 在 global_prompt / text_input / 时间轴编辑器中输入 @ 时弹出角色选择菜单
 // ============================================================================
 (function() {
@@ -4305,7 +4213,7 @@ app.registerExtension({
         if (!promptText) return [];
         const markers = [];
         // 与后端 _MSR_CHAR_PATTERN 严格对齐：仅识别 @图数字=描述，避免前端识别 @角色A=xxx
-        // 而后端不替换导致的字面量泄漏。按真实换行解析，不再把逗号转成换行（修复多逗号描述被截断）。
+        // 而后端不替换导致的字面量泄漏。按真实换行解析，不把逗号转成换行。
         const lines = promptText.split('\n');
         for (const line of lines) {
             const trimmed = line.trim();
@@ -4319,27 +4227,6 @@ app.registerExtension({
             }
         }
         return markers;
-    }
-
-    // ── 构建图像 view URL（与 _buildImageUrl 逻辑一致）──
-    function buildImageViewUrl(file) {
-        if (!file) return null;
-        let type = 'input';
-        let path = file.replace(/\\/g, '/');
-        const colonIdx = path.indexOf(':');
-        if (colonIdx > 0 && colonIdx < 10) {
-            const prefix = path.slice(0, colonIdx);
-            if (prefix === 'output' || prefix === 'input' || prefix === 'temp') {
-                type = prefix;
-                path = path.slice(colonIdx + 1);
-            }
-        }
-        const parts = path.split('/');
-        const filename = parts.pop();
-        const subfolder = parts.join('/');
-        let url = `/view?filename=${encodeURIComponent(filename)}&type=${type}`;
-        if (subfolder) url += `&subfolder=${encodeURIComponent(subfolder)}`;
-        return url;
     }
 
     // ── 从 motion_images 输入端 / TimelineEditor 缓存获取缩略图 ──
@@ -4359,17 +4246,17 @@ app.registerExtension({
                         results.push({ src: cachedImg.src, index: i });
                     } else {
                         // 缓存未命中时用 view URL，触发异步加载
-                        const url = buildImageViewUrl(seg.videoFile);
+                        const url = buildViewUrl(seg.videoFile);
                         if (url) results.push({ src: url, index: i });
                     }
                 }
                 // 视频文件或 frameFiles：用第一帧
                 else if (seg.videoFile) {
-                    const url = buildImageViewUrl(seg.videoFile);
+                    const url = buildViewUrl(seg.videoFile);
                     if (url) results.push({ src: url, index: i });
                 }
                 else if (seg.frameFiles && Array.isArray(seg.frameFiles) && seg.frameFiles.length > 0) {
-                    const url = buildImageViewUrl(seg.frameFiles[0]);
+                    const url = buildViewUrl(seg.frameFiles[0]);
                     if (url) results.push({ src: url, index: i });
                 }
             }
@@ -4389,7 +4276,7 @@ app.registerExtension({
                         results.push({ src: cachedImg.src, index: i });
                     } else {
                         // 缓存未命中时用 view URL
-                        const url = buildImageViewUrl(seg.imageFile);
+                        const url = buildViewUrl(seg.imageFile);
                         if (url) results.push({ src: url, index: i });
                     }
                 } else if (seg.imageB64) {
@@ -4413,7 +4300,7 @@ app.registerExtension({
         if (linkId == null || linkId === -1) return [];
 
         let linkData;
-        try { linkData = graph.links[linkId]; } catch(e) {}
+        try { linkData = graph.links.get?.(linkId) ?? graph.links[linkId]; } catch(e) {}
         if (!linkData) { try { linkData = graph._links?.get(linkId); } catch(e2) {} }
         if (!linkData) return [];
         const srcNode = graph._nodes?.find(n => n?.id === linkData.origin_id) ||
@@ -4473,41 +4360,6 @@ app.registerExtension({
         }
     }
 
-    // ── 从连接的源节点读取 全局提示词 文本 ──
-    function readConnectedGlobalPrompt(node) {
-        if (!node || !node.graph) return null;
-        const inputIdx = node.findInputSlot ? node.findInputSlot("全局提示词") : -1;
-        if (inputIdx < 0) return null;
-        const linkId = node.inputs[inputIdx]?.link;
-        if (linkId == null) return null;
-
-        const link = node.graph.links[linkId];
-        if (!link) return null;
-        const srcNode = node.graph.getNodeById(link.origin_id);
-        if (!srcNode) return null;
-
-        const candidates = [];
-        for (const w of (srcNode.widgets || [])) {
-            if (w.type === "customtext" || w.name === "string" || (w.name && /^(text|prompt|string|multiline|global_prompt)$/i.test(w.name))) {
-                candidates.push(w);
-            }
-        }
-        if (candidates.length === 0) {
-            for (const w of (srcNode.widgets || [])) {
-                if (!w.hidden && typeof w.value === "string" && w.value.trim()) {
-                    candidates.push(w);
-                }
-            }
-        }
-        if (candidates.length === 0) return null;
-
-        const stringW = candidates.find(w => w.name === "string");
-        if (stringW && stringW.value?.trim()) return stringW.value;
-
-        const combined = candidates.map(w => w.value).filter(v => typeof v === "string" && v.trim()).join("\n");
-        return combined || null;
-    }
-
     // ── 构建并显示弹窗 ──
     function showPopup(textEl, node) {
         const existing = document.querySelector('.timeline-atsign-popup');
@@ -4517,15 +4369,17 @@ app.registerExtension({
         // 优先读取 widget 值；外接连接时 widget 被隐藏，回退到从连接的源节点读取
         let promptText = gpWidget?.value || '';
         if (!promptText.trim()) {
-            const connected = readConnectedGlobalPrompt(node);
+            const connected = readUpstreamGlobalPrompt(node);
             if (connected) promptText = connected;
         }
         let markers = parseMarkersFromPrompt(promptText);
 
+        // 获取缩略图（仅调用一次），按 @图X 数字匹配
+        const thumbs = getRefThumbnails(node);
+
         // markers 为空时，从已上传的运动图像缩略图自动生成 @图X 标记
         // 这样用户即使没写 @图X=描述 行，输入 @ 也能看到已上传的图像供选择
         if (markers.length === 0) {
-            const thumbs = getRefThumbnails(node);
             if (thumbs.length === 0) return;
             markers = thumbs.map((t, i) => ({
                 name: '@图' + (i + 1),
@@ -4535,9 +4389,6 @@ app.registerExtension({
             }));
         }
 
-
-        // 获取缩略图，按 @图X 数字匹配
-        const thumbs = getRefThumbnails(node);
         const thumbMap = {};
         for (const t of thumbs) {
             thumbMap[`@图${t.index + 1}`] = t;
@@ -4717,7 +4568,7 @@ app.registerExtension({
     function init() {
         scanTextareas();
 
-        // 新 textarea 出现时由 MutationObserver 响应式触发，不再使用 setInterval 轮询
+        // 新 textarea 出现时由 MutationObserver 响应式触发
         if (window.MutationObserver) {
             const observer = new MutationObserver(() => {
                 const all = document.querySelectorAll('textarea');
