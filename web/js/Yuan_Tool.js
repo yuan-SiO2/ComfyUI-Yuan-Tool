@@ -442,7 +442,7 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
     };
 }
 
-// ==================== resize_type 条件参数（RTX 视频放大 / H3 放大通用）====================
+// ==================== resize_type 条件参数（RTX 视频放大 / H3 放大 / 缩放Latent（比例）通用）====================
 // 缩放方式为「按倍数缩放」时只显示 scale，为「目标尺寸」时只显示 width/height
 function registerResizeTypeConditionalWidgets(nodeType) {
     const UPSCALE_BY = "按倍数缩放";
@@ -452,6 +452,7 @@ function registerResizeTypeConditionalWidgets(nodeType) {
     const syncResizeWidgets = (self) => {
         const resizeWidget = self.widgets.find(w => w.name === "resize_type");
         if (!resizeWidget) return;
+        self._lastResizeTypeValue = resizeWidget.value;
         const isByScale = resizeWidget.value === UPSCALE_BY;
         const scaleWidget = self.widgets.find(w => w.name === "scale");
         const widthWidget = self.widgets.find(w => w.name === "width");
@@ -486,6 +487,19 @@ function registerResizeTypeConditionalWidgets(nodeType) {
     nodeType.prototype.onConfigure = function (info) {
         const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
         syncResizeWidgets(this);
+        return r;
+    };
+
+    // V3 (Nodes 2.0)：Vue 下拉组件直接改 widget.value、不走原生 callback，
+    // 每帧轻量比对 resize_type 值，变化即同步显隐（V2 下与 callback 路径幂等）
+    const onDrawForeground = nodeType.prototype.onDrawForeground;
+    nodeType.prototype.onDrawForeground = function () {
+        const r = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
+        if (!this.widgets) return r;
+        const resizeWidget = this.widgets.find(w => w.name === "resize_type");
+        if (resizeWidget && resizeWidget.value !== this._lastResizeTypeValue) {
+            syncResizeWidgets(this);
+        }
         return r;
     };
 }
@@ -635,6 +649,8 @@ app.registerExtension({
         } else if (nodeData.name === "Yuan_RTXVideoUpscaleH3") {
             registerResizeTypeConditionalWidgets(nodeType);
         } else if (nodeData.name === "Yuan_H3Upscale3D") {
+            registerResizeTypeConditionalWidgets(nodeType);
+        } else if (nodeData.name === "Yuan_LatentUpscaleBy") {
             registerResizeTypeConditionalWidgets(nodeType);
         } else if (nodeData.name === "Yuan_H3MotionContext") {
             registerYuanH3MotionContext(nodeType);
