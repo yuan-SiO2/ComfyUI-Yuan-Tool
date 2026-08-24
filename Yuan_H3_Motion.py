@@ -1276,13 +1276,15 @@ def _resolve_prefix(dir_part, prefix, idx):
 
 def _dir_fingerprint(prefix_path):
     """目录级综合指纹：对 prefix_path 所在目录下所有 prefix_*.safetensors
-    按「文件名 + 内容」计算 SHA256，任一文件新增/覆盖/删除都会改变指纹。
+    按「文件名 + mtime + size」计算指纹（仅读元数据、不读文件内容），
+    任一文件新增/覆盖/删除都会改变指纹。
 
     用于「加载潜空间」的 IS_CHANGED：该阶段链接输入拿不到真实值，
     片段序号来自 GetNode/表达式链路时不可用，因此对
-    整个存储目录做指纹——新片段保存（内容变化）→ 指纹变化 → 下游重跑；
-    同一片段重试（内容不变）→ 缓存命中。目录不存在时返回确定性 "missing"
-    标记（可缓存），首次保存出现文件后指纹变化自然触发重跑。
+    整个存储目录做指纹——保存节点每次覆盖写入同一路径（mtime 必变）
+    → 指纹变化 → 下游重跑；同一片段重试（内容不变）→ 缓存命中。
+    目录不存在时返回确定性 "missing" 标记（可缓存），首次保存出现
+    文件后指纹变化自然触发重跑。
     """
     p = (prefix_path or "").strip().strip('"').strip("'")
     if not p:
@@ -1299,9 +1301,9 @@ def _dir_fingerprint(prefix_path):
             for fname in files:
                 h.update(fname.encode("utf-8"))
                 try:
-                    with open(os.path.join(dir_part, fname), "rb") as f:
-                        for chunk in iter(lambda: f.read(1 << 20), b""):
-                            h.update(chunk)
+                    st = os.stat(os.path.join(dir_part, fname))
+                    h.update(("%d:%d;" % (st.st_mtime_ns, st.st_size))
+                             .encode("utf-8"))
                 except OSError:
                     pass
             return "%s:%s" % (p, h.hexdigest())
