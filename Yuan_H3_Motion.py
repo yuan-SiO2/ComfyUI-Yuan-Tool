@@ -120,17 +120,9 @@ def _ref_segment_map(layout, refs):
 
 
 def _cond_t(text_len, latent_t, frame_count, p):
-    """锚定在像素帧 p 的关键帧时间坐标。
-
-    首/末两端复用 stock 的精确表达式：与一般公式数学等价，但 stock 是
-    逐步累加 latent_t 浮点值、一般公式只做一次乘法，末位位元（约7e-15）
-    不同。逐位一致保证已存在的首/末帧图在补丁后构建出字节相同的坐标，
-    自测才能保持严格。
-    """
+    """锚定在像素帧 p 的关键帧时间坐标。"""
     if p == 0:
         return float(text_len)
-    if frame_count is not None and p == frame_count - 1:
-        return float(text_len) + sum(mm._video_t_spans(latent_t)) - mm.FRAME_RESCALE
     return float(text_len) + mm.FRAME_RESCALE * float(p)
 
 
@@ -217,7 +209,7 @@ def _fixup_audio(layout, text_len, refs):
 def _patched_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
                   keyframes=None, refs=None, frame_count=None):
     _layout_orig_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
-                      keyframes=keyframes, refs=refs, frame_count=frame_count)
+                      keyframes=keyframes, refs=refs)
     has_mc_kf = bool(keyframes) and any(
         kf.get(MC_KEY) is not None for kf in keyframes)
     has_mc_audio = bool(refs) and any(
@@ -243,7 +235,7 @@ def _layout_self_test():
     def build(keyframes=None, refs=None, fix=False, move=False):
         lay = mm.PackedLayout.__new__(mm.PackedLayout)
         _layout_orig_init(lay, text_len, latent_t, lh, lw, audio_t,
-                          keyframes=keyframes, refs=refs, frame_count=frame_count)
+                          keyframes=keyframes, refs=refs)
         if fix:
             _fixup(lay, text_len, latent_t, frame_count, keyframes, refs)
         if move:
@@ -255,10 +247,11 @@ def _layout_self_test():
                 for a, _, k in lay.segments if k == "cond"]
 
     # 1. stock 支持的两端锚点必须逐位一致
-    stock_kf = [{"resolved_frame_index": 0},
-                {"resolved_frame_index": frame_count - 1}]
-    ours_kf = [{"resolved_frame_index": 0, MC_KEY: 0},
-               {"resolved_frame_index": 0, MC_KEY: frame_count - 1}]
+    dummy_lat = torch.zeros(1, 24, 1, lh // 2, lw // 2)
+    stock_kf = [{"resolved_frame_index": 0, "latent": dummy_lat},
+                {"resolved_frame_index": frame_count - 1, "latent": dummy_lat}]
+    ours_kf = [{"resolved_frame_index": 0, MC_KEY: 0, "latent": dummy_lat},
+               {"resolved_frame_index": 0, MC_KEY: frame_count - 1, "latent": dummy_lat}]
     a = build(keyframes=stock_kf)
     b = build(keyframes=ours_kf, fix=True)
     if a.position_ids.shape != b.position_ids.shape:
@@ -268,7 +261,7 @@ def _layout_self_test():
         raise RuntimeError("position mismatch at rows %s" % bad[:8].tolist())
 
     # 2. 连续锚点须在两端点界定的区间内严格递增
-    run = [{"resolved_frame_index": 0, MC_KEY: i} for i in range(4)]
+    run = [{"resolved_frame_index": 0, MC_KEY: i, "latent": dummy_lat} for i in range(4)]
     c = build(keyframes=run, fix=True)
     ts = cond_ts(c)
     if len(ts) != len(run):
