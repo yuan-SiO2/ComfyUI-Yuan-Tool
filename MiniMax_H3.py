@@ -21,6 +21,207 @@ except Exception:  # 旧版 ComfyUI 无 H3 模型模块时用相同数值兜底
     FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
     FRAME_RESCALE = 5.0 / 3.0
 
+
+# ==================== 旧版核心（< v0.34.0）H3 修复反向移植 ====================
+# v0.34.0 核心修复了三处 MiniMax-H3 问题，这里把修复移植进插件，使旧核心也获得
+# 正确行为；检测到新版核心（已含修复）时自动跳过：
+#   1. #15808 分词器缺少 <d>/<|cutoff|> 等特殊 token，台词标签被切成垃圾子词，
+#      语音生成异常（注册后的 id 与官方分词器一致：151669-151675）
+#   2. #15439 PackedLayout 仅支持首/末帧锚点且丢弃关键帧音频 latent，数字人模式受损
+#   3. model_base 关键帧/参考共存时条件 latent 列表被参考覆盖、关键帧音频不收集
+try:
+    import inspect
+
+    import comfy.text_encoders.minimax as _h3_te
+
+    if not hasattr(_h3_te, "MINIMAX_EXTRA_TOKENS"):
+        _H3_EXTRA_TOKENS = ("<d>", "</d>", "<|cutoff|>", "<|lyrics_start|>",
+                            "<|lyrics_end|>", "<|caption_start|>", "<|caption_end|>")
+        _h3_te_orig_init = _h3_te.MiniMaxH3Tokenizer.__init__
+
+        def _h3_te_init_with_extra_tokens(self, embedding_directory=None, tokenizer_data={}):
+            _h3_te_orig_init(self, embedding_directory=embedding_directory, tokenizer_data=tokenizer_data)
+            tok = self.qwen3vl_32b.tokenizer
+            missing = [t for t in _H3_EXTRA_TOKENS if t not in tok.get_vocab()]
+            if missing:
+                tok.add_special_tokens({"additional_special_tokens": missing})
+                # 与官方修复一致：add_special_tokens 后重建反向词表（untokenize 用）
+                self.qwen3vl_32b.inv_vocab = {v: k for k, v in tok.get_vocab().items()}
+
+        _h3_te.MiniMaxH3Tokenizer.__init__ = _h3_te_init_with_extra_tokens
+except Exception:
+    pass
+
+try:
+    import inspect
+
+    import comfy.ldm.minimax.model as _h3_model
+    import comfy.model_base as _model_base
+
+    if "frame_count" in inspect.signature(_h3_model.PackedLayout.__init__).parameters:
+
+        def _h3_ref_t_span(blk):
+            # 参考块在目标流之前占据的时间轴跨度（v0.34.0 同名函数）
+            kind = blk["kind"]
+            if kind == "image":
+                return 1.0
+            if kind == "audio":
+                return float(blk["ref_audio_t"])
+            if kind in ("video", "video_audio"):
+                return max(float(blk["ref_audio_t"]), sum(_h3_model._video_t_spans(blk["latent_t"])))
+            return 0.0
+
+        def _h3_packed_layout_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
+                                   keyframes=None, refs=None, frame_count=None):
+            # v0.34.0 PackedLayout 逻辑；frame_count 参数仅为兼容旧调用点保留，不再使用。
+            # 关键帧音频段沿用 "ref_audio" 段类型（v0.34.0 命名为 cond_audio，两者在旧核心
+            # _forward 中的时间步/模态标签处理完全一致，沿用旧名可免去改动 _forward）
+            frame, w_grid = _h3_model._frame_grid(latent_h, latent_w)
+            frame_rows = frame.shape[0]
+
+            segments = [("text", text_len)]
+            g = torch.zeros(text_len, 3, dtype=torch.float64)
+            g[:, 0] = torch.arange(text_len, dtype=torch.float64)
+            pos = [g]
+
+            img_pos, img_update = [], []
+            audio_pos, audio_update = [], []
+            row = text_len
+
+            target_audio_w = (float(w_grid[0]), float(w_grid[-1]))
+            # 参考块排在文本与目标流之间，目标时间轴起点在参考块跨度之后
+            cursor = float(text_len)
+            for blk in refs or ():
+                cursor += _h3_ref_t_span(blk)
+
+            if keyframes:
+                # 锚点从目标时间轴起点计数：每像素帧 FRAME_RESCALE，每音频 latent 帧 1.0
+                for kf in keyframes:
+                    cond_t = cursor + _h3_model.FRAME_RESCALE * kf["resolved_frame_index"]
+                    video_latent = kf.get("latent")
+                    if video_latent is not None:
+                        vt = video_latent.shape[2]
+                        n = vt * frame_rows
+                        segments.append(("cond", n))
+                        pos.append(_h3_model._video_grid(vt, frame, cond_t))
+                        img_pos.append(torch.arange(row, row + n))
+                        img_update.append(torch.zeros(n, dtype=torch.bool))
+                        row += n
+                    audio_latent = kf.get("audio_latent")
+                    if audio_latent is not None:
+                        rt = audio_latent.shape[-1]
+                        segments.append(("ref_audio", rt * 2))
+                        pos.append(_h3_model._audio_grid(cond_t, rt, *target_audio_w))
+                        audio_pos.append(torch.arange(row, row + rt * 2))
+                        audio_update.append(torch.zeros(rt * 2, dtype=torch.bool))
+                        row += rt * 2
+
+            if refs:
+                cursor = float(text_len)
+                for blk in refs:
+                    kind = blk["kind"]
+                    if kind == "image":
+                        r_frame, _ = _h3_model._frame_grid(blk["latent_h"], blk["latent_w"])
+                        n = r_frame.shape[0]
+                        g = torch.empty(n, 3, dtype=torch.float64)
+                        g[:, 0] = cursor
+                        g[:, 1:] = r_frame
+                        segments.append(("ref_img", n))
+                        pos.append(g)
+                        img_pos.append(torch.arange(row, row + n))
+                        img_update.append(torch.zeros(n, dtype=torch.bool))
+                        row += n
+                        cursor += 1.0
+                    elif kind == "audio":
+                        rt = blk["ref_audio_t"]
+                        if rt > 0:
+                            segments.append(("ref_audio", rt * 2))
+                            pos.append(_h3_model._audio_grid(cursor, rt, *target_audio_w))
+                            audio_pos.append(torch.arange(row, row + rt * 2))
+                            audio_update.append(torch.zeros(rt * 2, dtype=torch.bool))
+                            row += rt * 2
+                        cursor += float(rt)
+                    elif kind in ("video", "video_audio"):
+                        # 音轨行紧贴在视频行之前，两者共享同一游标起点
+                        rt = blk["ref_audio_t"]
+                        vt = blk["latent_t"]
+                        r_frame, r_w_grid = _h3_model._frame_grid(blk["latent_h"], blk["latent_w"])
+                        if rt > 0:
+                            segments.append(("ref_audio", rt * 2))
+                            pos.append(_h3_model._audio_grid(cursor, rt, float(r_w_grid[0]), float(r_w_grid[-1])))
+                            audio_pos.append(torch.arange(row, row + rt * 2))
+                            audio_update.append(torch.zeros(rt * 2, dtype=torch.bool))
+                            row += rt * 2
+                        n = vt * r_frame.shape[0]
+                        segments.append(("ref_img", n))
+                        pos.append(_h3_model._video_grid(vt, r_frame, cursor))
+                        img_pos.append(torch.arange(row, row + n))
+                        img_update.append(torch.zeros(n, dtype=torch.bool))
+                        row += n
+                        cursor += max(float(rt), sum(_h3_model._video_t_spans(vt)))
+
+            # 目标音频与目标视频始终是最后两段
+            segments.append(("audio", audio_t * 2))
+            pos.append(_h3_model._audio_grid(cursor, audio_t, *target_audio_w))
+            audio_pos.append(torch.arange(row, row + audio_t * 2))
+            audio_update.append(torch.ones(audio_t * 2, dtype=torch.bool))
+            row += audio_t * 2
+
+            n_video = latent_t * frame_rows
+            segments.append(("video", n_video))
+            pos.append(_h3_model._video_grid(latent_t, frame, cursor))
+            img_pos.append(torch.arange(row, row + n_video))
+            img_update.append(torch.ones(n_video, dtype=torch.bool))
+            row += n_video
+
+            self.seq_len = row
+            self.position_ids = torch.cat(pos)
+            self.img_pos = torch.cat(img_pos)
+            self.img_update = torch.cat(img_update)
+            self.audio_pos = torch.cat(audio_pos)
+            self.audio_update = torch.cat(audio_update)
+            self.signature = (text_len, latent_t, latent_h, latent_w, audio_t)
+            seg_abs = []
+            off = 0
+            for kind, n in segments:
+                seg_abs.append((off, off + n, kind))
+                off += n
+            self.segments = seg_abs
+
+        _h3_model.PackedLayout.__init__ = _h3_packed_layout_init
+
+        # 旧核心 extra_conds 的缺陷：关键帧缺 latent 键直接 KeyError（纯音频引导）、
+        # 关键帧与参考共存时参考列表覆盖关键帧列表、关键帧音频 latent 不收集
+        _h3_orig_extra_conds = _model_base.MiniMaxH3.extra_conds
+
+        class _H3KeyframeDict(dict):
+            # 旧核心按 kf["latent"] 直接取键，纯音频关键帧会 KeyError；包装后缺失键
+            # 返回 None，随后由本包装函数按 v0.34.0 规则重建条件 latent 列表
+            def __missing__(self, key):
+                return None
+
+        def _h3_extra_conds(self, **kwargs):
+            keyframes = kwargs.get("minimax_keyframes")
+            if keyframes:
+                kwargs["minimax_keyframes"] = [_H3KeyframeDict(kf) for kf in keyframes]
+            out = _h3_orig_extra_conds(self, **kwargs)
+            pc = out.get("minimax_payload")
+            if pc is not None and keyframes:
+                payload = pc.cond
+                refs = kwargs.get("minimax_refs")
+                payload["cond_video_latents"] = [kf["latent"] for kf in keyframes if kf.get("latent") is not None]
+                audio_latents = [kf["audio_latent"] for kf in keyframes if kf.get("audio_latent") is not None]
+                if refs:
+                    payload["cond_video_latents"] += [r["latent"] for r in refs if "latent" in r]
+                    audio_latents += [r["audio_latent"] for r in refs if r.get("audio_latent") is not None]
+                if audio_latents:
+                    payload["cond_audio_latents"] = audio_latents
+            return out
+
+        _model_base.MiniMaxH3.extra_conds = _h3_extra_conds
+except Exception:
+    pass
+
 CANVAS_MULTIPLE = 32
 BASE_SHORT_EDGE = 768
 MAX_PIXELS = 768 * 1344
