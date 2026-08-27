@@ -98,13 +98,13 @@ class YUAN_TXTJsonExtractor:
             "required": {
                 "json": (AnyType("*"), {
                     "forceInput": True,
-                    "tooltip": "JSON 数据输入，支持 JSON 字符串或对象。"
+                    "tooltip": "JSON 数据输入，支持 JSON 字符串或对象。字符串可为多个 JSON 对象拼接（如分镜策划五档案与视频提示词对象合并），自动逐段解析合并提取。"
                 }),
                 "索引": ("INT", {
                     "default": 1,
                     "min": 1,
                     "step": 1,
-                    "tooltip": "对应分镜序列中的「编号」值，选择该编号的分镜。分镜序列端口整合输出 detailed_description(整体风格) + [Shot N]编号的时间段 + overall_soundscape(环境音) + non_diegetic_music(BGM)，标签与内容之间仅换行不空行；BGM开关关闭时 non_diegetic_music 内容输出 N/A；分镜「类型」含武戏时时间段不加 [Shot N] 编号、原行输出；角色道具场景端口先在时间段内容中智能匹配角色和道具档案（台词保护：引号对与 <d>...</d> 标签内出现的名称不匹配、不提取），再根据该分镜标题智能匹配场景档案，按 角色→道具→场景 顺序输出对应档案的完整描述，整体以 retention_analysis: 开头换行输出，每条描述前加 <Picture N> 序号（从1连续编号）；角色索引/道具索引端口输出匹配到的角色/道具在对应档案中的0基序号（逗号分隔），场景索引端口输出匹配到的场景档案0基序号（未匹配为空），三者均受对应输出开关控制，关时输出空文本；索引时长端口锁定该分镜「类型」字段中的时长（如 武戏：12秒、文戏：8s，单位 s 或无单位均可）。"
+                    "tooltip": "对应分镜序列/分镜情节中的「编号」值，选择该编号的分镜。分镜序列端口默认输出 detailed_description(整体风格) + [Shot N]编号的时间段 + overall_soundscape(环境音) + non_diegetic_music(BGM)，标签与内容之间仅换行不空行；BGM开关关闭时 non_diegetic_music 内容输出 N/A；情节开关开启时改为输出「分镜情节」中该编号分镜的「情节」内容；分镜「类型」含武戏时时间段不加 [Shot N] 编号、原行输出；角色道具场景端口优先取「分镜情节」条目的 出现角色/出现道具/出现场景 列表定位角色、道具、场景档案（未提供时在时间段内容中智能匹配角色和道具、按标题智能匹配场景；台词保护：引号对与 <d>...</d> 标签内出现的名称不匹配、不提取），按 角色→道具→场景 顺序输出对应档案的完整描述，整体以 retention_analysis: 开头换行输出，每条描述前加 <Picture N> 序号（从1连续编号）；角色索引/道具索引端口输出匹配到的角色/道具在对应档案中的0基序号（逗号分隔），场景索引端口输出匹配到的场景档案0基序号（未匹配为空），三者均受对应输出开关控制，关时输出空文本；索引时长端口锁定该分镜「类型」字段中的时长（如 武戏：12秒、文戏：8s，单位 s 或无单位均可）。"
                 }),
                 "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
                     "default": "角色档案",
@@ -138,6 +138,13 @@ class YUAN_TXTJsonExtractor:
                     "display_name": "BGM输出",
                     "tooltip": "控制「分镜序列」端口中 non_diegetic_music(BGM) 内容：开=正常输出 BGM，关=输出 N/A。"
                 }),
+                "情节开关": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "输出",
+                    "label_off": "整合格式",
+                    "display_name": "情节输出",
+                    "tooltip": "控制「分镜序列」端口输出内容：开=输出「分镜情节」中该编号分镜的「情节」内容（纯文本，替代整合格式）；关=输出 detailed_description(整体风格) + [Shot N]时间段 + 环境音 + BGM 整合格式。未找到对应分镜情节时回退为整合格式。"
+                }),
             },
         }
 
@@ -166,6 +173,44 @@ class YUAN_TXTJsonExtractor:
             return str(val)
         except Exception:
             return ""
+
+    @staticmethod
+    def _parse_json_text(text):
+        """解析 JSON 字符串：先整体解析；失败时按多个 JSON 对象拼接处理（raw_decode 逐段解析并合并，同名键后者覆盖）。
+
+        支持多个 JSON 对象拼接输入（如分镜策划五档案与视频提示词对象合并），
+        避免整体 json.loads 抛 JSONDecodeError 导致提取全部为空。
+        """
+        s = text.strip() if isinstance(text, str) else text
+        if not s:
+            return {}
+        try:
+            obj = _json.loads(s)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+        # 多个 JSON 对象拼接：逐段 raw_decode 解析并合并
+        decoder = _json.JSONDecoder()
+        data = {}
+        i = 0
+        n = len(s)
+        while i < n:
+            while i < n and s[i] in " \t\r\n":
+                i += 1
+            if i >= n:
+                break
+            if s[i] not in "{[":
+                i += 1
+                continue
+            try:
+                obj, end = decoder.raw_decode(s, i)
+            except Exception:
+                i += 1
+                continue
+            if isinstance(obj, dict):
+                data.update(obj)
+            i = end
+        return data
 
     @staticmethod
     def _extract_name(entry):
@@ -324,16 +369,39 @@ class YUAN_TXTJsonExtractor:
                 return idx
         return -1
 
-    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 角色开关=True, 道具开关=True, 场景开关=True, BGM开关=True):
+    @staticmethod
+    def _archive_indices_by_names(appearing, archive_names):
+        """按显式出现名称列表解析档案 0 基索引（去重、保持出现顺序）。
+
+        返回 None 表示 appearing 不是列表（无显式列表，由调用方走文本匹配兜底）。
+        匹配规则：精确匹配档案提取名，未命中时再取该名称第一个逗号前的部分匹配。
+        """
+        if not isinstance(appearing, list):
+            return None
+        index_map = {name: i for i, name in enumerate(archive_names) if name}
+        result = []
+        for entry in appearing:
+            if entry is None:
+                continue
+            name = str(entry)
+            if name not in index_map:
+                for sep in ("，", ","):
+                    if sep in name:
+                        name = name.split(sep)[0].strip()
+                        break
+            if name in index_map:
+                idx = index_map[name]
+                if idx not in result:
+                    result.append(idx)
+        return result
+
+    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 角色开关=True, 道具开关=True, 场景开关=True, BGM开关=True, 情节开关=False):
         # 形参名必须与输入端口名一致（ComfyUI 按关键字传参）
         data = json
 
-        # 字符串自动解析为 dict
+        # 字符串自动解析为 dict（支持多个 JSON 对象拼接合并）
         if isinstance(data, str):
-            try:
-                data = _json.loads(data)
-            except Exception:
-                data = {}
+            data = self._parse_json_text(data)
 
         if not isinstance(data, dict):
             data = {}
@@ -363,15 +431,22 @@ class YUAN_TXTJsonExtractor:
             "场景档案": 3,
         }.get(档案选择, 0)
 
-        # 分镜序列：按编号选取对应分镜
+        # 分镜序列：按编号选取对应分镜（时间段/环境音/BGM）
         分镜序列数据 = data.get("分镜序列", [])
+        分镜情节数据 = data.get("分镜情节", [])
         分镜序列文本 = ""
         时间段 = []
         环境音 = ""
         BGM = ""
         matched_title = ""
         matched_type = ""
-        found_shot = False
+        情节条目 = None
+        if isinstance(分镜情节数据, list):
+            for item in 分镜情节数据:
+                if isinstance(item, dict) and item.get("编号") == 索引:
+                    情节条目 = item
+                    break
+        found_shot = 情节条目 is not None
         if isinstance(分镜序列数据, list):
             for item in 分镜序列数据:
                 if isinstance(item, dict) and item.get("编号") == 索引:
@@ -383,8 +458,16 @@ class YUAN_TXTJsonExtractor:
                     matched_type = str(item.get("类型", ""))
                     found_shot = True
                     break
-        # 始终输出整合格式；索引未匹配到分镜时，时间段/环境音/BGM 留空，不报错；BGM开关关闭时 non_diegetic_music 输出 N/A
-        分镜序列整合 = self._build_detailed_description(整体风格, 时间段, 环境音, BGM, matched_type, BGM开关)
+        # 仅命中分镜情节而未命中分镜序列时，标题/类型取自分镜情节条目
+        if 情节条目 is not None and not matched_title:
+            matched_title = str(情节条目.get("标题", ""))
+        if 情节条目 is not None and not matched_type:
+            matched_type = str(情节条目.get("类型", ""))
+        # 情节开关开启且找到对应分镜情节：分镜序列端口输出「情节」纯文本；否则输出整合格式（未命中分镜时时间段/环境音/BGM 留空，不报错；BGM开关关闭时 non_diegetic_music 输出 N/A）
+        if 情节开关 and 情节条目 is not None and str(情节条目.get("情节") or "").strip():
+            分镜序列整合 = str(情节条目.get("情节"))
+        else:
+            分镜序列整合 = self._build_detailed_description(整体风格, 时间段, 环境音, BGM, matched_type, BGM开关)
 
         # 角色道具场景：未找到分镜输出空；否则按 角色→道具→场景 顺序输出档案完整描述
         # 角色/道具/场景索引：匹配到的档案 0 基序号（角色/道具逗号分隔，场景单个），未匹配为空
@@ -395,10 +478,19 @@ class YUAN_TXTJsonExtractor:
             场景索引 = ""
             索引时长 = 0.0
         else:
-            # 角色、道具：在分镜时间段文本中智能匹配，输出对应档案的完整描述
+            # 角色、道具：优先取「分镜情节」条目的 出现角色/出现道具 显式列表；未提供时在分镜时间段文本中智能匹配
             char_names = [self._extract_name(e) for e in (角色档案数据 if isinstance(角色档案数据, list) else [])]
             prop_names = [self._extract_name(e) for e in (道具档案数据 if isinstance(道具档案数据, list) else [])]
-            char_indices, prop_indices = self._find_appearing_indices(分镜序列文本, char_names, prop_names)
+            出现角色 = 情节条目.get("出现角色") if 情节条目 is not None else None
+            出现道具 = 情节条目.get("出现道具") if 情节条目 is not None else None
+            char_indices = self._archive_indices_by_names(出现角色, char_names)
+            prop_indices = self._archive_indices_by_names(出现道具, prop_names)
+            if char_indices is None or prop_indices is None:
+                text_char, text_prop = self._find_appearing_indices(分镜序列文本, char_names, prop_names)
+                if char_indices is None:
+                    char_indices = text_char
+                if prop_indices is None:
+                    prop_indices = text_prop
             角色描述列表 = []
             if isinstance(角色档案数据, list):
                 for i in char_indices:
@@ -410,8 +502,18 @@ class YUAN_TXTJsonExtractor:
                     if 0 <= i < len(道具档案数据) and 道具档案数据[i] is not None:
                         道具描述列表.append(str(道具档案数据[i]))
 
-            # 场景：根据分镜标题智能匹配，输出对应档案的完整描述
-            idx = self._match_scene_index(matched_title, 场景档案数据)
+            # 场景：优先取「分镜情节」条目的 出现场景；未提供时根据分镜标题智能匹配
+            出现场景 = 情节条目.get("出现场景") if 情节条目 is not None else None
+            scene_names = [self._extract_name(e) for e in (场景档案数据 if isinstance(场景档案数据, list) else [])]
+            idx = -1
+            if isinstance(出现场景, str) and 出现场景.strip() and scene_names:
+                target = 出现场景.strip()
+                for si, sname in enumerate(scene_names):
+                    if target == sname or (sname and (target in sname or sname in target)):
+                        idx = si
+                        break
+            if idx < 0:
+                idx = self._match_scene_index(matched_title, 场景档案数据)
             场景描述 = ""
             if idx >= 0 and isinstance(场景档案数据, list) and idx < len(场景档案数据) and 场景档案数据[idx] is not None:
                 场景描述 = str(场景档案数据[idx])
@@ -421,7 +523,9 @@ class YUAN_TXTJsonExtractor:
             道具索引 = ",".join(str(i) for i in prop_indices) if 道具开关 else ""
             场景索引 = (str(idx) if idx >= 0 else "") if 场景开关 else ""
 
-            # 按开关过滤后输出：先角色再道具最后场景，整体以 retention_analysis: 开头、每条加 <Picture N> 序号
+            # 按开关过滤后输出：先角色再道具最后场景
+            # 情节开关开启时输出纯描述文本（无 retention_analysis: 前缀、无 <Picture N>：序号）；
+            # 情节开关关闭时整体以 retention_analysis: 开头、每条加 <Picture N> 序号
             输出块 = []
             if 角色开关:
                 输出块.extend(角色描述列表)
@@ -430,8 +534,11 @@ class YUAN_TXTJsonExtractor:
             if 场景开关 and 场景描述:
                 输出块.append(场景描述)
             if 输出块:
-                编号行 = [f"<Picture {i + 1}>：{d}" for i, d in enumerate(输出块)]
-                角色道具场景 = "retention_analysis:\n" + "\n".join(编号行) + "\n"
+                if 情节开关:
+                    角色道具场景 = "\n".join(输出块) + "\n"
+                else:
+                    编号行 = [f"<Picture {i + 1}>：{d}" for i, d in enumerate(输出块)]
+                    角色道具场景 = "retention_analysis:\n" + "\n".join(编号行) + "\n"
             else:
                 角色道具场景 = ""
 
