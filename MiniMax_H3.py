@@ -59,6 +59,11 @@ try:
     import comfy.model_base as _model_base
 
     if "frame_count" in inspect.signature(_h3_model.PackedLayout.__init__).parameters:
+        # 与 Yuan_H3_Motion.py 共享的 ABI 标记（改名须两文件同步）：反向移植
+        # 包装器据此被 Yuan_H3_Motion 识别为"同插件"而非第三方包装器，布局
+        # 补丁在反向移植 PackedLayout 上叠加、载荷补丁视为已应用。
+        BACKPORT_MARKER_LAYOUT = "_yuan_minimax_h3_v034_layout"
+        BACKPORT_MARKER_PAYLOAD = "_yuan_minimax_h3_v034_extra_conds"
 
         def _h3_ref_t_span(blk):
             # 参考块在目标流之前占据的时间轴跨度（v0.34.0 同名函数）
@@ -189,6 +194,7 @@ try:
             self.segments = seg_abs
 
         _h3_model.PackedLayout.__init__ = _h3_packed_layout_init
+        setattr(_h3_packed_layout_init, BACKPORT_MARKER_LAYOUT, True)
 
         # 旧核心 extra_conds 的缺陷：关键帧缺 latent 键直接 KeyError（纯音频引导）、
         # 关键帧与参考共存时参考列表覆盖关键帧列表、关键帧音频 latent 不收集
@@ -219,6 +225,7 @@ try:
             return out
 
         _model_base.MiniMaxH3.extra_conds = _h3_extra_conds
+        setattr(_h3_extra_conds, BACKPORT_MARKER_PAYLOAD, True)
 except Exception:
     pass
 

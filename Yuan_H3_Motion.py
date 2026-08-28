@@ -48,6 +48,11 @@ MC_AUDIO_KEY = "motion_context_audio_end_frame"
 # 与 MC_KEY/MC_AUDIO_KEY 同属共享 ABI，改名须所有拷贝同步。
 PATCH_MARKER_LAYOUT = "_h3_motion_context_layout_patch"
 
+# MiniMax_H3.py 反向移植包装器（旧核心）上的标记：布局补丁在其上叠加、
+# 载荷补丁视为已应用。与 PATCH_MARKER_* 同属共享 ABI，改名须两文件同步。
+BACKPORT_MARKER_LAYOUT = "_yuan_minimax_h3_v034_layout"
+BACKPORT_MARKER_PAYLOAD = "_yuan_minimax_h3_v034_extra_conds"
+
 _layout_orig_init = None
 _layout_applied = False
 
@@ -380,14 +385,15 @@ setattr(_patched_init, PATCH_MARKER_LAYOUT, True)
 
 
 def _layout_already_patched():
-    """本文件的另一份拷贝是否已包装过该构造函数？返回 None/"same"/"other"。
+    """构造函数当前由谁接管？返回 None/"same"/"other"/"backport"/"foreign"。
 
     多个包会内置本补丁，后加载者若把先加载者的包装器当作原始实现去包装
     就会套上多层（各拷贝用已装好的版本自测，新旧行为互相校验会误拒绝）。
-    按可信度递减做三项检查：带标记的拷贝（匹配版本，静默退出）；仅同名
-    的包装器是旧拷贝或分支（先加载者决定支持范围，退出并说明）；其余占着
-    构造函数位置的是别的包在补同一处（按 __module__ 归属判断，无法同时
-    持有；被 __wrapped__ 隐藏的无法识别）。
+    按可信度递减做四项检查：带标记的拷贝（匹配版本，静默退出）；同插件
+    反向移植包装器（MiniMax_H3.py 在旧核心上的 v0.34.0 布局，布局补丁在
+    其上叠加）；仅同名的包装器是旧拷贝或分支（先加载者决定支持范围，退出
+    并说明）；其余占着构造函数位置的是别的包在补同一处（按 __module__
+    归属判断，无法同时持有；被 __wrapped__ 隐藏的无法识别）。
     """
     cls = getattr(mm, "PackedLayout", None)
     init = getattr(cls, "__init__", None)
@@ -395,6 +401,8 @@ def _layout_already_patched():
         return None
     if getattr(init, PATCH_MARKER_LAYOUT, False):
         return "same"
+    if getattr(init, BACKPORT_MARKER_LAYOUT, False):
+        return "backport"
     if getattr(init, "__name__", "") == "_patched_init":
         return "other"
     if hasattr(init, "__wrapped__"):
@@ -419,7 +427,12 @@ def _apply_layout_patch():
             "PackedLayout.__init__ is already wrapped by a different pack "
             "from another module; refusing to stack a second wrapper.")
         return False
-    if who:
+    if who == "backport":
+        # 同插件反向移植（MiniMax_H3.py 在旧核心上已替换构造函数）：以它为
+        # 基础叠加本文锚点修复。自测对反向移植基础同样有效（复现两端锚点），
+        # 继续走到下方公共安装流程。
+        pass
+    elif who:
         # 补丁已生效（非本份），调用方节点运行前会检查 is_applied()
         _layout_applied = True
         return True
@@ -494,17 +507,20 @@ setattr(_patched_extra_conds, PATCH_MARKER_PAYLOAD, True)
 
 
 def _payload_already_patched(cls):
-    """另一份拷贝是否已包装过 extra_conds？返回 None/"same"/"other"/"foreign"。
+    """extra_conds 当前由谁接管？返回 None/"same"/"backport"/"other"/"foreign"。
 
     检测逻辑与 _layout_already_patched 相同：标记只识别新到能设置它的
-    拷贝，仅同名的包装器视为旧拷贝或分支（后加载者退出），其他包装者
-    是别的包在补同一处则拒绝叠包。
+    拷贝，同插件反向移植 extra_conds（旧核心）已实现关键帧/引用共存合并
+    视为已应用，仅同名的包装器视为旧拷贝或分支（后加载者退出），其他
+    包装者是别的包在补同一处则拒绝叠包。
     """
     fn = getattr(cls, "extra_conds", None)
     if fn is None:
         return None
     if getattr(fn, PATCH_MARKER_PAYLOAD, False):
         return "same"
+    if getattr(fn, BACKPORT_MARKER_PAYLOAD, False):
+        return "backport"
     if getattr(fn, "__name__", "") == "_patched_extra_conds":
         return "other"
     if hasattr(fn, "__wrapped__"):
@@ -535,6 +551,11 @@ def _apply_payload_patch():
             "MiniMaxH3.extra_conds is already wrapped by a different pack "
             "from another module; refusing to stack a second wrapper.")
         return False
+    if who == "backport":
+        # 同插件反向移植 extra_conds（旧核心）已实现关键帧/引用共存合并，
+        # 视为已应用；反向移植布局不消费 payload 的 frame_count，无需补写。
+        _payload_applied = True
+        return True
     if who:
         # 补丁已生效（非本份），调用方节点运行前会检查 is_applied()
         _payload_applied = True
