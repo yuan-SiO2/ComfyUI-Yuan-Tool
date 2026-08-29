@@ -23,35 +23,11 @@ except Exception:  # 旧版 ComfyUI 无 H3 模型模块时用相同数值兜底
 
 
 # ==================== 旧版核心（< v0.34.0）H3 修复反向移植 ====================
-# v0.34.0 核心修复了三处 MiniMax-H3 问题，这里把修复移植进插件，使旧核心也获得
-# 正确行为；检测到新版核心（已含修复）时自动跳过：
-#   1. #15808 分词器缺少 <d>/<|cutoff|> 等特殊 token，台词标签被切成垃圾子词，
-#      语音生成异常（注册后的 id 与官方分词器一致：151669-151675）
-#   2. #15439 PackedLayout 仅支持首/末帧锚点且丢弃关键帧音频 latent，数字人模式受损
-#   3. model_base 关键帧/参考共存时条件 latent 列表被参考覆盖、关键帧音频不收集
-try:
-    import inspect
-
-    import comfy.text_encoders.minimax as _h3_te
-
-    if not hasattr(_h3_te, "MINIMAX_EXTRA_TOKENS"):
-        _H3_EXTRA_TOKENS = ("<d>", "</d>", "<|cutoff|>", "<|lyrics_start|>",
-                            "<|lyrics_end|>", "<|caption_start|>", "<|caption_end|>")
-        _h3_te_orig_init = _h3_te.MiniMaxH3Tokenizer.__init__
-
-        def _h3_te_init_with_extra_tokens(self, embedding_directory=None, tokenizer_data={}):
-            _h3_te_orig_init(self, embedding_directory=embedding_directory, tokenizer_data=tokenizer_data)
-            tok = self.qwen3vl_32b.tokenizer
-            missing = [t for t in _H3_EXTRA_TOKENS if t not in tok.get_vocab()]
-            if missing:
-                tok.add_special_tokens({"additional_special_tokens": missing})
-                # 与官方修复一致：add_special_tokens 后重建反向词表（untokenize 用）
-                self.qwen3vl_32b.inv_vocab = {v: k for k, v in tok.get_vocab().items()}
-
-        _h3_te.MiniMaxH3Tokenizer.__init__ = _h3_te_init_with_extra_tokens
-except Exception:
-    pass
-
+# <d>/<|cutoff|> 等特殊 token 不再自注册，直接对接官方核心分词器
+# （v0.34.0 起由 comfy/text_encoders/minimax.py 的 MINIMAX_EXTRA_TOKENS 统一注册）。
+# 下面仅保留旧核心仍缺失的修复，检测到新版核心（已含修复）时自动跳过：
+#   1. #15439 PackedLayout 仅支持首/末帧锚点且丢弃关键帧音频 latent，数字人模式受损
+#   2. model_base 关键帧/参考共存时条件 latent 列表被参考覆盖、关键帧音频不收集
 try:
     import inspect
 
@@ -453,8 +429,8 @@ class YuanMiniMaxH3Video:
         if keyframes:
             for kf in keyframes:
                 kf["latent"] = vae.encode(kf.pop("image"))
-            # minimax_frame_count 必须随关键帧一起写入：布局层靠它识别末帧锚点，
-            # 缺失时接尾帧图像会在采样时报 "only first/last keyframe anchors are supported"
+            # minimax_frame_count：v0.34.0 核心已无消费者（PackedLayout 用
+            # resolved_frame_index 原生支持末帧锚点），仅为旧核心兜底保留
             cond = node_helpers.conditioning_set_values(cond, {"minimax_keyframes": keyframes,
                                                                "minimax_frame_count": frame_count})
         return (cond, latent)
@@ -512,7 +488,7 @@ class YuanMiniMaxH3Video:
         # 写入 minimax_keyframes（数字人模式下引导是唯一关键帧）
         keyframes = list(cond[0][1].get("minimax_keyframes", []))
         keyframes.append(keyframe)
-        # 同样补写 minimax_frame_count：末帧锚定（frame_idx=-1）时布局层需要它识别末帧锚点
+        # 同样补写 minimax_frame_count（v0.34.0 核心无消费者，仅为旧核心兜底保留）
         return node_helpers.conditioning_set_values(cond, {"minimax_keyframes": keyframes,
                                                            "minimax_frame_count": frame_count})
 
