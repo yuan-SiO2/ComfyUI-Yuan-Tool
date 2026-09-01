@@ -90,7 +90,7 @@ def _build_dialogue_protect_mask(text):
 
 class YUAN_TXTJsonExtractor:
     # 输出端口名
-    OUTPUT_NAMES = ("整体风格", "档案", "档案编码", "分镜序列", "角色道具场景", "角色索引", "道具索引", "场景索引", "索引时长", "场景判断")
+    OUTPUT_NAMES = ("整体风格", "档案", "档案编码", "分镜序列", "角色道具场景", "角色索引", "道具索引", "场景索引", "索引时长", "场景上下文")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -547,20 +547,20 @@ class YUAN_TXTJsonExtractor:
             if 索引时长 is None:
                 索引时长 = self._max_duration_seconds(分镜序列文本)
 
-        # 场景判断：当前分镜与后一个分镜（编号+1）的场景关键词是否相同（取「-」前部分比较）；找不到后一编号则输出 False
+        # 场景上下文：当前分镜（编号=索引）与上一个分镜（编号-1）的场景关键词是否相同（取「-」前部分比较）；索引为1（无前参考）或找不到上一编号则输出 False
         场景判断 = False
         if found_shot and isinstance(分镜序列数据, list):
-            next_title = ""
-            next_found = False
+            prev_title = ""
+            prev_found = False
             for item in 分镜序列数据:
-                if isinstance(item, dict) and item.get("编号") == 索引 + 1:
-                    next_title = str(item.get("标题", ""))
-                    next_found = True
+                if isinstance(item, dict) and item.get("编号") == 索引 - 1:
+                    prev_title = str(item.get("标题", ""))
+                    prev_found = True
                     break
-            if next_found:
+            if prev_found:
                 curr_prefix = self._extract_scene_prefix(matched_title)
-                next_prefix = self._extract_scene_prefix(next_title)
-                if curr_prefix and next_prefix and curr_prefix == next_prefix:
+                prev_prefix = self._extract_scene_prefix(prev_title)
+                if curr_prefix and prev_prefix and curr_prefix == prev_prefix:
                     场景判断 = True
 
         return {

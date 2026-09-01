@@ -134,8 +134,15 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
         seg_start = actual_start_time + s0 / fps
         seg_end = actual_start_time + s1 / fps
         thumb = ""
+        # 后端「图像」输出真正取到的首/末帧时间（与 load_video 取帧逻辑一致：
+        # seek backward 后取第一个 frame.time >= 对应网格时间的帧）。
+        # 默认先用网格时间兜底；解码后改为帧的精确 PTS（完整双精度，不 round，
+        # 四舍五入会落到相邻帧的显示区间导致错位一帧）。
+        first_frame_time = seg_start
+        last_frame_time = seg_end
         if container is not None and vstream is not None:
             try:
+                # --- 首帧（兼缩略图） ---
                 if vstream.time_base:
                     seek_pts = int(seg_start / float(vstream.time_base))
                 else:
@@ -148,19 +155,35 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
                         got = f
                         break
                 if got is not None:
+                    first_frame_time = float(got.time)
                     got = got.reformat(format="rgb24")
                     img = got.to_image()
                     img.thumbnail((160, 160))
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=70)
                     thumb = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+                # --- 末帧：输出序列的最后一帧（首个 PTS >= 倒数第二个网格点的帧） ---
+                last_grid_time = actual_start_time + (s1 - 1) / fps
+                if vstream.time_base:
+                    seek_pts2 = int(last_grid_time / float(vstream.time_base))
+                else:
+                    seek_pts2 = int(last_grid_time * av.time_base)
+                container.seek(seek_pts2, stream=vstream, backward=True)
+                for f in container.decode(vstream):
+                    t = f.time if f.time is not None else 0.0
+                    if t >= last_grid_time:
+                        last_frame_time = float(t)
+                        break
             except Exception as e:
-                print(f"[YuanVideoUI] thumb for seg {i} failed: {e}")
+                print(f"[YuanVideoUI] frame times for seg {i} failed: {e}")
         segs.append({
             "index": i,
-            "start": round(seg_start, 3),
-            "end": round(seg_end, 3),
-            "duration": round(max(0.0, seg_end - seg_start), 3),
+            # 段首时间 = 输出首帧精确 PTS：浏览器跳转到该时间即显示与「图像」输出相同的首帧
+            "start": first_frame_time,
+            # 段尾时间 = 输出末帧精确 PTS + 帧内微小偏移：播放到该处暂停且停留帧仍是末帧，
+            # 不会继续播放/停留到下一分镜的首帧画面
+            "end": last_frame_time + 1e-6,
+            "duration": round(max(0.0, seg_end - seg_start), 6),
             "frames": max(0, s1 - s0),
             "thumb": thumb,
         })
@@ -200,7 +223,8 @@ async def yuan_detect_segments(request):
     result_key = None
     try:
         st = os.stat(video_path)
-        result_key = f"{os.path.abspath(video_path)}|{st.st_size}|{int(st.st_mtime)}|{fps}|{start_time}|{end_time}"
+        # v3：段尾时间从"网格时间 round"改为"输出末帧精确 PTS + 1e-6"，旧缓存内的 end 值播放时会串到下一分镜首帧，必须失效
+        result_key = f"{os.path.abspath(video_path)}|{st.st_size}|{int(st.st_mtime)}|{fps}|{start_time}|{end_time}|v3"
     except OSError:
         pass
 
