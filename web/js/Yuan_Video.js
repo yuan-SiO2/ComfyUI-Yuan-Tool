@@ -1321,9 +1321,10 @@ app.registerExtension({
                             if (isSmartMode && segmentIndexWidget) segmentIndexWidget.value = seg.index;
                             renderSegBlocks();
                             node.setDirtyCanvas(true, false);
-                            // 同步预览画面到该分段的起始时间
+                            // 同步预览画面到该分段的起始帧：seg.start 已由后端对齐为「图像」输出首帧的精确 PTS。
+                            // 加 1e-6 秒的帧内微小偏移，避免 seek 恰好落在帧边界上被浏览器吸附到相邻帧。
                             if (videoPreview && duration > 0) {
-                                videoPreview.currentTime = Math.min(seg.start, Math.max(0, duration - 0.01));
+                                videoPreview.currentTime = Math.min(seg.start + 1e-6, Math.max(0, duration - 0.01));
                             }
                         };
                         segBlocksLayer.appendChild(block);
@@ -1935,12 +1936,15 @@ app.registerExtension({
                 videoPreview.ontimeupdate = () => {
                     if (!duration || dragging) return;
 
-                    // 选中了分段小方块：仅在 [start, end] 内播放，播到结束即停止
+                    // 选中了分段小方块：仅在 [start, end] 内播放，播到结束即停止。
+                    // 段尾暂停由 rVFC/interval 快速监控主处理（见 _pauseAtSegEnd），
+                    // timeupdate 事件频率低（约 250ms），这里仅作极端情况兜底。
                     if (selectedSegment && selectedSegment.end > 0) {
-                        if (videoPreview.currentTime >= selectedSegment.end) {
-                            videoPreview.pause();
-                            videoPreview.currentTime = selectedSegment.end;
-                        } else if (videoPreview.currentTime < selectedSegment.start) {
+                        if (videoPreview.currentTime >= selectedSegment.end - 0.001) {
+                            _pauseAtSegEnd();
+                            return;
+                        }
+                        if (videoPreview.currentTime < selectedSegment.start) {
                             videoPreview.currentTime = selectedSegment.start;
                         }
                         return;
@@ -1968,6 +1972,60 @@ app.registerExtension({
                         videoPreview.currentTime = selectedSegment.start;
                     }
                 });
+
+                // ====================================================================
+                // 段尾精准停帧监控
+                // 背景：HTMLMediaElement 的 timeupdate 事件频率由浏览器决定（约每 250ms 一次）。
+                // 播放越过分段段尾后，浏览器会先渲染出下一分镜的首帧画面，timeupdate 才触发，
+                // 此时 pause + 拉回只是"事后补救"，用户已经看到了下一分镜画面。
+                // 方案：
+                //   1) requestVideoFrameCallback（Chrome/Edge/Firefox）：每呈现一帧回调一次，
+                //      用该帧精确 PTS(mediaTime) 判断——输出末帧（end-1e-6）一呈现立即暂停，
+                //      下一分镜首帧根本不会被提交渲染，零闪现。
+                //   2) setInterval 8ms 兜底：读 currentTime >= end 即暂停（支持 rVFC 时是双保险）。
+                //   3) ontimeupdate 兜底：后台节流等极端情况最后补救。
+                // 说明：end = 输出末帧精确PTS + 1e-6，浏览器显示 PTS<=currentTime 的帧，暂停后
+                // 停留帧仍是输出末帧；所有函数幂等，重复触发不会产生重复 pause/seek 抖动。
+                // ====================================================================
+                const _pauseAtSegEnd = () => {
+                    if (!selectedSegment || selectedSegment.end <= 0 || duration <= 0) return;
+                    if (!videoPreview.paused) videoPreview.pause();
+                    // 吸附到段尾边界；仅当播放头明显偏离时才 seek，避免重复 seek 造成画面抖动
+                    const cur = videoPreview.currentTime;
+                    if (Math.abs(cur - selectedSegment.end) > 1e-4) {
+                        videoPreview.currentTime = selectedSegment.end;
+                    }
+                };
+                const _checkSegEndByFrame = (frameTime) => {
+                    if (!selectedSegment || selectedSegment.end <= 0 || duration <= 0 || videoPreview.paused) return false;
+                    // 1ms 容差：覆盖 mediaTime 与后端 PTS 的浮点换算误差；
+                    // 容差小于任何实际视频帧间隔，只会在输出末帧呈现的瞬间触发，不会提前误停
+                    if (frameTime >= selectedSegment.end - 0.001) {
+                        _pauseAtSegEnd();
+                        return true;
+                    }
+                    return false;
+                };
+                const _checkSegEndByTime = () => {
+                    if (!selectedSegment || selectedSegment.end <= 0 || duration <= 0 || videoPreview.paused) return false;
+                    if (videoPreview.currentTime >= selectedSegment.end) {
+                        _pauseAtSegEnd();
+                        return true;
+                    }
+                    return false;
+                };
+                const _rvfcSegLoop = (now, meta) => {
+                    if (!videoPreview.requestVideoFrameCallback) return;
+                    if (!videoPreview.paused) {
+                        _checkSegEndByFrame(meta.mediaTime);
+                    }
+                    // 暂停时 rVFC 不再回调；恢复播放后自动续上，因此始终续订
+                    videoPreview.requestVideoFrameCallback(_rvfcSegLoop);
+                };
+                if (videoPreview.requestVideoFrameCallback) {
+                    videoPreview.requestVideoFrameCallback(_rvfcSegLoop);
+                }
+                const _segEndPollTimer = setInterval(_checkSegEndByTime, 8);
 
                 // --- Timeline Drag Logic (Primary state runs in Seconds format to lock playback natively) ---
                 sliderBox.onpointerdown = (e) => {
