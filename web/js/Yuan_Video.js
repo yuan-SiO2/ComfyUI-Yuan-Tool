@@ -1,5 +1,13 @@
-/** Yuan Tool · 加载视频 UI 前端：为 Yuan_VideoUI 节点提供视频预览、时间轴裁剪、镜头智能分段与裁剪框交互 UI。 */
+/** Yuan Tool · 加载视频前端：为 Yuan_VideoUI 节点提供视频预览、时间轴裁剪、镜头智能分段与裁剪框交互 UI。 */
+import { findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput } from "./Yuan_Common.js";
+
 const { app } = window.comfyAPI.app;
+
+/** UI 托管参数：widget 值由 DOM UI 驱动并隐藏，V3 下需移除其空占位输入端口 */
+const MANAGED_PARAM_NAMES = [
+    "开始时间", "结束时间", "时长", "开始帧", "结束帧", "时长帧数",
+    "显示模式", "裁剪X", "裁剪Y", "裁剪宽度", "裁剪高度", "输出模式", "分段索引",
+];
 
 /** 从 window.comfyAPI 获取 api 实例 */
 function getApi() {
@@ -1410,6 +1418,8 @@ app.registerExtension({
                         const nodeWidth = node.size?.[0] || width || 690;
                         return [Math.max(10, nodeWidth - 30), 250];
                     };
+                    // V3：DOM 行尺寸约束（返回 DOM 自身所需尺寸，不含节点标题/端口余量）
+                    node.domWidget.computeLayoutSize = () => ({ minWidth: 660, minHeight: 250 });
 
                     // Applies the default creation bounds natively, increased default height
                     // to match the widgets required height out of the box.
@@ -1446,6 +1456,70 @@ app.registerExtension({
                         app.graph.setDirtyCanvas(true, true);
                     });
                 }, 100);
+
+                // ====================================================================
+                // V3 (Nodes 2.0) 适配：Vue 控件不走原生 callback，逐帧轮询关键
+                // widget 值；移除 UI 托管参数的空占位端口；同步最小尺寸。
+                // 全部带变化检测（值/签名缓存），未变化时不做任何写入，避免布局抖动
+                // ====================================================================
+                const protoODF = node.onDrawForeground;
+                node.onDrawForeground = function (ctx) {
+                    if (protoODF) protoODF.apply(this, arguments);
+                    try {
+                        const mountEl = (node.domWidget && node.domWidget.element)
+                            ? node.domWidget.element.parentElement : null;
+                        const v3El = findComfyNodeEl(mountEl);
+
+                        // 移除 UI 托管参数的空占位端口（端口名签名变化检测，
+                        // 避免工作流切换后 V3 重建端口时每帧 removeInput 触发重排）
+                        if (v3El && Array.isArray(node.inputs)) {
+                            const sig = node.inputs.map(i => i.name).join("|");
+                            if (sig !== node._yuanVideoPortSig) {
+                                for (const name of MANAGED_PARAM_NAMES) removeV3PlaceholderInput(node, name);
+                                node._yuanVideoPortSig = node.inputs.map(i => i.name).join("|");
+                            }
+                        }
+
+                        // 最小尺寸（元素引用缓存，常量尺寸只写一次）
+                        if (v3El) {
+                            node.min_size = [690, 740];
+                            if (node._yuanVideoV3El !== v3El) {
+                                enforceV3MinSize(v3El, 690, 740);
+                                node._yuanVideoV3El = v3El;
+                            }
+                        }
+
+                        // widget 值轮询：首次观测仅记录基线不触发动作
+                        // （防止节点刚创建/工作流加载时误触发裁剪重置等副作用）
+                        const poll = (w, key, fn) => {
+                            if (!w) return;
+                            const v = String(w.value);
+                            if (node[key] === v) return;
+                            const first = node[key] === undefined;
+                            node[key] = v;
+                            if (!first) fn(v);
+                        };
+                        poll(videoWidget, "_yuanLastVideo", () => {
+                            if (!node._initializing) node._should_reset_trim = true;
+                            if (node.updatePreview) node.updatePreview(videoWidget.value);
+                        });
+                        poll(frameRateWidget, "_yuanLastFps", () => {
+                            node.syncFramesFromTime();
+                            updateRuler();
+                            updateUI(true);
+                        });
+                        poll(displayModeWidget, "_yuanLastDisp", () => {
+                            if (node.syncToggleVisual) node.syncToggleVisual();
+                        });
+                        poll(outputModeWidget, "_yuanLastOut", () => {
+                            node.toggleWidgetVisibility();
+                            if (node.syncOutputToggleVisual) node.syncOutputToggleVisual();
+                        });
+                        poll(segmentIndexWidget, "_yuanLastSeg", () => {
+                            if (segmentsCacheData && segmentsCacheData.segments) renderSegBlocks();
+                        });
+                    } catch (_) {}
+                };
 
                 // ====================================================================
                 // LOGIC & SYNCING

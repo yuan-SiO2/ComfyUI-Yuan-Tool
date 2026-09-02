@@ -253,15 +253,23 @@ app.registerExtension({
                     return [width, widgetHeight];
                 };
 
-                // V3 (Nodes 2.0) 尺寸适配：在 comfy-node 元素上同步节点最小尺寸
+                // V3 (Nodes 2.0) 尺寸适配：在 comfy-node 元素上同步节点最小尺寸。
+                // 缓存已应用元素+尺寸签名：未变化时直接跳过，避免每帧 DOM 向上遍历
+                // 与 removeProperty/setProperty 写入引发布局抖动（工作流切换闪动根源）
+                let _v3AppliedEl = null;
+                let _v3AppliedSig = "";
                 const applyV3MinSize = () => {
                     try {
                         const el = findComfyNodeEl(container.parentElement);
                         if (!el || !this.size) return;
                         const minW = Math.max(400, this.size[0] || 400);
                         const minH = Math.max(400, this.size[1] || 500);
+                        const sig = minW + "x" + minH;
+                        if (el === _v3AppliedEl && sig === _v3AppliedSig) return;
                         this.min_size = [minW, minH];
                         enforceV3MinSize(el, minW, minH);
+                        _v3AppliedEl = el;
+                        _v3AppliedSig = sig;
                     } catch (_) {}
                 };
 
