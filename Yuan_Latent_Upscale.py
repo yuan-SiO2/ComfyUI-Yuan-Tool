@@ -1,15 +1,4 @@
-"""Yuan Tool · 缩放Latent（比例）节点
-
-复刻 ComfyUI 原生 LatentUpscaleBy（缩放Latent（比例））节点，注册于 Yuan Tool/放大
-分类，类名/映射键与原生完全分离、互不影响。
-
-在原生基础上扩展：
-- 兼容 H3 纯视频 latent（5D: B,C,T,H,W，仅缩放空间维度，时间维度不变）
-- 兼容 H3 联合 AV latent（NestedTensor：仅缩放视频流，音频流原样保留）
-- 支持「按倍数缩放」与「目标尺寸」两种缩放方式，与「H3 放大」「RTX 视频放大 (H3)」
-  节点的缩放方式一致
-- 「目标尺寸」为像素单位：H3 latent（5D）按 16 对齐换算，常规 latent（4D）按 8 对齐换算
-"""
+"""缩放Latent（比例）节点：复刻原生 LatentUpscaleBy，额外兼容 H3 5D 与联合 AV latent。"""
 
 import comfy.utils
 import comfy.nested_tensor
@@ -19,12 +8,7 @@ UPSCALE_TARGET = "目标尺寸"
 
 
 class YuanLatentUpscaleBy:
-    """缩放Latent（比例）：按倍数或目标尺寸缩放 latent 空间分辨率。
-
-    常规 latent（4D: B,C,H,W）行为与原生 LatentUpscaleBy 一致；
-    H3 纯视频 latent（5D: B,C,T,H,W）仅缩放空间维度（H×W），时间维度不变；
-    H3 联合 AV latent（NestedTensor）仅缩放视频流，音频流原样保留。
-    """
+    """缩放Latent（比例）：按倍数或目标尺寸缩放空间分辨率，兼容常规 4D / H3 5D / 联合 AV latent。"""
 
     SEARCH_ALIASES = ["enlarge latent", "resize latent", "scale latent"]
 

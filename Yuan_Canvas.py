@@ -1,11 +1,4 @@
-"""Yuan Tool · 画布 节点
-
-自包含的合成器（V3）：
-- 接收最多 8 张图像，在内嵌的 fabric.js 编辑器中可视化放置、旋转、缩放
-- 前端合成后的图像会回传后端，作为单个 IMAGE 输出
-
-节点分类: "Yuan Tool/画布"
-"""
+"""画布 节点（V3）：接收最多 8 张图像在 fabric.js 编辑器中可视化编辑，合成后作为单个 IMAGE 输出。"""
 
 import folder_paths
 from PIL import Image, ImageOps

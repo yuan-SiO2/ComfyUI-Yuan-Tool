@@ -1,9 +1,6 @@
-"""H3 运动上下文相关节点。
+"""H3 运动上下文相关节点：直接从前一片段潜空间切片视频与音频尾部衔接，跳过解码/重编码。
 
-包含 3 个节点：H3 加载潜空间 / H3 运动上下文 / H3 运动裁剪。片段衔接时直接从上一片段潜空间切片视频与音频尾部，
-跳过解码/重编码。布局补丁解除仅首/末帧关键帧锚点限制，载荷补丁让固定
-视频与固定音频共存；两补丁均在节点首次运行时安装（避免影响无关 H3 图），
-带 ABI 标记门控并先自测再提交，失败则拒绝运行并说明原因。
+布局/载荷两补丁带 ABI 标记门控、先自测再安装，失败则拒绝运行。
 """
 
 import asyncio
@@ -775,6 +772,108 @@ def _silence_audio_latent(audio_vae, audio_t):
 
 
 # ============================================================================
+# 上下文潜空间集成加载（原「H3 加载潜空间」节点的逻辑并入「H3 运动上下文」）
+# ============================================================================
+
+# 空标记键：上下文潜空间端口未连接且片段序号为 0 / 文件未找到时，
+# 本地加载输出带此标记的空 latent，运动上下文据此直通、不裁头
+CONTEXT_EMPTY_MARKER = "_h3_motion_context_empty"
+# 原因键：空标记的原因（first_clip / file_not_found）
+CONTEXT_EMPTY_REASON = "_h3_motion_context_empty_reason"
+# 细节键：原因细节（如未找到的片段序号）
+CONTEXT_EMPTY_REASON_DETAIL = "_h3_motion_context_empty_reason_detail"
+# 正常加载时携带的片段序号键，用于生成"已关联片段 N"提示
+CONTEXT_CLIP_INDEX_KEY = "_h3_motion_context_clip_index"
+
+
+def _load_context_latent(存储位置, 片段序号=1, 手动上传=""):
+    """上下文潜空间端口未连接时，按 存储位置+片段序号+手动上传 加载本地潜空间。
+
+    行为与原先独立的「H3 加载潜空间」节点完全一致：
+    - 手动上传非空：优先加载该文件，完全忽略存储位置与片段序号
+      （即使序号为 0 也照样加载）；
+    - 片段序号 0：链条第一个片段（无前序上下文），不读文件，输出带空标记；
+    - 片段序号 >0：按 存储位置/latent_0000N_.safetensors 加载，文件未找到
+      时输出带 file_not_found 空标记的潜空间，直通、不裁头。
+    """
+    if _st_load is None:
+        raise RuntimeError("h3_motion_context: safetensors is not "
+                           "available; cannot load latents.")
+    manual_path = _resolve_manual_latent_path(手动上传)
+    if manual_path is not None:
+        data = _st_load(manual_path)
+        if "video" not in data or "audio" not in data:
+            raise ValueError(
+                "h3_motion_context: %s is not an h3_motion_context latent "
+                "(missing video/audio streams). Was it saved by the stock "
+                "Save Latent node instead?" % manual_path)
+        return {"samples": [data["video"], data["audio"]]}
+    try:
+        idx = int(片段序号)
+    except (TypeError, ValueError):
+        raise ValueError("h3_motion_context: 片段序号必须是整数，得到 %r"
+                         % (片段序号,))
+    if idx == 0:
+        return {"samples": [], CONTEXT_EMPTY_MARKER: True,
+                CONTEXT_EMPTY_REASON: "first_clip"}
+    try:
+        path = _resolve_latent_path(_build_load_path(存储位置), idx)
+    except FileNotFoundError:
+        # 主「存储位置」解析失败：兜底扫描 output 目录。可能「存储位置」
+        # 参数因工作流错位而错误（如被保存为 1 而非 H3-Mubu），但文件
+        # 实际由「H3 运动裁剪」保存在输出目录的某个子目录中，扫描即可命中。
+        path = _find_latent_in_output(idx)
+        if path is None:
+            return {"samples": [], CONTEXT_EMPTY_MARKER: True,
+                    CONTEXT_EMPTY_REASON: "file_not_found",
+                    CONTEXT_EMPTY_REASON_DETAIL: str(idx)}
+    data = _st_load(path)
+    if "video" not in data or "audio" not in data:
+        raise ValueError(
+            "h3_motion_context: %s is not an h3_motion_context latent "
+            "(missing video/audio streams). Was it saved by the stock "
+            "Save Latent node instead?" % path)
+    return {"samples": [data["video"], data["audio"]],
+            CONTEXT_CLIP_INDEX_KEY: idx}
+
+
+def _context_latent_fingerprint(存储位置, 片段序号, 手动上传):
+    """IS_CHANGED 用的缓存指纹：手动上传优先文件指纹；否则目录级综合指纹。
+
+    片段序号显式为常量 0 时输出确定性 0（无需读文件）；链接输入拿不到真实
+    序号时对存储目录下全部 latent 文件做综合指纹——内容变化 → 指纹变化 →
+    下游重跑；同一片段重试内容不变 → 缓存命中。异常统一返回 NaN 保守重跑。
+    """
+    if (手动上传 or "").strip():
+        try:
+            path = _resolve_manual_latent_path(手动上传)
+            st = os.stat(path)
+            return "manual:%s:%s:%s" % (path, st.st_mtime_ns, st.st_size)
+        except Exception:
+            return float("NaN")
+    try:
+        if int(片段序号) == 0:
+            return 0
+    except (TypeError, ValueError):
+        pass
+    try:
+        fp = _dir_fingerprint(_build_load_path(存储位置))
+    except Exception:
+        return float("NaN")
+    # 与 apply 时的兜底扫描保持一致：主存储位置目录不存在（参数错位）时，
+    # 改扫 output 目录下实际保存的文件做指纹，避免缓存漏跑/误缓存
+    if fp.startswith("missing"):
+        alt = _find_latent_in_output(片段序号)
+        if alt:
+            try:
+                st = os.stat(alt)
+                return "found:%s:%d:%d" % (alt, st.st_mtime_ns, st.st_size)
+            except OSError:
+                return float("NaN")
+    return fp
+
+
+# ============================================================================
 # 节点定义
 # ============================================================================
 
@@ -785,16 +884,33 @@ class Yuan_H3MotionContext:
             "required": {
                 "条件化": ("CONDITIONING",),
                 "潜空间": ("LATENT",),
-                "上下文潜空间": ("LATENT", {
-                    "tooltip": "前一片段的采样器输出潜空间（与你连接到解码"
-                               "节点的相同）。同时提供画面和声音，直接切片"
-                               "获取，跳过链条中每次链接都会损失少许质量的"
-                               "解码和重编码过程。必须与正在生成的片段分辨率"
-                               "相同。需要分离/合并 AV latent 时可使用"
-                               "「RTX 视频放大 (H3)」节点。"
-                               "链条的第一个片段无前序上下文时，将「H3 加载"
-                               "潜空间」节点的片段序号设为 0，本端口接收其空"
-                               "标记后条件化直通、输出 \"0:17\"（不裁头）。"}),
+                "模式": (["上传", "端口", "自动索引"], {
+                    "default": "自动索引",
+                    "tooltip": "上下文来源与可见参数：上传模式只使用「上传潜空间」"
+                               "按钮手动上传的文件；端口模式只使用「上下文潜空间」"
+                               "端口的传入值；自动索引模式只按「存储位置」"
+                               "「片段序号」自动搜索加载本地潜空间。三种模式互斥，"
+                               "切换时可清除/覆盖之前的手动上传 latent。"}),
+                "存储位置": ("STRING", {
+                    "default": "H3-Mubu",
+                    "tooltip": "与「H3 运动裁剪」节点相同的存储位置（ComfyUI"
+                               "输出文件夹下的子目录名）。仅「自动索引」模式"
+                               "生效：按此路径+「片段序号」搜索加载本地潜空间。"}),
+                "片段序号": ("INT", {
+                    "default": 1, "min": 0, "max": 9999,
+                    "tooltip": "「自动索引」模式下要加载的片段序号：设为 2 时"
+                               "加载 latent_00002_.safetensors，与「H3 运动裁剪」"
+                               "节点的命名规则一致。设为 0 时表示链条第一个片段"
+                               "（无前序上下文）：不读本地文件，条件化直通、裁剪"
+                               "帧数为 0。上传/端口模式下本参数不启用。"}),
+                "手动上传": ("STRING", {
+                    "default": "",
+                    "tooltip": "「上传」模式下要加载的潜空间文件。通过「上传"
+                               "潜空间」按钮上传 .safetensors，或手动填写路径"
+                               "（支持 input:/output:/temp: 前缀、绝对路径；无"
+                               "前缀时先查 input 再查 output 目录）。非空时加载"
+                               "本文件，完全忽略存储位置与片段序号；切到端口/"
+                               "自动索引模式会自动清空本题。"}),
                 "启用上下文": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "总开关。关闭时条件化直通输出：不固定画面"
@@ -827,6 +943,21 @@ class Yuan_H3MotionContext:
                                "生成（固定的画面可能带出上一片段的声音）。"}),
             },
             "optional": {
+                "上下文潜空间": ("LATENT", {
+                    "tooltip": "前一片段的采样器输出潜空间（与你连接到解码"
+                               "节点的相同）。同时提供画面和声音，直接切片"
+                               "获取，跳过链条中每次链接都会损失少许质量的"
+                               "解码和重编码过程。必须与正在生成的片段分辨率"
+                               "相同。需要分离/合并 AV latent 时可使用"
+                               "「RTX 视频放大 (H3)」节点。此端口为可选："
+                               "上下文来源按「手动上传 > 本端口 > 本地自动"
+                               "加载」判定——「手动上传」非空时直接加载该"
+                               "文件并忽略本端口；本端口连线时用传入的潜空间、"
+                               "不启用本地加载；未手动上传且未连线时才按上方"
+                               "「存储位置」「片段序号」参数自动搜索加载本地"
+                               "潜空间。链条第一个片段无前序上下文时，片段"
+                               "序号设为 0，本节点识别后条件化直通、输出"
+                               " \"0:17\"（不裁头）。"}),
                 "audio_vae": ("VAE", {
                     "tooltip": "音频 VAE（H3 音频 VAE）。仅在音频上下文长度"
                                "为 0 时使用：零波形经它真实编码成静音潜空间"
@@ -848,8 +979,9 @@ class Yuan_H3MotionContext:
                    "损失少许质量的解码和重编码过程。裁剪帧数输出为字符串"
                    "\"状态:长度\"（如 1:34），供「运动裁剪」节点解析。")
 
-    def apply(self, 条件化, 潜空间, 上下文潜空间, 启用上下文=True, 上下文长度="17",
-              音频上下文长度="17", audio_vae=None):
+    def apply(self, 条件化, 潜空间, 启用上下文=True, 模式="自动索引",
+              存储位置="H3-Mubu", 片段序号=1, 手动上传="", 上下文长度="17",
+              音频上下文长度="17", audio_vae=None, 上下文潜空间=None):
         # 「上下文长度」与「音频上下文长度」都只针对上下文潜空间输入端口：
         # 前者取其尾部画面，后者取其尾部声音。两者都只固定到本片段头部、
         # 由「运动裁剪」整组移除，交付部分的画面与音频由模型全新生成。
@@ -861,16 +993,32 @@ class Yuan_H3MotionContext:
         if not 启用上下文:
             return {"result": (条件化, "0:17"), "ui": {
                 "h3_hint": "上下文已关闭，直通"}}
-        # 第一个片段：上下文潜空间是「H3 加载潜空间」片段序号 0 的空标记或
-        # 文件未找到的回退空标记。无前序上下文，条件化直通、裁 0，
-        # 并通过 ui.h3_hint 在节点下方显示提示
+        # 上下文来源由「模式」决定（替代原先 manual>port>auto 的优先级）：
+        # - 上传　　：只用手动上传的潜空间文件（忽略存储位置与片段序号）；
+        # - 端口　　：只用「上下文潜空间」端口的传入值；
+        # - 自动索引：只按 存储位置+片段序号 自动搜索加载本地潜空间。
+        if 模式 == "上传":
+            if not (手动上传 or "").strip():
+                raise ValueError(
+                    "h3_motion_context: 「上传」模式下需先通过「上传潜空间」"
+                    "按钮上传 .safetensors 文件，或填写「手动上传」路径。")
+            上下文潜空间 = _load_context_latent(存储位置, 片段序号, 手动上传)
+        elif 模式 == "端口":
+            if 上下文潜空间 is None:
+                raise ValueError(
+                    "h3_motion_context: 「端口」模式下「上下文潜空间」"
+                    "端口必须连接。")
+        else:  # 自动索引
+            上下文潜空间 = _load_context_latent(存储位置, 片段序号, "")
+        # 第一个片段：上下文潜空间为空标记（含片段序号 0 / 文件未找到的回退
+        # 空标记）。无前序上下文，条件化直通、裁 0，并在节点下方显示提示
         if isinstance(上下文潜空间, dict) and 上下文潜空间.get(
-                Yuan_H3MotionContextLoadLatent.EMPTY_MARKER):
+                CONTEXT_EMPTY_MARKER):
             reason = 上下文潜空间.get(
-                Yuan_H3MotionContextLoadLatent.EMPTY_REASON, "first_clip")
+                CONTEXT_EMPTY_REASON, "first_clip")
             if reason == "file_not_found":
                 detail = 上下文潜空间.get(
-                    Yuan_H3MotionContextLoadLatent.EMPTY_REASON_DETAIL, "?")
+                    CONTEXT_EMPTY_REASON_DETAIL, "?")
                 return {"result": (条件化, "0:17"), "ui": {
                     "h3_hint": "未找到片段 %s 文件" % detail}}
             return {"result": (条件化, "0:17"), "ui": {
@@ -1015,14 +1163,26 @@ class Yuan_H3MotionContext:
         # 头部裁切与尾段保存同长）；0=无上下文可裁（长度固定 17，
         # 仅作尾段保存长度）
         trim_str = ("1:%d" % trim) if trim > 0 else "0:17"
-        # 提示已关联的片段序号（来自加载节点）
-        clip_idx = (上下文潜空间.get(Yuan_H3MotionContextLoadLatent.CLIP_INDEX_KEY)
+        # 提示已关联的片段序号（来自本地加载/连线传入的潜空间携带的标记）
+        clip_idx = (上下文潜空间.get(CONTEXT_CLIP_INDEX_KEY)
                     if isinstance(上下文潜空间, dict) else None)
         hint_text = ("已关联片段 %s 文件" % clip_idx) if clip_idx is not None else "已关联上下文"
         if audio_silent:
             hint_text += "，音频上下文=静音"
         return {"result": (out, trim_str), "ui": {
             "h3_hint": hint_text}}
+
+    @classmethod
+    def IS_CHANGED(cls, 模式="自动索引", 存储位置="H3-Mubu", 片段序号=1,
+                   手动上传="", **kwargs):
+        # 上下文来源由「模式」决定（端口模式只依赖「上下文潜空间」端口输入，
+        # 换工作流/改端口时按输入数据变化正常重跑，widget 与本地文件指纹不
+        # 额外触发；上传/自动索引模式涉及本地加载，用文件指纹判定重跑）。
+        # IS_CHANGED 只能拿到 widget 值、无法感知端口连线，故 onDrawForeground
+        # 只对 widget 建档；**kwargs 兼容运行框架传入的其余端口值。
+        if 模式 == "端口":
+            return 0
+        return _context_latent_fingerprint(存储位置, 片段序号, 手动上传)
 
 
 class Yuan_H3MotionContextTrim:
@@ -1036,8 +1196,8 @@ class Yuan_H3MotionContextTrim:
     第二次裁切：在交付潜空间的尾部按字符串中的长度再切一段（状态 1 时
     =裁剪长度；状态 0 时固定 17 帧），保留后段保存到本地（是否保存由
     「保存到本地」开关控制），供下一次运行加载衔接。音视频分离取窗是
-    「H3 加载潜空间 → H3 运动上下文」的事情，本节点只做整段切片，
-    潜空间输出以本节点的裁剪结果为主。
+    「H3 运动上下文」节点的事情（「上下文潜空间」连线传入或本地自动加载），
+    本节点只做整段切片，潜空间输出以本节点的裁剪结果为主。
     """
 
     @classmethod
@@ -1059,7 +1219,8 @@ class Yuan_H3MotionContextTrim:
                     "default": 1, "min": 1, "max": 9999,
                     "tooltip": "本片段在链条中的序号。设为 2 时保存到"
                                "latent_00002_.safetensors，重复生成会覆盖原文件。"
-                               "「加载潜空间」节点设相同序号即可对应加载。"}),
+                               "「H3 运动上下文」未连接「上下文潜空间」时设相同"
+                               "片段序号即可对应加载。"}),
                 "保存到本地": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "尾段保存总开关。开启时按裁剪帧数字符串中的"
@@ -1069,8 +1230,8 @@ class Yuan_H3MotionContextTrim:
                 "存储位置": ("STRING", {
                     "default": "H3-Mubu",
                     "tooltip": "保存在 ComfyUI 输出文件夹下的子目录名。"
-                               "「加载潜空间」节点使用相同的存储位置即可"
-                               "对应加载。"}),
+                               "「H3 运动上下文」未连接「上下文潜空间」时使用"
+                               "相同的存储位置即可对应加载。"}),
             },
         }
 
@@ -1120,7 +1281,7 @@ class Yuan_H3MotionContextTrim:
         if len(parts) < 2:
             raise ValueError(
                 "h3_motion_context: 裁剪需要含视频和音频两流的 AV 潜空间，"
-                "得到 %d 个流。请连接 H3 采样器（或加载潜空间）的输出。"
+                "得到 %d 个流。请连接 H3 采样器的输出。"
                 % len(parts))
         video, audio = parts[0], parts[1]
         if video.ndim == 4:
@@ -1157,9 +1318,10 @@ class Yuan_H3MotionContextTrim:
         out["samples"] = new_samples
         # 第二次裁切（保存与否仅由「保存到本地」开关控制）：在第一次裁头
         # 结果的尾部按解析出的长度再切一段（保留后段）保存到本地，供下一
-        # 片段「加载潜空间 → 运动上下文」取尾部窗口。未启用上下文（"0:17"）
-        # 时裁 0 帧但尾段仍保存 17 帧，保证链条任何配置下下一片段都有可
-        # 衔接的上下文文件。音视频分离取窗由那边负责，本节点只做整段切片
+        # 片段「H3 运动上下文」取尾部窗口（连线传入或本地自动加载）。未启用
+        # 上下文（"0:17"）时裁 0 帧但尾段仍保存 17 帧，保证链条任何配置下
+        # 下一片段都有可衔接的上下文文件。音视频分离取窗由那边负责，
+        # 本节点只做整段切片
         if 保存到本地 and tail > 0:
             _save_av_latent(_tail_portion_latent(out, tail),
                             存储位置, 片段序号)
@@ -1199,7 +1361,7 @@ def _tail_portion_latent(delivered, tail_len):
     保存到本地的只取交付部分的「后段」而非整段：下一片段的运动上下文
     只需要尾部窗口，文件更小、目录指纹更快。切点对齐整 VRF 组边界
     （帧数 ≡ 0 mod 17），切出的尾段自身时序相位锚定在步 0，可被
-    「加载潜空间 → 运动上下文」正常取尾部窗口；交付帧数不足时退化为
+    「H3 运动上下文」正常取尾部窗口；交付帧数不足时退化为
     保存整个交付潜空间。
     """
     video, audio = _streams_from_latent(delivered)[:2]
@@ -1288,13 +1450,49 @@ def _resolve_prefix(dir_part, prefix, idx):
     return max(files, key=os.path.getmtime)
 
 
+def _find_latent_in_output(idx):
+    """兜底搜索：主「存储位置」解析失败时，扫描 ComfyUI 输出目录下所有
+    子目录，查找文件名匹配 latent_%05d_.safetensors 的文件。
+
+    用于「H3 运动上下文」自动索引模式——该模式依赖「存储位置」参数，
+    而工作流中该参数可能因节点合并/参数错位而错误（例如被保存为数字
+    1 而非 H3-Mubu）。只要文件实际存在于输出目录任意子目录（即「H3
+    运动裁剪」保存的位置），就能找到，消除"未找到片段 N 文件"。
+    命中多个时取修改时间最新的一个。
+    """
+    try:
+        idx_i = int(idx)
+    except (TypeError, ValueError):
+        return None
+    target = "latent_%05d_" % idx_i
+    out = folder_paths.get_output_directory()
+    if not out or not os.path.isdir(out):
+        return None
+    try:
+        subs = sorted(os.listdir(out))
+    except OSError:
+        return None
+    for sub in subs:
+        subp = os.path.join(out, sub)
+        if not os.path.isdir(subp):
+            continue
+        try:
+            files = [os.path.join(subp, f) for f in os.listdir(subp)
+                     if f.startswith(target) and f.endswith(".safetensors")]
+        except OSError:
+            continue
+        if files:
+            return max(files, key=os.path.getmtime)
+    return None
+
+
 def _dir_fingerprint(prefix_path):
     """目录级综合指纹：对 prefix_path 所在目录下所有 prefix_*.safetensors
     按「文件名 + mtime + size」计算指纹（仅读元数据、不读文件内容），
     任一文件新增/覆盖/删除都会改变指纹。
 
-    用于「加载潜空间」的 IS_CHANGED：该阶段链接输入拿不到真实值，
-    片段序号来自 GetNode/表达式链路时不可用，因此对
+    用于「H3 运动上下文」本地自动加载的 IS_CHANGED：该阶段链接输入拿不到
+    真实值，片段序号来自 GetNode/表达式链路时不可用，因此对
     整个存储目录做指纹——保存节点每次覆盖写入同一路径（mtime 必变）
     → 指纹变化 → 下游重跑；同一片段重试（内容不变）→ 缓存命中。
     目录不存在时返回确定性 "missing" 标记（可缓存），首次保存出现
@@ -1339,7 +1537,7 @@ def _read_and_write_latent_chunk(file, file_path, mode):
 
 @PromptServer.instance.routes.post("/yuan_h3_motion_upload_latent")
 async def _yuan_h3_motion_upload_latent(request):
-    """接收「H3 加载潜空间」节点手动上传的潜空间文件（分块追加写入）。"""
+    """接收「H3 运动上下文」节点手动上传的潜空间文件（分块追加写入）。"""
     post = await request.post()
     file = post.get("file")
     filename = post.get("filename")
@@ -1404,139 +1602,11 @@ def _resolve_manual_latent_path(手动上传):
         " output 目录下查找）。" % p)
 
 
-class Yuan_H3MotionContextLoadLatent:
-    """为 context_latent 输入加载已保存的 H3 AV 潜空间。
-
-    片段序号即"要延续的片段"：设为 2 加载 latent_00002_.safetensors
-    （与裁剪节点的保存命名一致）；重掷某片段会覆盖其自身保存，废弃文件
-    不堆积。输出仅用于运动上下文节点的「上下文潜空间」输入，不是可解码
-    的潜空间，勿接入 VAE 解码。
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "存储位置": ("STRING", {
-                    "default": "H3-Mubu",
-                    "tooltip": "与「H3 运动裁剪」节点相同的存储位置"
-                               "（ComfyUI 输出文件夹下的子目录名）。"}),
-                "片段序号": ("INT", {
-                    "default": 1, "min": 0, "max": 9999,
-                    "tooltip": "要加载的片段序号。设为 2 时加载"
-                               "latent_00002_.safetensors，与「H3 运动裁剪」"
-                               "节点的命名规则一致。设为 0 时表示链条的第一个"
-                               "片段（无前序上下文）：不读取本地文件，输出空"
-                               "标记，运动上下文节点识别后条件化直通、裁剪帧"
-                               "数为 0。手动上传非空时本参数被忽略。"}),
-                "手动上传": ("STRING", {
-                    "default": "",
-                    "tooltip": "通过「上传潜空间」按钮上传 .safetensors 潜空间"
-                               "文件，或手动填写路径（支持 input:/output:/temp: "
-                               "前缀、绝对路径；无前缀时先查 input 再查 output "
-                               "目录）。非空时优先加载该文件，完全忽略存储位置"
-                               "与片段序号（序号为 0 也照样加载）；留空时按"
-                               "存储位置+片段序号正常加载。"}),
-            },
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "load"
-    CATEGORY = "Yuan Tool/MiniMax"
-    DESCRIPTION = ("加载由「H3 运动裁剪」节点保存的潜空间，"
-                   "仅用于运动上下文节点的「上下文潜空间」输入。"
-                   "片段序号设为 0 时表示第一个片段，不读取文件，"
-                   "运动上下文节点将条件化直通。")
-
-    # 标记键：片段序号 0 时输出带此标记的空 latent，上下文节点据此直通
-    EMPTY_MARKER = "_h3_motion_context_empty"
-    # 原因键：空标记的原因（first_clip / file_not_found），供上下文节点生成提示
-    EMPTY_REASON = "_h3_motion_context_empty_reason"
-    # 细节键：原因细节（如未找到的片段序号），供上下文节点生成提示
-    EMPTY_REASON_DETAIL = "_h3_motion_context_empty_reason_detail"
-    # 正常加载时携带的片段序号键，供上下文节点生成"已关联片段 N"提示
-    CLIP_INDEX_KEY = "_h3_motion_context_clip_index"
-
-    @classmethod
-    def IS_CHANGED(cls, 存储位置, 片段序号=1, 手动上传=""):
-        # 手动上传非空：以该文件的 mtime+size 为指纹，忽略存储位置与序号。
-        # 文件未找到等异常返回 NaN：不缓存，保守每次重跑（load 会大声报错）。
-        if (手动上传 or "").strip():
-            try:
-                path = _resolve_manual_latent_path(手动上传)
-                st = os.stat(path)
-                return "manual:%s:%s:%s" % (path, st.st_mtime_ns, st.st_size)
-            except Exception:
-                return float("NaN")
-        # 片段序号显式为常量 0 = 第一个片段：输出确定性空标记，无需读文件。
-        # IS_CHANGED 阶段序号来自 GetNode/表达式链路时拿不到真实值，
-        # 故对存储目录下全部 latent 文件做综合指纹：内容变化 → 指纹变化
-        # → 下游重跑；同一片段重试内容不变 → 缓存命中。
-        try:
-            if int(片段序号) == 0:
-                return 0
-        except (TypeError, ValueError):
-            pass  # 链接输入拿不到序号，走目录级指纹
-        try:
-            return _dir_fingerprint(_build_load_path(存储位置))
-        except Exception:
-            return float("NaN")  # 意外失败：永不缓存，保守重跑
-
-    def load(self, 存储位置, 片段序号=1, 手动上传=""):
-        # 手动上传非空：优先加载该文件，完全忽略存储位置与片段序号
-        # （即使序号为 0 也照样加载，不以第一片段处理）
-        if _st_load is None:
-            raise RuntimeError("h3_motion_context: safetensors is not "
-                               "available; cannot load latents.")
-        manual_path = _resolve_manual_latent_path(手动上传)
-        if manual_path is not None:
-            data = _st_load(manual_path)
-            if "video" not in data or "audio" not in data:
-                raise ValueError(
-                    "h3_motion_context: %s is not an h3_motion_context latent "
-                    "(missing video/audio streams). Was it saved by the stock "
-                    "Save Latent node instead?" % manual_path)
-            # 手动加载无片段序号，不携带 CLIP_INDEX_KEY，
-            # 上下文节点提示为"已关联上下文"
-            return ({"samples": [data["video"], data["audio"]]},)
-        # 片段序号 0 = 第一个片段：无前序上下文，不读文件，输出带空标记的
-        # 空 latent，上下文节点识别后条件化直通、裁剪 0
-        try:
-            idx = int(片段序号)
-        except (TypeError, ValueError):
-            raise ValueError("h3_motion_context: 片段序号必须是整数，得到 %r"
-                             % (片段序号,))
-        if idx == 0:
-            return ({"samples": [], self.EMPTY_MARKER: True,
-                     self.EMPTY_REASON: "first_clip"},)
-        try:
-            path = _resolve_latent_path(_build_load_path(存储位置), idx)
-        except FileNotFoundError as e:
-            # 文件未找到：按第一片段处理，输出带原因的空标记，
-            # 上下文节点识别后直通、裁剪 0 并显示提示
-            return ({"samples": [], self.EMPTY_MARKER: True,
-                     self.EMPTY_REASON: "file_not_found",
-                     self.EMPTY_REASON_DETAIL: str(idx)},)
-        data = _st_load(path)
-        if "video" not in data or "audio" not in data:
-            raise ValueError(
-                "h3_motion_context: %s is not an h3_motion_context latent "
-                "(missing video/audio streams). Was it saved by the stock "
-                "Save Latent node instead?" % path)
-        # 输出普通 list 而非 NestedTensor：仅本仓库的 context_latent 输入
-        # 接受它，因此不可能被误当成可解码潜空间——接错会大声失败
-        # 携带片段序号，供上下文节点生成"已关联片段 N"提示
-        return ({"samples": [data["video"], data["audio"]],
-                 self.CLIP_INDEX_KEY: int(片段序号)},)
-
-
 NODE_CLASS_MAPPINGS = {
     "Yuan_H3MotionContext": Yuan_H3MotionContext,
     "Yuan_H3MotionContextTrim": Yuan_H3MotionContextTrim,
-    "Yuan_H3MotionContextLoadLatent": Yuan_H3MotionContextLoadLatent,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Yuan_H3MotionContext": "H3 运动上下文",
     "Yuan_H3MotionContextTrim": "H3 运动裁剪",
-    "Yuan_H3MotionContextLoadLatent": "H3 加载潜空间",
 }

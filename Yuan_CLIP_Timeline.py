@@ -1697,7 +1697,6 @@ class YuanCLIPTimeline:
                 ts = int(time.time() * 1000)
                 new_motion_segs = []
 
-                # 保存所有图像
                 saved_refs = []
                 for i in range(batch_size):
                     img_tensor = motion_images[i].clamp(0, 1).cpu()
@@ -1741,7 +1740,6 @@ class YuanCLIPTimeline:
                 tdata["motionSegments"] = new_motion_segs
 
                 timeline_data = json.dumps(tdata)
-                # 通过 WebSocket 通知前端刷新
                 try:
                     PromptServer.instance.send_sync("yuan_clip_motion_images_updated", {
                         "files": [{"file": f"motion_seg_{ts}_{i}.png", "index": i} for i in range(batch_size)],

@@ -1,14 +1,4 @@
-"""Yuan Tool · H3 放大 (3D) 节点
-
-纯 3D 卷积主干在 latent 空间放大 Minimax H3 视频（24 通道），跳过「解码 → 像素放大
-→ 再编码」的慢速往返，并避免直接对 latent 插值带来的鬼影/重影。
-
-特性：
-- 自动检测模型结构（通道数、块数、时序卷积配置）
-- 自动检测设备（优先 CUDA，无 GPU 回退 CPU）与模型精度，强制关闭注意力 (attn=False)
-- 模型从 ComfyUI/models/latent_upscale_models/ 加载
-- 联合 AV latent（NestedTensor）只放大视频流，音频流原样保留
-"""
+"""H3 放大 (3D) 节点：纯 3D 卷积在 latent 空间放大 Minimax H3 视频（联合 AV latent 只放大视频流）。"""
 
 import os
 import re
@@ -21,9 +11,7 @@ from einops import rearrange
 
 import folder_paths
 
-# ==========================================
 # 模型文件夹注册
-# ==========================================
 _LATENT_UPSCALE_FOLDER = "latent_upscale_models"
 if _LATENT_UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
     folder_paths.add_model_folder_path(
@@ -31,15 +19,11 @@ if _LATENT_UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
         os.path.join(folder_paths.models_dir, _LATENT_UPSCALE_FOLDER)
     )
 
-# ==========================================
 # 缩放方式选项
-# ==========================================
 UPSCALE_BY = "按倍数缩放"
 UPSCALE_TARGET = "目标尺寸"
 
-# ==========================================
 # Minimax H3 归一化参数（24 通道）
-# ==========================================
 LATENTS_MEAN = [
     0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075,
     -0.2727581858634949, -1.3675414323806763, -0.2553254961967468, -0.26907554268836975,
@@ -64,9 +48,7 @@ def _make_norm_tensors(device, dtype):
     return mean, std
 
 
-# ==========================================
 # 3D 网络组件
-# ==========================================
 def normalization(channels):
     return nn.GroupNorm(32, channels)
 
@@ -150,9 +132,7 @@ class TemporalConv(nn.Module):
         return identity + h
 
 
-# ==========================================
 # 纯 3D 主干网络
-# ==========================================
 class LatentResizer3D(nn.Module):
     def __init__(self, in_channels=24, in_blocks=12, out_blocks=12,
                  channels=512, dropout=0.1, attn=False,
@@ -223,9 +203,7 @@ class LatentResizer3D(nn.Module):
         return x
 
 
-# ==========================================
 # 模型加载（纯 3D 版本）
-# ==========================================
 MODEL_CACHE = {}
 
 
@@ -361,23 +339,12 @@ def load_model(name, device):
 
     MODEL_CACHE[cache_key] = model
 
-    print(f"[H3 放大 3D] 加载放大模型: {name}")
-    print(f"  Params: {sum(p.numel() for p in model.parameters()):,} | "
-          f"设备: {device} | 精度: {dtype} | "
-          f"Temporal: {'✓' if cfg['temporal_every'] > 0 else '✗'} "
-          f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']})")
     return model
 
 
-# ==========================================
 # ComfyUI 节点
-# ==========================================
 class Yuan_H3Upscale3D:
-    """H3 放大 (3D) 节点：纯 3D 卷积在 latent 空间放大 Minimax H3 视频。
-
-    支持「按倍数缩放」与「目标尺寸」两种缩放方式；时间维度保持不变，
-    仅放大空间分辨率（H×W）。
-    """
+    """H3 放大 (3D) 节点：latent 空间放大 H3 视频，仅放大空间分辨率，时间维度不变。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -509,9 +476,7 @@ class Yuan_H3Upscale3D:
         return ({"samples": out},)
 
 
-# ==========================================
 # 节点注册
-# ==========================================
 NODE_CLASS_MAPPINGS = {
     "Yuan_H3Upscale3D": Yuan_H3Upscale3D,
 }

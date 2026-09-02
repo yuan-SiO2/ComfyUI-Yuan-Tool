@@ -1,12 +1,4 @@
-"""Yuan Tool · 图像点处理 节点
-
-复刻自 ComfyUI-YuanEditor 的 YuanEditor 节点（原版为 ComfyUI-Easy-Sam3 的 FramesEditor）：
-- 在内嵌画布上为图像标注正面点/负面点/边界框，多帧图像可逐帧标注
-- 为避免与原插件冲突，节点标识改为 Yuan_ImagePoint，分类归入 "Yuan Tool/图像"
-- 端口与说明全面汉化，显示名为「图像点处理」
-
-节点分类: "Yuan Tool/图像"
-"""
+"""图像点处理 节点：在内嵌画布上标注正面点/负面点/边界框（复刻自 YuanEditor，多帧可逐帧标注）。"""
 
 import json
 import random

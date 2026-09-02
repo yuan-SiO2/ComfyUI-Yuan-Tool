@@ -1,8 +1,4 @@
-"""MiniMax H3 节点：图生视频 / 参考图生视频 / 数字人，构建 AV 联合潜空间与任务条件。
-
-合并为单个节点 Yuan_MiniMaxH3Video，通过"模式"下拉框切换，
-node_id 加 "Yuan_" 前缀避免与原生节点冲突。
-"""
+"""MiniMax H3 节点：图生视频 / 参考图生视频 / 数字人，构建 AV 联合潜空间与任务条件。"""
 
 import math
 
@@ -22,12 +18,8 @@ except Exception:  # 旧版 ComfyUI 无 H3 模型模块时用相同数值兜底
     FRAME_RESCALE = 5.0 / 3.0
 
 
-# ==================== 旧版核心（< v0.34.0）H3 修复反向移植 ====================
-# <d>/<|cutoff|> 等特殊 token 不再自注册，直接对接官方核心分词器
-# （v0.34.0 起由 comfy/text_encoders/minimax.py 的 MINIMAX_EXTRA_TOKENS 统一注册）。
-# 下面仅保留旧核心仍缺失的修复，检测到新版核心（已含修复）时自动跳过：
-#   1. #15439 PackedLayout 仅支持首/末帧锚点且丢弃关键帧音频 latent，数字人模式受损
-#   2. model_base 关键帧/参考共存时条件 latent 列表被参考覆盖、关键帧音频不收集
+# 旧版核心（< v0.34.0）H3 修复反向移植；新版核心已含修复时自动跳过。
+#   1) PackedLayout 支持首/末帧锚点并保留关键帧音频 latent；2) 关键帧/参考共存时条件与关键帧音频正确合并。
 try:
     import inspect
 
@@ -35,9 +27,7 @@ try:
     import comfy.model_base as _model_base
 
     if "frame_count" in inspect.signature(_h3_model.PackedLayout.__init__).parameters:
-        # 与 Yuan_H3_Motion.py 共享的 ABI 标记（改名须两文件同步）：反向移植
-        # 包装器据此被 Yuan_H3_Motion 识别为"同插件"而非第三方包装器，布局
-        # 补丁在反向移植 PackedLayout 上叠加、载荷补丁视为已应用。
+        # 与 Yuan_H3_Motion.py 共享的 ABI 标记（改名须两文件同步）
         BACKPORT_MARKER_LAYOUT = "_yuan_minimax_h3_v034_layout"
         BACKPORT_MARKER_PAYLOAD = "_yuan_minimax_h3_v034_extra_conds"
 
@@ -54,9 +44,7 @@ try:
 
         def _h3_packed_layout_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
                                    keyframes=None, refs=None, frame_count=None):
-            # v0.34.0 PackedLayout 逻辑；frame_count 参数仅为兼容旧调用点保留，不再使用。
-            # 关键帧音频段沿用 "ref_audio" 段类型（v0.34.0 命名为 cond_audio，两者在旧核心
-            # _forward 中的时间步/模态标签处理完全一致，沿用旧名可免去改动 _forward）
+            # v0.34.0 PackedLayout 逻辑；frame_count 仅兼容旧调用点保留，不再使用。
             frame, w_grid = _h3_model._frame_grid(latent_h, latent_w)
             frame_rows = frame.shape[0]
 
@@ -309,17 +297,7 @@ def _is_empty_audio(audio, audio_vae=None):
 
 
 class YuanMiniMaxH3Video:
-    """MiniMax-H3 视频生成（图生视频 / 参考图生视频 / 数字人）。
-
-    图生视频：提示词（+ 可选首帧/尾帧关键帧）生成正向条件与音视频联合潜空间。
-    参考图生视频：提示词 + <Picture i> / <Video k> / <Audio j> 参考条件。
-    数字人：把引导图像/音频锚定到任意帧。
-    引导 latent 写入 minimax_keyframes，每个采样步重新注入、从不去噪。
-
-    参考内容按固定顺序进入：先图像，再视频（每个视频的音轨 <Audio j> 标记
-    紧跟在对应 <Video k> 之前），最后是独立音频。每种类型的编号从 1 开始，
-    提示词中可用 <Picture i> / <Video k> / <Audio j> 引用。
-    """
+    """MiniMax-H3 视频生成（图生视频 / 参考图生视频 / 数字人），引导/参考 latent 写入 minimax_keyframes。"""
 
     RETURN_TYPES = ("CONDITIONING", "LATENT")
     RETURN_NAMES = ("正向", "潜空间")

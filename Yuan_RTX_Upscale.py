@@ -1,7 +1,4 @@
-"""Yuan Tool · RTX 视频放大 (H3) 节点
-
-合并 RTX 视频超分辨率 + AV Decode Split + PT H3 Concat AV Latent 为一体，支持 images 直连与 av_latent（解码→放大→重编码→合并音频）两种互斥输入模式；内置输入指纹缓存，输入未变时直接返回上次结果。依赖 nvidia-vfx（需 NVIDIA RTX 显卡）。
-"""
+"""RTX 视频放大 (H3) 节点：RTX 超分辨 + AV 解码/重编码合并，内置输入指纹缓存，依赖 nvidia-vfx。"""
 
 import torch
 

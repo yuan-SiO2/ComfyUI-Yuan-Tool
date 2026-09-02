@@ -30,9 +30,7 @@ except Exception:  # pragma: no cover
     av = None
 
 
-# --------------------------------------------------------------------------- #
 # 通用工具
-# --------------------------------------------------------------------------- #
 def _decode_data_url_image(data_url: str):
     """将前端截取的 base64 data URL 解码为 [1,H,W,C] 的 torch.Tensor（0..1）。"""
     text = str(data_url or "").strip()
@@ -117,9 +115,7 @@ def _save_preview_images(images, key: str = "pano_input_images") -> dict:
     return {}
 
 
-# --------------------------------------------------------------------------- #
 # 视频编码（best-effort，依赖 PyAV）
-# --------------------------------------------------------------------------- #
 def _pad_to_even(frames: torch.Tensor):
     h = int(frames.shape[-3])
     w = int(frames.shape[-2])
@@ -256,14 +252,9 @@ def _make_video_ui_payload(mp4_path: Path, fps: float, frame_count: int) -> dict
     }
 
 
-# --------------------------------------------------------------------------- #
 # 节点 1：全景预览
-# --------------------------------------------------------------------------- #
 class YuanPanoramaPreview:
-    """交互式预览 ERP 全景图（360°/180°），支持视频批次输入。
-
-    后端将输入落盘为预览图（pano_input_images），视频批次额外编码 mp4 预览（pano_videos / pano_video_meta）。
-    """
+    """交互式预览 ERP 全景图（360°/180°），支持视频批次输入。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -332,15 +323,9 @@ class YuanPanoramaPreview:
         return {"ui": ui_ret, "result": (output_image,)}
 
 
-# --------------------------------------------------------------------------- #
 # 节点 2：全景接缝
-# --------------------------------------------------------------------------- #
 class YuanPanoramaSeamPrep:
-    """为接缝修复（seam-focused inpainting）准备 ERP 图像。
-
-    输入 [B,H,W,C]（0..1），输出平移接缝后的图像 [B,H,W,C] 与接缝掩码 [B,H,W]（硬掩码 + 高斯模糊掩码）。
-    seam_center_offset_px 为正时接缝带右移，为负时左移。
-    """
+    """为接缝修复准备 ERP 图像：平移接缝并输出接缝掩码（硬掩码 + 高斯模糊掩码）。"""
 
     @classmethod
     def INPUT_TYPES(cls):

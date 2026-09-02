@@ -283,7 +283,6 @@ class YUAN_TXTJsonExtractor:
         """提取时间段文本中的最大结束时间（秒）：仅匹配行首的「开始-结束」时段标记（支持 s/秒/无单位、小数），避免误匹配其他数字。"""
         if not text:
             return 0.0
-        # 仅匹配行首的时段标记（支持 s/秒/无单位、小数）
         pattern = r'(?:^|\n)\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*(?:s|秒)?'
         matches = re.findall(pattern, text)
         if not matches:

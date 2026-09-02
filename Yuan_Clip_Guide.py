@@ -95,7 +95,6 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
 
             # 用预计算的 ref_summary 独立编码，解耦物理坐标系错位问题
             ref_summary = subject_ref_features[subject_num].to(device=x.device, dtype=x.dtype)
-            # 扩展到正向批次数
             num_pos = len(positive_rows) if positive_rows is not None else x.shape[0]
             ref_summary = ref_summary.expand(num_pos, -1)  # [num_pos, inner_dim]
 
@@ -124,7 +123,6 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
                     v[:, marker_tensor, :] * (1.0 - effective_alpha) + ref_v_expanded * effective_alpha
                 )
 
-    # 标准 attention 计算
     if mask is None:
         out = comfy.ldm.modules.attention.optimized_attention(
             q, k, v, heads=self.heads,
@@ -998,13 +996,11 @@ class YuanClipGuide:
                         length_frames = int(seg.get("length", 1))
                         if length_frames <= 0:
                             continue
-                        # 加载参考帧
                         video_frames = _load_motion_video_frames(
                             video_file, 0, length_frames, director_fps,
                             seg.get("resampleMode", "nearest"),
                             frame_files=seg.get("frameFiles"),
                         )
-                        # VAE 编码
                         _, guide_latent = cls._encode_for_timeline(
                             vae, latent_width, latent_height, video_frames, scale_factors,
                             latent_downscale_factor, resize_method=active_resize_method,

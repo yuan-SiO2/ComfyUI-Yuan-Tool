@@ -1,11 +1,4 @@
-"""Yuan Tool · Yuan 加载视频 UI 节点
-
-复刻自 Yuan-TV 插件的「加载视频 UI」节点（类/路由/前端扩展名均做隔离，
-可与源插件共存）。支持从 input 目录或本地路径加载视频，提供内置预览、
-时间轴裁剪、镜头智能分段与裁剪框交互 UI。
-
-节点分类: "Yuan Tool/视频"
-"""
+"""Yuan 加载视频 UI 节点：内置预览、时间轴裁剪、镜头智能分段与裁剪框交互。"""
 
 import os
 import gc
@@ -22,18 +15,6 @@ from server import PromptServer
 from aiohttp import web
 import comfy.utils
 
-
-# ====================================================================
-# 内存诊断辅助：记录当前 Python 进程 RSS，用于定位"切换分段内存叠加"来源
-# ====================================================================
-def _log_ram(tag=""):
-    try:
-        import psutil
-        proc = psutil.Process()
-        rss_mb = proc.memory_info().rss / (1024 * 1024)
-        print(f"[YuanVideoUI] {tag} 进程RSS={rss_mb:.0f}MB")
-    except Exception:
-        pass
 
 # 自定义 API 路由：从系统任意路径读取视频文件，供前端预览
 @PromptServer.instance.routes.get("/yuan_tool/video_custom_view")
@@ -107,8 +88,8 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
             vs = c.streams.video[0] if len(c.streams.video) > 0 else None
             if vs and vs.duration and vs.time_base:
                 video_duration = float(vs.duration * vs.time_base)
-    except Exception as e:
-        print(f"[YuanVideoUI] detect_segments open failed: {e}")
+    except Exception:
+        pass
     actual_end_time = end_time if (end_time > 0 and end_time > actual_start_time) else video_duration
     if actual_end_time <= 0:
         actual_end_time = float('inf')
@@ -125,8 +106,8 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
         vstream = container.streams.video[0] if len(container.streams.video) > 0 else None
         if vstream:
             vstream.thread_type = "AUTO"
-    except Exception as e:
-        print(f"[YuanVideoUI] thumb open failed: {e}")
+    except Exception:
+        pass
 
     segs = []
     for i in range(seg_count):
@@ -134,10 +115,7 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
         seg_start = actual_start_time + s0 / fps
         seg_end = actual_start_time + s1 / fps
         thumb = ""
-        # 后端「图像」输出真正取到的首/末帧时间（与 load_video 取帧逻辑一致：
-        # seek backward 后取第一个 frame.time >= 对应网格时间的帧）。
-        # 默认先用网格时间兜底；解码后改为帧的精确 PTS（完整双精度，不 round，
-        # 四舍五入会落到相邻帧的显示区间导致错位一帧）。
+        # 首/末帧默认用网格时间兜底；解码后改用帧的精确 PTS（避免四舍五入落到相邻帧区间）
         first_frame_time = seg_start
         last_frame_time = seg_end
         if container is not None and vstream is not None:
@@ -174,8 +152,8 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
                     if t >= last_grid_time:
                         last_frame_time = float(t)
                         break
-            except Exception as e:
-                print(f"[YuanVideoUI] frame times for seg {i} failed: {e}")
+            except Exception:
+                pass
         segs.append({
             "index": i,
             # 段首时间 = 输出首帧精确 PTS：浏览器跳转到该时间即显示与「图像」输出相同的首帧
@@ -258,20 +236,15 @@ async def yuan_detect_segments(request):
 
 
 def _detect_shot_frames(video_path):
-    """使用 PySceneDetect 检测源视频的镜头切割帧（含 0 与末尾帧）。
-
-    返回排序后的源视频帧号列表；PySceneDetect 不可用或检测失败时返回 None。
-    """
+    """用 PySceneDetect 检测源视频的镜头切割帧，返回排序帧号列表；不可用时返回 None。"""
     try:
         from scenedetect import AdaptiveDetector, detect
     except ImportError:
-        print('[YuanVideoUI] 未检测到 PySceneDetect，智能分段不可用。请安装: pip install "scenedetect>=0.6.4,<0.8"')
         return None
     try:
         detector = AdaptiveDetector(adaptive_threshold=3.0, min_scene_len=15)
         scenes = detect(video_path, detector, show_progress=False, start_in_scene=True)
-    except Exception as e:
-        print(f"[YuanVideoUI] 智能分割检测失败: {e}")
+    except Exception:
         return None
     if not scenes:
         return None
@@ -284,13 +257,7 @@ def _detect_shot_frames(video_path):
     return sorted(set(cuts))
 
 
-# ====================================================================
-# 镜头检测缓存：PySceneDetect 需要整段解码，非常慢。
-# 只缓存「切割点元数据」（每段起止位置），不缓存任何视频帧/缩略图数据。
-# 1) 内存缓存：同一次运行内复用；
-# 2) 磁盘缓存（JSON）：重启 ComfyUI 后，同一视频源直接读取切割点，
-#    无需再次整段解码检测，也就没有大内存占用。
-# ====================================================================
+# 镜头检测缓存：仅缓存切割点元数据（内存 + 磁盘 JSON），避免重复整段解码
 _scene_cut_cache = {}
 _SCENE_CUT_CACHE_MAX = 16
 _scene_cut_lock = threading.Lock()
@@ -332,8 +299,8 @@ def _save_disk_cache(cache):
     try:
         with open(_segment_disk_cache_path(), "w", encoding="utf-8") as f:
             json.dump(cache, f)
-    except OSError as e:
-        print(f"[YuanVideoUI] save segment cache failed: {e}")
+    except OSError:
+        pass
 
 
 def _load_result_cache():
@@ -350,8 +317,8 @@ def _save_result_cache(cache):
     try:
         with open(_segment_result_cache_path(), "w", encoding="utf-8") as f:
             json.dump(cache, f)
-    except OSError as e:
-        print(f"[YuanVideoUI] save segments result cache failed: {e}")
+    except OSError:
+        pass
 
 
 def _get_scene_cuts(video_path):
@@ -397,10 +364,7 @@ def _get_scene_cuts(video_path):
 
 
 def _build_segment_bounds(video_path, actual_start_time, actual_end_time, out_fps):
-    """与节点内一致的智能分段边界计算（基于缓存镜头检测）。
-
-    返回 (segment_bounds, seg_count)。segment_bounds 是输出帧坐标系下的边界列表。
-    """
+    """与节点内一致的智能分段边界计算，返回 (segment_bounds, seg_count)。"""
     end = actual_end_time
     if end == float('inf'):
         try:
@@ -451,11 +415,7 @@ def _build_segment_bounds(video_path, actual_start_time, actual_end_time, out_fp
     if len(bounds) < 2:
         bounds = [0, total_out]
 
-    # ====================================================================
-    # 长片段细分：镜头边界之间若仍有超过 15 秒的片段，则自动均分。
-    # 段数 n = ceil(片段时长 / 15)：>15s 对半 2 段，>30s 均分 3 段，
-    # >45s 均分 4 段，依此类推。无镜头检测时整段同样参与细分。
-    # ====================================================================
+    # 长片段细分：边界间超过 15 秒的片段按约 15 秒自动均分
     max_seg_sec = 15.0
     refined = [bounds[0]]
     for i in range(1, len(bounds)):
@@ -528,7 +488,6 @@ class YuanVideoUI:
         return True
 
     def load_video(self, 视频, 帧率, 显示模式, 开始时间, 结束时间, 时长, 开始帧, 结束帧, 时长帧数, 最长边=1536, 裁剪X=0.0, 裁剪Y=0.0, 裁剪宽度=1.0, 裁剪高度=1.0, 输出模式="自定义裁剪输出", 分段索引=0, **kwargs):
-        _log_ram("[YuanVideoUI] 执行前")
         if not 视频:
             # 未加载视频时返回空默认值
             empty_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
@@ -630,10 +589,7 @@ class YuanVideoUI:
         if actual_end_time <= 0:
             actual_end_time = float('inf') # 时长未知时的回退值
 
-        # ====================================================================
-        # 4. 智能分段：基于缓存镜头检测计算分段边界，
-        #    并确定本次只解码的起止范围（切换分段时不再整段重新提取）
-        # ====================================================================
+        # 4. 智能分段：基于缓存镜头检测计算分段边界，并确定本次只解码的起止范围
         out_fps = float(帧率) if 帧率 > 0 else 24.0
         seg_count = 1
         segment_bounds = None
@@ -681,13 +637,9 @@ class YuanVideoUI:
                 if duration_to_extract > 0:
                     expected_frames = int(np.ceil(duration_to_extract / frame_interval)) + 2
 
-            # ====================================================================
-            # 内存保护：估算输出张量大小，避免整段解码把内存拔高到数 GB
-            # （1080p float32 单帧约 25MB，240 帧即约 6GB；ComfyUI 还会缓存该输出）
-            # ====================================================================
+            # 内存保护：估算输出张量大小，防止整段解码使内存占比过高
             _FRAME_BYTES = 4  # float32
-            _MEMORY_HARD_LIMIT_GB = 8.0   # 超过则直接报错，防止内存暴涨
-            _MEMORY_WARN_GB = 1.5         # 超过则打印明显警告
+            _MEMORY_HARD_LIMIT_GB = 8.0  # 超过则直接报错，防止内存暴涨
             if expected_frames > 0 and scale_w > 0 and scale_h > 0:
                 est_mb = expected_frames * scale_w * scale_h * 3 * _FRAME_BYTES / (1024 * 1024)
                 if est_mb > _MEMORY_HARD_LIMIT_GB * 1024:
@@ -697,10 +649,6 @@ class YuanVideoUI:
                         f"请缩小【开始时间~结束时间】范围，或降低【帧率】/【最长边】，"
                         f"或改用“智能分段输出”模式（只解码所选分段）。"
                     )
-                elif est_mb > _MEMORY_WARN_GB * 1024:
-                    print(f"\n[YuanVideoUI] ⚠ 警告：当前范围解码约 {expected_frames} 帧，"
-                          f"输出图像预计占用约 {est_mb / 1024:.1f} GB 内存。\n"
-                          f"[YuanVideoUI]    建议缩小时间范围、降低帧率，或用“智能分段输出”模式。\n")
 
             pbar = comfy.utils.ProgressBar(expected_frames) if expected_frames > 0 else None
 
@@ -722,9 +670,7 @@ class YuanVideoUI:
                 if frame_time > decode_end_time + frame_interval:
                     break
 
-                # 强制正确的色彩空间和范围转换，修复 PyAV 色偏。
-                # 省略 dst_colorspace 让 swscale 对 RGB 输出使用默认值
-                # （传入它可能导致 YUV 矩阵应用错误）。
+                # 强制正确的色彩空间/范围转换修复 PyAV 色偏；省略 dst_colorspace 用 swscale 默认值
                 try:
                     frame = frame.reformat(
                         format="rgb24",
@@ -733,9 +679,8 @@ class YuanVideoUI:
                         dst_color_range=dst_range
                     )
                     frame_rgb = frame.to_ndarray(format='rgb24')
-                except Exception as e:
-                    # 回退：如果显式色彩转换失败，使用 PyAV 默认转换
-                    print(f"[YuanVideoUI] Color reformat failed, using default: {e}")
+                except Exception:
+                    # 回退：显式色彩转换失败时用 PyAV 默认转换
                     frame_rgb = frame.to_ndarray(format='rgb24')
 
                 # 先应用交互式裁剪
@@ -753,10 +698,8 @@ class YuanVideoUI:
                 if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
                     frame_rgb = np.pad(frame_rgb, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='constant', constant_values=0)
 
-                # 基于时间戳精确复制或跳过帧，以满足强制帧率。
-                # FIX: 对 actual_end_time 使用严格小于 (<)，避免在时长切片边界多取一帧！
-                # 智能分段模式（target_frames 已设置）按目标帧数精确输出，与检测接口 frames 一致；
-                # 其余模式维持原浮点时间边界判断。
+                # 基于时间戳精确复帧以满足强制帧率；结束边界严格小于，避免在切片边界多取一帧。
+                # 智能分段模式按目标帧数精确输出，与检测接口 frames 一致；其余模式维持浮点时间边界判断。
                 while expected_target_time <= frame_time and (
                     (target_frames is not None and frames_loaded < target_frames)
                     or (target_frames is None and expected_target_time < decode_end_time - 1e-5)
@@ -767,9 +710,8 @@ class YuanVideoUI:
                         alloc_frames = expected_frames + 50 # 增加缓冲避免重新分配
                         try:
                             image_tensor = torch.zeros((alloc_frames, height, width, 3), dtype=torch.float32)
-                        except Exception as e:
-                            print(f"[YuanVideoUI] Pre-allocation failed, falling back to list: {e}")
-                            expected_frames = 0 # 禁用预分配
+                        except Exception:
+                            expected_frames = 0  # 禁用预分配
 
                     if image_tensor is not None:
                         # 检查边界（以防万一）
@@ -867,9 +809,9 @@ class YuanVideoUI:
                     waveform = waveform.unsqueeze(0)
                     audio_dict = {"waveform": waveform, "sample_rate": sample_rate}
 
-            except Exception as e:
-                # 优雅捕获异常，不影响主流程执行
-                print(f"[YuanVideoUI] Audio track extraction skipped or failed: {e}")
+            except Exception:
+                # 音频流提取失败时优雅跳过，不影响主流程
+                pass
 
         # 始终关闭容器以释放系统内存锁
         container.close()
@@ -880,11 +822,8 @@ class YuanVideoUI:
         except Exception:
             pass
         gc.collect()
-        _log_ram("[YuanVideoUI] 执行后")
 
-        # ====================================================================
-        # 5. 输出组装：智能分段模式下，解码范围即为所选分段，直接输出
-        # ====================================================================
+        # 输出组装：智能分段模式下解码范围即所选分段，直接输出
         output_seg_count = seg_count
 
         if 输出模式 == "智能分段输出":
