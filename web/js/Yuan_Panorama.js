@@ -1,10 +1,6 @@
 /**
- * Yuan Tool · Panorama 前端
- *
- * 为 YuanPanoramaPreview 节点提供自包含的 WebGL 球面投影全景查看器：
- * 拖拽旋转（无惯性）、滚轮缩放、360°/180° 覆盖、图像与视频（mp4 批次）输入、双击/空格播放暂停视频。
- *
- * YuanPanoramaSeamPrep 为普通图像/掩码节点，由 ComfyUI 默认渲染，无需特殊前端。
+ * Yuan Tool · Panorama 前端：为 YuanPanoramaPreview 提供自包含 WebGL 球面投影全景查看器。
+ * 支持拖拽旋转、滚轮缩放、360°/180° 覆盖、图像与视频（mp4 批次）输入播放。
  */
 (function () {
     "use strict";
@@ -575,10 +571,7 @@
             }
         }
 
-        /**
-         * V3 (Nodes 2.0) 尺寸适配：强制节点最小尺寸并移除 current_view_data 占位端口。
-         * V1 前端不存在 comfy-node 元素，直接跳过。
-         */
+        /** V3 尺寸适配：强制最小尺寸并移除占位端口；V1 无 comfy-node 元素直接跳过 */
         _applyV3MinSize() {
             try {
                 let el = this.root?.parentElement;

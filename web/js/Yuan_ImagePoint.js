@@ -1,9 +1,5 @@
 /**
- * Yuan Tool · 图像点处理 前端
- * 复刻自 ComfyUI-YuanEditor 的 YuanEditor（原版为 ComfyUI-Easy-Sam3 的 FramesEditor）。
- * 为 Yuan_ImagePoint 节点提供内嵌画布：点标注模式（左键正面点/右键负面点）、
- * 框标注模式（拖拽边界框）、多帧图像底部滑块逐帧切换、撤销/重做/清空。
- * 辅助函数均为模块作用域，不会与原版产生全局冲突。
+ * Yuan Tool · 图像点处理前端：为 Yuan_ImagePoint 提供内嵌画布（点/框标注、多帧切换、撤销重做清空）。
  */
 import { getApi, findComfyNodeEl, enforceV3MinSize } from "./Yuan_Common.js";
 
@@ -26,8 +22,6 @@ const makeUUID = _ =>{
 }
 const chainCallback = (object, property, callback) => {
   if (object == undefined) {
-    // 理论上不应发生
-    console.error("Tried to add callback to non-existant object")
     return;
   }
   if (property in object) {

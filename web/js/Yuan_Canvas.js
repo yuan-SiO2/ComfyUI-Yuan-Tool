@@ -1,8 +1,4 @@
-/**
- * Yuan Tool · 画布 前端：为 Yuan_Canvas 节点提供基于 fabric.js 的内嵌合成编辑器，
- * 接收 bg_image 与 images(batch) 作为图层，支持放置/旋转/缩放/锁定/层级调整，
- * 合成结果上传后端作为节点 IMAGE 输出，并持久化位置信息以在工作流切换后恢复。
- */
+/** Yuan Tool · 画布前端：为 Yuan_Canvas 节点提供基于 fabric.js 的内嵌合成画布编辑器。 */
 import { fabric } from "./fabric.js";
 import { getApi, findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput, imageSourceFromCandidate, lookupNodeOutputEntry } from "./Yuan_Common.js";
 
@@ -207,13 +203,7 @@ async function waitForImageLoads(instance) {
     }
 }
 
-/**
- * 排队前确保所有画布节点的合成图已上传：
- * 画布有内容且（有未上传修改 / 无合成文件名 / 合成文件已被清理）时，
- * 先等待图像加载沉淀并上传合成结果，再继续排队。
- * 这样运行工作流时合成图像输出端口直接给出图像，外接预览节点直接显示，
- * 无需手动点「更新画布」等按钮。
- */
+/** 排队前确保画布有内容且待上传的合成图已自动上传，运行时可直接输出合成图像。 */
 async function ensureCanvasesUploadedBeforeQueue() {
     const graphNodes = app?.graph?._nodes || [];
     const uploads = [];
@@ -516,18 +506,13 @@ app.registerExtension({
         compositorInstance.onHeightChange(compositorInstance.h.value);
         compositorInstance.onPaddingChange(compositorInstance.p.value);
 
-        // ── V3 (Nodes 2.0) 尺寸适配：使 DOM 渲染尺寸与 V1 设计保持一致 ──
-        // V3 专用：告知布局系统该 DOM widget 的最小尺寸（随画布尺寸变化）
+        // V3 (Nodes 2.0) 尺寸适配：DOM 行布局尺寸=画布自身尺寸，不得用整节点尺寸，否则 DOM 行被撑高
         if (node.editorWidget) {
             const widget = node.editorWidget;
             const prevCLS = typeof widget.computeLayoutSize === "function"
                 ? widget.computeLayoutSize.bind(widget) : null;
             widget.computeLayoutSize = (targetNode) => {
                 const p = prevCLS ? (prevCLS(targetNode) || {}) : {};
-                // DOM widget 行的布局尺寸 = 画布自身尺寸（w+2p × h+2p），
-                // 不得返回整节点尺寸（含标题/端口/按钮余量）：那会把 DOM 行撑高，
-                // 「更新画布」按钮与画布之间出现超过暂存边距的大段空白。
-                // 节点整体最小尺寸由 enforceV3Size 的 node.min_size/comfy-node min-height 负责。
                 const cw = compositorInstance.fcanvas ? compositorInstance.fcanvas.getWidth() : 0;
                 const ch = compositorInstance.fcanvas ? compositorInstance.fcanvas.getHeight() : 0;
                 return {
@@ -539,8 +524,7 @@ app.registerExtension({
             compositorInstance.enforceV3Size();
         }
 
-        // V3 (Nodes 2.0)：widget 与输入端口共存，
-        // 移除 fabricData / imageName 的占位端口（避免节点被端口拉长）
+        // V3 (Nodes 2.0)：移除 fabricData / imageName 的占位端口，避免节点被拉长
         if (compositorInstance.v3NodeElement) {
             for (const name of ["fabricData", "imageName"]) {
                 removeV3PlaceholderInput(node, name);
@@ -620,7 +604,6 @@ class Editor {
         try {
             return JSON.parse(value)
         } catch (e) {
-            console.log("deserializeStuff", e, value);
             return undefined;
         }
     }
@@ -716,8 +699,7 @@ class Editor {
     }
 
     /**
-     * V3 (Nodes 2.0) 尺寸适配：在 comfy-node 元素上同步节点最小尺寸，
-     * 使 DOM 渲染尺寸与 V1 设计保持一致（V1 无 comfy-node 元素，直接跳过）。
+     * V3 (Nodes 2.0) 尺寸适配：在 comfy-node 元素上同步节点最小尺寸（V1 无此元素则跳过）。
      */
     enforceV3Size() {
         try {
@@ -775,10 +757,7 @@ class Editor {
         return this.inputImages[sig] != null;
     }
 
-    /**
-     * 清空所有输入图层（从画布移除并清空 inputImages 对象）。
-     * 在后端每次推送新一批 images 之前调用，确保数量变化时不会有残留图层。
-     */
+    /** 清空所有输入图层并在后端推送新一批 images 前调用，确保数量变化时无残留图层。 */
     clearInputImages() {
         if (!this.fcanvas) {
             this.inputImages = {};
@@ -877,10 +856,7 @@ class Editor {
         instance.enforceLayerOrder();
     }
 
-    /**
-     * 将 bg_image 作为不可选中的最底层图层（compositionArea 之上、输入图像之下），
-     * cover 铺满合成区域（w×h，偏移 padding）。
-     */
+    /** 将 bg_image 作为不可选中的最底层图层，cover 铺满合成区域（w×h，偏移 padding）。 */
     setBgImage(img) {
         if (!img) return;
         // 移除之前的背景图像（若有）
@@ -941,10 +917,7 @@ class Editor {
         this.bgImage.setCoords();
     }
 
-    /**
-     * 强制执行规范图层顺序（compositionArea < bgImage < images < compositionBorder）。
-     * 在任何结构性变更（添加/移除/重排/调整尺寸）后调用。
-     */
+    /** 强制执行图层顺序（compositionArea < bgImage < images < compositionBorder），结构性变更后调用。 */
     enforceLayerOrder() {
         if (!this.fcanvas) return;
         if (this.bgImage) {
@@ -1184,7 +1157,6 @@ class Editor {
             if (callback) callback()
 
         }, () => {
-            console.log("some error")
         });
     }
 
@@ -1224,8 +1196,7 @@ class Editor {
     }
 
     continue() {
-        // continue 仅更新画布：从上游输入重新读取图像，不触发工作流执行。
-        // 合成结果在图像加载沉淀后自动上传，直接运行/预览即可输出合成图像。
+        // continue 仅更新画布：从上游重新读取图像，不触发工作流执行；加载沉淀后自动上传合成结果。
         this.refreshFromUpstream();
     }
 
@@ -1255,12 +1226,8 @@ class Editor {
     }
 
     /**
-     * 按内容增量刷新画布图层：
-     * - 内容未变的图层保持原样（位置/锁定/隐藏状态不丢，不重新加载）
-     * - 上游新增的图像加入画布（按 sig 从 fabricData 恢复历史位置）
-     * - 上游已不存在的图层移出画布
-     * sources: [{url, sig}]，sig 为来源提供的键（后端 sig），可为 null（用内容签名作 key）
-     * clearWhenEmpty：sources 为空时是否清空全部图层（执行回调可信；主动刷新时保守保留）
+     * 按内容增量刷新画布图层：内容未变的保持原位（位置/锁定/隐藏不丢），
+     * 上游新增的入画布、已不存在的移除。sig 为来源键；clearWhenEmpty 为空时是否清空。
      */
     reconcileLayers(sources, restoreData, shouldRestore, wantUpload, clearWhenEmpty) {
         if (!this.fcanvas) return;
@@ -1329,10 +1296,7 @@ class Editor {
         });
     }
 
-    /**
-     * 加载图像并跟踪加载状态：完成后通知 _imageLoadActivity；
-     * wantUpload 为 true 时，所有图像加载沉淀后自动上传当前合成结果。
-     */
+    /** 加载图像并跟踪加载状态；wantUpload 时所有图像加载沉淀后自动上传合成结果。 */
     _loadTrackedImage(url, onReady, wantUpload) {
         if (!url) return;
         if (wantUpload) this._autoUploadWanted = true;

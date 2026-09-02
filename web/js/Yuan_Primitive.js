@@ -16,7 +16,6 @@ app.registerExtension({
         const LiteGraph = window.LiteGraph;
         const { PrimitiveNode } = window.comfyAPI?.widgetInputs ?? {};
         if (!LiteGraph) {
-            console.warn("[YuanTool] 未获取到 LiteGraph，'选项' 节点未注册。");
             return;
         }
 
@@ -194,9 +193,6 @@ app.registerExtension({
             })
         );
         YuanPrimitive.category = "Yuan Tool/选项";
-        if (!PrimitiveNode) {
-            console.warn("[YuanTool] 未获取到原生 PrimitiveNode，'选项' 节点已用内置基类注册（功能受限：连接后请手动点击开关写入）。");
-        }
     },
 
     // 汉化 V3 节点库/搜索：前端为纯前端注册节点生成的定义默认

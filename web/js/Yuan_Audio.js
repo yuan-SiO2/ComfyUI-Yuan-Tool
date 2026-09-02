@@ -1,10 +1,5 @@
 /**
- * Yuan Tool · 音频节点前端
- *
- * - Yuan 音频列表：每个音频一个固定方块（序号/文件名/时长/删除）；点击播放/暂停，
- *   全局互斥（同一时刻仅一个播放）；滚轮上下滑动横向滚动滑轨（仅滚动，不触发播放）；
- *   支持上传 / 从输入目录选择 / 拖拽排序；状态持久化到 audio_list_data。
- * - Yuan 音频分流：按「输出数量」widget 动态修剪输出端口（默认 2，上限 30）。
+ * Yuan Tool · 音频节点前端：音频列表（互斥播放/上传/选择/拖拽排序）+ 音频分流（按输出数量修剪端口）。
  */
 (function () {
     "use strict";
@@ -225,9 +220,7 @@
     }
 
     /**
-     * 播放/暂停切换（互斥）：
-     * - 该方块正在播放 → 暂停；
-     * - 否则先停止全局其他播放（自动关闭另一个），再播放该方块。
+     * 播放/暂停切换（全局互斥，先停止其他播放再播放当前）。
      */
     function togglePlayback(blockEl, src) {
         if (globalPlayer && globalPlayer.blockEl === blockEl) {
@@ -653,7 +646,7 @@
                             if (data.subfolder) name = data.subfolder + "/" + name;
                             uploaded.push(name);
                         }
-                    } catch (e) { console.error("上传错误", e); }
+                    } catch (e) {}
                 }
                 if (uploaded.length > 0) {
                     audioFiles = audioFiles.concat(uploaded).slice(0, MAX_AUDIOS);
@@ -671,9 +664,7 @@
                         const data = await resp.json();
                         if (Array.isArray(data.files)) files = data.files;
                     }
-                } catch (e) {
-                    console.error("获取音频文件列表失败", e);
-                }
+                } catch (e) {}
 
                 closeFilePicker();
 
@@ -785,10 +776,7 @@
             }
 
             // --- 9. 布局管理 ---
-            // 容器高度固定（方块滑轨横向滚动，不随文件数变化）。
-            // 节点尺寸完全交给 LiteGraph / V3 处理，允许用户自由拉伸：
-            // - 不重写 onResize / computeSize / setSize（反复强制最小高度会导致拉伸异常）；
-            // - min_size 仅初始化时设置一次。
+            // 容器高度固定，尺寸交给 LiteGraph/V3 处理；不重写 resize（反复强制最小高会导致拉伸异常）
             const MIN_W = 240;
 
             function getContainerHeight() {

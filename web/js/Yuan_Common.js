@@ -1,10 +1,4 @@
-/**
- * Yuan Tool · 前端共享工具库
- *
- * 各节点前端扩展的公共函数（API 实例获取、V3 前端检测、占位端口移除、
- * 图像 URL 解析等），以 ES module 形式导出供 Yuan_*.js 导入复用。
- * 本文件无副作用，被 ComfyUI 当作扩展加载时不执行任何操作。
- */
+/** Yuan Tool · 前端共享工具库：供各节点前端导出的公共函数（ES module，无副作用） */
 
 /** 从 window.comfyAPI 获取 api 实例（兼容不同 ComfyUI 版本）。 */
 export function getApi() {
@@ -31,10 +25,7 @@ export function findComfyNodeEl(startEl) {
     return null;
 }
 
-/**
- * 在 V3 comfy-node 元素上强制最小尺寸，使 DOM 渲染尺寸与 V1 设计一致。
- * minW 传 null 时仅强制高度（宽度交由用户/画布自适应）。
- */
+/** 在 V3 comfy-node 元素上强制最小尺寸；minW 传 null 时仅强制高度 */
 export function enforceV3MinSize(comfyNodeEl, minW, minH) {
     if (!comfyNodeEl) return;
     comfyNodeEl.style.removeProperty("min-width");
@@ -44,10 +35,7 @@ export function enforceV3MinSize(comfyNodeEl, minW, minH) {
     comfyNodeEl.style.setProperty("min-height", minH + "px", "important");
 }
 
-/**
- * V3 (Nodes 2.0) 下 widget 与输入端口共存，移除隐藏管理参数的空占位端口
- * （避免节点被端口拉长）。已有连线（inp.link != null）的端口保留不删。
- */
+/** 移除 V3 下隐藏管理参数的空占位端口（避免节点被拉长）；已有连线的端口保留不删 */
 export function removeV3PlaceholderInput(node, name) {
     if (!node || !Array.isArray(node.inputs)) return false;
     const slot = node.findInputSlot(name);

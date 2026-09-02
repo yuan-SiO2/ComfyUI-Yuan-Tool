@@ -1,10 +1,4 @@
-/**
- * Yuan Tool · 加载视频 UI 前端
- *
- * 复刻自 Yuan-TV 插件的「加载视频 UI」节点（节点键名/路由/扩展注册名均做隔离，
- * 可与源插件共存）。为 Yuan_VideoUI 节点提供内置视频预览、时间轴裁剪、
- * 镜头智能分段与裁剪框交互 UI。
- */
+/** Yuan Tool · 加载视频 UI 前端：为 Yuan_VideoUI 节点提供视频预览、时间轴裁剪、镜头智能分段与裁剪框交互 UI。 */
 const { app } = window.comfyAPI.app;
 
 /** 从 window.comfyAPI 获取 api 实例 */
@@ -321,7 +315,6 @@ app.registerExtension({
                             if (checkResp.status === 200) {
                                 const checkResult = await checkResp.json();
                                 if (checkResult.exists) {
-                                    console.log(`[YuanVideoUI] File already exists: ${checkResult.name}. Reusing existing file.`);
                                     if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(checkResult.name)) {
                                         videoWidget.options.values.push(checkResult.name);
                                     }
@@ -333,7 +326,6 @@ app.registerExtension({
                                 }
                             }
                         } catch (e) {
-                            console.warn("[YuanVideoUI] Failed to check for existing file, proceeding with upload", e);
                         }
 
                         btnWidget.name = "上传中...";
@@ -406,7 +398,6 @@ app.registerExtension({
                             }
                         }
                     } catch (error) {
-                        console.error("Upload failed", error);
                         if (errorMsg) {
                             errorMsg.textContent = "上传失败，请查看控制台。";
                             errorMsg.style.display = "block";
@@ -1389,7 +1380,6 @@ app.registerExtension({
                         segmentsCacheData = data;
                         renderSegBlocks();
                     } catch (err) {
-                        console.error("[YuanVideoUI] 分段检测失败", err);
                         flashDetectBtn("检测失败");
                     } finally {
                         detectBtn.disabled = false;

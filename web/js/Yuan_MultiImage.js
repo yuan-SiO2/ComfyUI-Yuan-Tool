@@ -1,9 +1,4 @@
-/**
- * Yuan Tool · 加载批量图像 前端（多滑轨版）
- *
- * 最多 20 个独立滑轨，每滑轨单独加载批量图像并自定义命名；
- * 状态持久化到 tracks_data widget，兼容 V1 / V3 前端。
- */
+/** Yuan Tool · 加载批量图像前端（多滑轨版） */
 (function () {
     "use strict";
 
@@ -163,12 +158,10 @@
                 overflow: hidden;
             `;
 
-            // 滑轨列表容器
             const tracksContainer = document.createElement("div");
             tracksContainer.style.cssText = "display: flex; flex-direction: column; gap: 0;";
             container.appendChild(tracksContainer);
 
-            // 添加滑轨按钮
             const addTrackBtn = document.createElement("button");
             addTrackBtn.className = "yuan-mi-btn";
             addTrackBtn.innerText = "+ 添加滑轨";
@@ -201,8 +194,7 @@
             // 当前活跃滑轨索引（用于文件上传目标）
             let activeTrackIndex = 0;
             fileInput.onchange = (e) => {
-                // 必须先将 FileList 转为数组，否则 e.target.value="" 会清空 FileList，
-                // 导致 async handleFiles 中 await 后续迭代拿不到文件（只能上传第一张）
+                // 必须先将 FileList 转数组，避免异步迭代丢失文件（否则只能上传第一张）
                 const files = Array.from(e.target.files);
                 if (files.length > 0) {
                     handleFiles(files, activeTrackIndex);
@@ -281,7 +273,6 @@
 
             /**
              * 同步输出端口与 tracks 数组（严格 1:1 对应）
-             * @param {number} deletedIndex - 删除滑轨时传入被删除的索引；添加/重命名时不传
              */
             function syncOutputs(deletedIndex) {
                 if (!node.outputs) return;
@@ -326,7 +317,7 @@
                 if (!isInput) {
                     const trackIdx = slotToTrackIndex(slotNumber);
                     if (trackIdx >= 0 && trackYPositions[trackIdx] !== undefined) {
-                        out[0] = this.size[0]; // 右边缘
+                        out[0] = this.size[0];
                         out[1] = trackYPositions[trackIdx];
                         return out;
                     }
@@ -393,7 +384,6 @@
 
                 toolbar.append(zoomOutBtn, zoomLabel, zoomInBtn, resetBtn, nameSpan, closeBtn);
 
-                // 视口区域
                 const viewport = document.createElement("div");
                 viewport.className = "yuan-mi-preview-viewport";
 
@@ -451,7 +441,6 @@
                     updateTransform();
                 }
 
-                // 按钮
                 zoomInBtn.onclick = () => {
                     zoomAt(viewport.clientWidth / 2, viewport.clientHeight / 2, 1.25);
                 };
@@ -567,7 +556,6 @@
                     background: #2a2a38; box-sizing: border-box;
                 `;
 
-                // 名称输入框
                 const nameInput = document.createElement("input");
                 nameInput.className = "yuan-mi-name-input";
                 nameInput.type = "text";
@@ -583,7 +571,6 @@
                 // 阻止 LiteGraph 键盘事件
                 nameInput.addEventListener("keydown", (e) => e.stopPropagation());
 
-                // 上传按钮
                 const uploadBtn = document.createElement("button");
                 uploadBtn.className = "yuan-mi-btn";
                 uploadBtn.innerText = "上传";
@@ -597,7 +584,6 @@
                     fileInput.click();
                 };
 
-                // 清空按钮
                 const clearBtn = document.createElement("button");
                 clearBtn.className = "yuan-mi-btn";
                 clearBtn.innerText = "清空";
@@ -612,7 +598,6 @@
                     serializeTracks();
                 };
 
-                // 删除滑轨按钮
                 const deleteBtn = document.createElement("button");
                 deleteBtn.className = "yuan-mi-btn";
                 deleteBtn.innerText = "删除";
@@ -699,7 +684,6 @@
                 galleryWrapper.appendChild(gallery);
                 trackDiv.appendChild(galleryWrapper);
 
-                // 渲染缩略图
                 renderTrackGallery(trackIndex, gallery);
 
                 return trackDiv;
@@ -770,7 +754,7 @@
                     item.addEventListener("click", (e) => {
                         // 发生位移视为拖拽，不触发预览
                         if (Math.abs(e.clientX - pressX) > 4 || Math.abs(e.clientY - pressY) > 4) return;
-                        // 点击删除按钮时不触发预览（del.onclick 已 stopPropagation，此处双保险）
+                        // 点击删除按钮时不触发预览（双保险）
                         if (e.target === del || del.contains(e.target)) return;
                         e.stopPropagation();
                         openPreview(path);
@@ -790,7 +774,6 @@
                     item.ondragend = () => {
                         if (draggedNode) draggedNode.style.opacity = "1";
                         draggedNode = null;
-                        // 保存新顺序
                         const newPaths = Array.from(galleryEl.children).map(n => n.dataset.path);
                         const current = tracks[trackIndex].paths.join("\n");
                         if (newPaths.join("\n") !== current) {
@@ -842,7 +825,7 @@
                             if (data.subfolder) name = data.subfolder + "/" + name;
                             uploaded.push(name);
                         }
-                    } catch (e) { console.error("上传错误", e); }
+                    } catch (e) {}
                 }
                 if (uploaded.length > 0) {
                     tracks[trackIndex].paths = tracks[trackIndex].paths.concat(uploaded);
@@ -866,9 +849,7 @@
                 return galleryY + getContainerHeight() + 5;
             }
 
-            // 最小宽度需容纳轨道头部内容：header padding(12) + 名称输入框(60)
-            // + 上传/清空/删除按钮(34*3=102) + 间距(16) = 190，加容器 padding(16)
-            // 和右侧端口区(30) ≈ 236，取 240 确保按钮不被裁剪
+            // 最小宽度取 240 确保轨道头部按钮不被裁剪
             function getMinW() { return 240; }
 
             let v3EventsAttached = false;
@@ -914,7 +895,6 @@
                 isLayouting = false;
             }
 
-            // 重写尺寸方法
             const origOnResize = node.onResize;
             node.onResize = function (size) {
                 size[0] = Math.max(size[0], getMinW());
@@ -975,8 +955,7 @@
                 deserializeTracks();
                 if (tracks.length === 0) tracks = [createDefaultTrack()];
 
-                // 同步端口：此时 LiteGraph 已恢复 node.outputs[i].links，
-                // onConfigure 时端口数量与 tracks 一致，只同步名称不删端口
+                // 端口数量此时与 tracks 一致，仅同步名称不删端口
                 syncOutputs();
 
                 // 异步渲染 UI（等 DOM 就绪）
@@ -1061,8 +1040,7 @@
             // 延迟初始化兜底（确保 DOM 就绪）
             setTimeout(ensureInitialized, 50);
 
-            // 一次性修正：DOM 渲染后 last_y 已稳定，按实际偏移重新计算节点高度
-            // （新建节点首次渲染时 last_y=0，估算高度与实际可能有偏差）
+            // DOM 渲染后 last_y 已稳定，重新校正节点高度
             setTimeout(() => {
                 updateLayout(true);
                 updateTrackYPositions();

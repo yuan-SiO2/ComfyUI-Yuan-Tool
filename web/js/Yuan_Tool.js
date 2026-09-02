@@ -505,8 +505,89 @@ function registerResizeTypeConditionalWidgets(nodeType) {
 }
 
 // ==================== Yuan_H3MotionContext（H3 运动上下文，节点下方提示）====================
+
+function yuanHideWidget(w) {
+    if (!w) return;
+    w.type = "hidden";
+    w.hidden = true;
+    w.computeSize = () => [0, -4];
+}
+
+// 确保某输入端口存在（用于模式切换重建被移除的端口）。
+// widgetName 非空表示该端口绑定同名 widget（V3 下据此把参数渲染为 widget 而非可连端口）
+function yuanEnsureInput(node, name, type, opts, widgetName) {
+    if (node && node.inputs && node.inputs.find((i) => i.name === name)) return;
+    node.addInput(name, type, opts || {});
+    const inp = node.inputs && node.inputs.find((i) => i.name === name);
+    if (inp) {
+        inp.optional = !!(opts && opts.optional);
+        if (widgetName) inp.widget = widgetName;
+        if (opts && opts.label) inp.label = opts.label;
+        if (opts && opts.tooltip) inp.tooltip = opts.tooltip;
+    }
+}
+
+// V3 (Nodes 2.0) 检测：向上找 comfy-node 元素（含 shadow DOM host）
+function yuanIsV3Node(node) {
+    try {
+        const w = node.widgets && node.widgets.find((x) => x.element);
+        const el = w ? w.element : null;
+        let n = el;
+        while (n) {
+            if ((n.tagName && n.tagName.toLowerCase().includes("comfy-node")) ||
+                (n.classList && n.classList.contains("comfy-node"))) return true;
+            n = n.parentElement || (n.getRootNode ? n.getRootNode().host : null);
+        }
+    } catch (_) {}
+    return false;
+}
+
+// V3 下被前端隐藏的 widget 会显示为空端口占位把节点拉长，主动移除对应输入端口
+// （保留真实可连接端口；已有连线的端口保留不删，避免破坏连接）
+function yuanRemoveHiddenWidgetPorts(node, names) {
+    if (!node || !Array.isArray(node.inputs) || !yuanIsV3Node(node)) return;
+    for (let i = node.inputs.length - 1; i >= 0; i--) {
+        const inp = node.inputs[i];
+        if (inp && names.indexOf(inp.name) !== -1 && inp.link == null) {
+            try { node.removeInput(i); } catch (_) {}
+        }
+    }
+}
+
+// 兼容 V2（数组）与 V3（Map）的 graph.links 取值
+function yuanH3LinkObj(graph, id) {
+    if (!graph || id == null) return null;
+    const links = graph.links;
+    if (!links) return null;
+    if (typeof links.get === "function") return links.get(id) || null;
+    return links[id] || null;
+}
+
+// 把「H3 运动上下文 → 裁剪帧数 → H3 运动裁剪」链路上裁剪节点的「存储位置」
+// 同步到本节点的隐藏「存储位置」widget（只在值不同时写入并重绘）
+function yuanH3SyncStorageFromTrim(node) {
+    if (!node || !app || !app.graph || !Array.isArray(node.outputs)) return;
+    const out = node.outputs[1]; // 索引 1 = 裁剪帧数
+    if (!out || !Array.isArray(out.links) || out.links.length === 0) return;
+    const graph = app.graph;
+    for (const lid of out.links) {
+        const l = yuanH3LinkObj(graph, lid);
+        if (!l || typeof graph.getNodeById !== "function") continue;
+        const trim = graph.getNodeById(l[3]);
+        if (!trim || trim.type !== "Yuan_H3MotionContextTrim") continue;
+        const src = trim.widgets && trim.widgets.find((w) => w.name === "存储位置");
+        const dst = node.widgets && node.widgets.find((w) => w.name === "存储位置");
+        if (!src || !dst || src.value === dst.value) continue;
+        dst.value = src.value;
+        if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
+        break;
+    }
+}
+
 function registerYuanH3MotionContext(nodeType) {
     const HINT_HEIGHT = 20; // 提示行预留高度
+    const PORT_NAME = "上下文潜空间"; // 随模式显隐的真实数据端口
+    const SEQ_NAME = "片段序号"; // 仅自动索引模式显示
 
     const origOnExecuted = nodeType.prototype.onExecuted;
     nodeType.prototype.onExecuted = function (data) {
@@ -533,9 +614,15 @@ function registerYuanH3MotionContext(nodeType) {
         return size;
     };
 
-    // 在节点底部绘制单行提示（不可编辑）
+    // 在节点底部绘制单行提示（不可编辑）。绘制前做一次「存储位置」轻量同步，
+    // 并比对「模式」值（V3 下 Vue 下拉不走原生 callback，值变化即触发显隐同步）
     const origOnDrawForeground = nodeType.prototype.onDrawForeground;
     nodeType.prototype.onDrawForeground = function (ctx) {
+        yuanH3SyncStorageFromTrim(this);
+        const modeWidget = this.widgets && this.widgets.find((w) => w.name === "模式");
+        if (modeWidget && this._syncModeReal && modeWidget.value !== this._lastModeValue) {
+            this._syncModeReal();
+        }
         if (origOnDrawForeground) origOnDrawForeground.apply(this, arguments);
         if (!this._h3Hint) return;
         ctx.save();
@@ -548,16 +635,267 @@ function registerYuanH3MotionContext(nodeType) {
         ctx.restore();
     };
 
-    // 工作流加载时清除提示（提示由运行时生成，不随工作流保存）
+    // 工作流加载时清除提示（提示由运行时生成，不随工作流保存），
+    // 并按「模式」重建显隐、移除被隐藏 widget 的空端口占位、同步存储位置
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (info) {
         const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
         this._h3Hint = null;
+        if (this._syncModeReal) this._syncModeReal();
+        yuanRemoveHiddenWidgetPorts(this, ["存储位置", "手动上传"]);
+        yuanH3SyncStorageFromTrim(this);
+        return r;
+    };
+
+    // 输入端口连接/断开时（尤其「上下文潜空间」在端口模式下的连线）重建显隐
+    const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function (type, slot, connected, link_info, input_or_output) {
+        const r = onConnectionsChange ? onConnectionsChange.apply(this, arguments) : undefined;
+        if (!this._syncing && this._syncModeReal && type === 1) this._syncModeReal();
+        return r;
+    };
+
+    // 模式切换：按「上传/端口/自动索引」重建端口与按钮显隐；存储位置/手动上传始终隐藏
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+        const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+        if (this._yuanH3MotionBuilt) return r;
+        this._yuanH3MotionBuilt = true;
+        const self = this;
+
+        const storageWidget = this.widgets && this.widgets.find((w) => w.name === "存储位置");
+        const manualWidget = this.widgets && this.widgets.find((w) => w.name === "手动上传");
+        const seqWidget = this.widgets && this.widgets.find((w) => w.name === "片段序号");
+        const modeWidget = this.widgets && this.widgets.find((w) => w.name === "模式");
+
+        // 「片段序号」serializeValue 兜底：归一化为合法整数，避免残留空串触发后端"输入值类型错误"
+        if (seqWidget) {
+            const seqNormalize = (v) => {
+                const n = parseInt(String(v == null ? "" : v).trim(), 10);
+                return isNaN(n) ? 1 : Math.max(0, Math.min(9999, n));
+            };
+            seqWidget.serializeValue = function (node, idx) {
+                return seqNormalize(this.value);
+            };
+        }
+
+        // 始终隐藏：存储位置（随裁剪同步）、手动上传（仅由按钮写入）
+        yuanHideWidget(storageWidget);
+        yuanHideWidget(manualWidget);
+        yuanRemoveHiddenWidgetPorts(this, ["存储位置", "手动上传"]);
+
+        // 上传按钮 input 须挂到 DOM 且不能用 display:none，否则部分浏览器会拦截 click() 弹框
+        const fileInput = document.createElement("input");
+        fileInput.type = "file";
+        fileInput.accept = ".safetensors";
+        Object.assign(fileInput.style, {
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            opacity: "0",
+            overflow: "hidden",
+            pointerEvents: "none",
+            zIndex: "-1",
+        });
+        document.body.appendChild(fileInput);
+        fileInput.addEventListener("change", async () => {
+            const file = fileInput.files && fileInput.files[0];
+            if (!file) return;
+            btn.name = "上传中…";
+            try {
+                const resp = await yuanH3LatentUploadFile(file, (done, total) => {
+                    btn.name = `上传潜空间 ${done}/${total}`;
+                });
+                if (!resp || !resp.name) {
+                    throw new Error((resp && resp.error) || "上传失败：服务器未返回文件名");
+                }
+                if (manualWidget) manualWidget.value = resp.name;
+                // 上传的是上一片段潜空间：音频上下文置 0 防上一片段声音污染本片段
+                const audioCtxWidget = self.widgets &&
+                    self.widgets.find((w) => w.name === "音频上下文长度");
+                if (audioCtxWidget && String(audioCtxWidget.value) !== "0") {
+                    audioCtxWidget.value = "0";
+                    if (typeof audioCtxWidget.callback === "function") {
+                        try { audioCtxWidget.callback(); } catch (_) {}
+                    }
+                }
+                self._yuanH3Uploaded = true;
+                btn.name = "上传完毕";
+                self.setDirtyCanvas(true, true);
+            } catch (err) {
+                btn.name = "上传失败";
+            } finally {
+                // 只有未成功上传时才把按钮复位；成功上传后保持「上传完毕」
+                if (!self._yuanH3Uploaded) {
+                    setTimeout(() => { btn.name = "上传潜空间"; }, 2000);
+                }
+            }
+        });
+        // 按钮触发：仅 widget 回调（与 Yuan_Video 的成熟按钮一致，回调可靠）
+        const btnClicked = () => {
+            fileInput.value = ""; // 允许重复选择同一文件时仍触发 change
+            fileInput.click();
+        };
+        const btn = this.addWidget("button", "上传潜空间", null, btnClicked);
+        // 防抖：V3 下 widget 回调 + 按钮 DOM 可能同时收到点击，去重防双弹框。
+        // 但只有真正从回调里 click()，才是用户手势链内的调用，浏览器才放行弹框。
+        let _btnLastClickMs = 0;
+        const btnSafeClicked = () => {
+            const now = Date.now();
+            if (now - _btnLastClickMs < 500) return; // 双触发，防重复弹框
+            _btnLastClickMs = now;
+            btnClicked();
+        };
+        const origBtnCallback = btn.callback;
+        btn.callback = btnSafeClicked;
+        // 补充原生 DOM 监听（仅当 widget 回调确实不触发时才需要）
+        (function bindBtnDom() {
+            if (btn.element && !btn._domClickBound) {
+                try {
+                    btn.element.addEventListener("click", btnSafeClicked);
+                    btn._domClickBound = true;
+                    return;
+                } catch (_) {}
+            }
+            if (!btn._domClickBound) setTimeout(bindBtnDom, 100);
+        })();
+        this._yuanH3UploadBtn = btn;
+
+        // 模式显隐核心：按「模式」widget 值重建端口/按钮/参数可见性
+        const syncModeReal = () => {
+            if (self._syncing) return;
+            self._syncing = true;
+            try {
+                const mode = modeWidget ? modeWidget.value : "自动索引";
+                self._lastModeValue = mode;
+                const isUpload = mode === "上传";
+                const isPort = mode === "端口";
+                const isAuto = mode === "自动索引";
+
+                // 1) 上下文潜空间 端口显隐（离开时保存连接，返回时恢复）
+                if (isPort) {
+                    if (!(self.inputs && self.inputs.find((i) => i.name === PORT_NAME))) {
+                        yuanEnsureInput(self, PORT_NAME, "LATENT", {
+                            shape: 7, optional: true, label: "上下文潜空间",
+                        });
+                        const saved = self._yuanH3SavedPortLink;
+                        self._yuanH3SavedPortLink = null;
+                        if (saved && app && app.graph && typeof app.graph.getNodeById === "function") {
+                            const inp = self.inputs.find((i) => i.name === PORT_NAME);
+                            const origin = app.graph.getNodeById(saved.origin_id);
+                            const ts = self.inputs.indexOf(inp);
+                            if (origin) { try { origin.connect(saved.origin_slot, self, ts); } catch (_) {} }
+                        }
+                    }
+                } else {
+                    const inp = self.inputs && self.inputs.find((i) => i.name === PORT_NAME);
+                    if (inp && inp.link != null) {
+                        const l = yuanH3LinkObj(app.graph, inp.link);
+                        if (l) self._yuanH3SavedPortLink = { origin_id: l[1], origin_slot: l[2] };
+                    }
+                    if (inp) {
+                        const idx = self.inputs.findIndex((i) => i.name === PORT_NAME);
+                        if (idx !== -1) self.removeInput(idx);
+                    }
+                }
+
+                // 2) 片段序号 port+widget 显隐：仅自动索引显示。
+                // 上传/端口模式下它完全无关（上传模式用手动文件、端口模式用
+                // 端口潜空间），即使有连线也整端口移除，切回自动索引时恢复连接
+                // （与「上下文潜空间」端口的保存/恢复逻辑一致）。
+                if (isAuto) {
+                    if (!(self.inputs && self.inputs.find((i) => i.name === SEQ_NAME))) {
+                        yuanEnsureInput(self, SEQ_NAME, "INT",
+                            { default: 1, min: 0, max: 9999 }, SEQ_NAME);
+                        const saved = self._yuanH3SavedSeqLink;
+                        self._yuanH3SavedSeqLink = null;
+                        if (saved && app && app.graph && typeof app.graph.getNodeById === "function") {
+                            const inp = self.inputs.find((i) => i.name === SEQ_NAME);
+                            const ts = self.inputs.indexOf(inp);
+                            const origin = app.graph.getNodeById(saved.origin_id);
+                            if (origin) { try { origin.connect(saved.origin_slot, self, ts); } catch (_) {} }
+                        }
+                    }
+                    if (seqWidget) seqWidget.hidden = false;
+                } else {
+                    // 端口移除前先把 widget 值归一化为合法整数：端口被移除后，
+                    // 该参数由 widget 值参与 ComfyUI 类型校验，其残留的空串/
+                    // 无效值会报"输入值类型错误"。上传/端口模式下后端完全忽略
+                    // 此参数，归一化无任何副作用。
+                    if (seqWidget) {
+                        const n = parseInt(String(seqWidget.value).trim(), 10);
+                        seqWidget.value = isNaN(n) ? 1 : Math.max(0, Math.min(9999, n));
+                    }
+                    const inp = self.inputs && self.inputs.find((i) => i.name === SEQ_NAME);
+                    if (inp && inp.link != null) {
+                        const l = yuanH3LinkObj(app.graph, inp.link);
+                        if (l) self._yuanH3SavedSeqLink = { origin_id: l[1], origin_slot: l[2] };
+                    }
+                    if (inp) {
+                        const idx = self.inputs.findIndex((i) => i.name === SEQ_NAME);
+                        if (idx !== -1) self.removeInput(idx);
+                    }
+                    if (seqWidget) seqWidget.hidden = true;
+                }
+
+                // 3) 上传潜空间 按钮显隐：仅上传模式显示
+                // 按钮隐藏须用 hidden+disabled（type="hidden"+computeSize 会在恢复后丢点击绑定）
+                if (btn) {
+                    btn.hidden = !isUpload;
+                    btn.disabled = !isUpload;
+                }
+
+                // 4) 离开上传模式：清除手动上传值，重置按钮文本（覆盖/清除之前的 latent）
+                if (!isUpload) {
+                    self._yuanH3Uploaded = false;
+                    if (manualWidget && manualWidget.value) manualWidget.value = "";
+                    if (btn && btn.name && btn.name.indexOf("上传潜空间") === -1 && btn.name.indexOf("上传") !== -1) {
+                        btn.name = "上传潜空间";
+                    }
+                }
+
+                // 5) 移除被隐藏 widget 的空端口占位（V3）
+                yuanRemoveHiddenWidgetPorts(self, ["存储位置", "手动上传"]);
+
+                // 6) 保持当前宽度不变，只更新高度
+                const curW = self.size ? self.size[0] : self.computeSize()[0];
+                self.setSize([curW, self.computeSize()[1]]);
+                if (app && app.graph) app.graph.setDirtyCanvas(true, true);
+            } finally {
+                self._syncing = false;
+            }
+        };
+        this._syncModeReal = syncModeReal;
+
+        // 初始按当前模式建立显隐；模式下拉 callback（V2）触发重建
+        if (modeWidget) {
+            syncModeReal();
+            const origCallback = modeWidget.callback;
+            modeWidget.callback = function () {
+                if (origCallback) origCallback.apply(this, arguments);
+                syncModeReal();
+            };
+        }
+
+        // 初始同步一次「存储位置」（可能「裁剪帧数」尚未连线，连线后由 onDrawForeground 持续推进）
+        yuanH3SyncStorageFromTrim(this);
+        // 工作流加载时链路可能尚未建立（Trim 节点后配置），延迟重试几次确保
+        // 「存储位置」从裁剪节点同步到位，避免因参数错位导致的"未找到片段 N 文件"
+        if (!self._yuanH3SyncRetried) {
+            self._yuanH3SyncRetried = true;
+            const retry = () => {
+                const stillAlive = self.widgets && self.widgets.length > 0 &&
+                    self.widgets.some((w) => w.name === "存储位置");
+                if (!stillAlive) return;
+                yuanH3SyncStorageFromTrim(self);
+            };
+            [200, 800, 2000].forEach((ms) => setTimeout(retry, ms));
+        }
         return r;
     };
 }
 
-// ==================== Yuan_H3MotionContextLoadLatent（H3 加载潜空间：手动上传按钮）====================
+// ==================== 潜空间手动上传（分块上传 .safetensors） ====================
 
 async function yuanH3LatentUploadFile(file, onProgress) {
     // 分块上传潜空间文件到后端 /yuan_h3_motion_upload_latent
@@ -578,46 +916,6 @@ async function yuanH3LatentUploadFile(file, onProgress) {
         if (onProgress) onProgress(i + 1, totalChunks);
     }
     return lastResp;
-}
-
-function registerYuanH3MotionContextLoadLatent(nodeType) {
-    const onNodeCreated = nodeType.prototype.onNodeCreated;
-    nodeType.prototype.onNodeCreated = function () {
-        const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-        const self = this;
-        const manualWidget = this.widgets && this.widgets.find((w) => w.name === "手动上传");
-        if (!manualWidget || this._yuanLatentUploadBtn) return r;
-        const btn = this.addWidget("button", "上传潜空间", null, () => {
-            const input = document.createElement("input");
-            input.type = "file";
-            input.accept = ".safetensors";
-            input.onchange = async () => {
-                const file = input.files && input.files[0];
-                if (!file) return;
-                const origLabel = btn.name;
-                btn.name = "上传中…";
-                try {
-                    const resp = await yuanH3LatentUploadFile(file, (done, total) => {
-                        btn.name = `上传潜空间 ${done}/${total}`;
-                    });
-                    if (!resp || !resp.name) {
-                        throw new Error((resp && resp.error) || "上传失败：服务器未返回文件名");
-                    }
-                    manualWidget.value = resp.name;
-                    self.setDirtyCanvas(true, true);
-                    btn.name = "上传完成";
-                } catch (err) {
-                    console.error("[Yuan H3 加载潜空间] 上传失败:", err);
-                    btn.name = "上传失败";
-                } finally {
-                    setTimeout(() => { btn.name = origLabel; }, 2000);
-                }
-            };
-            input.click();
-        });
-        this._yuanLatentUploadBtn = btn;
-        return r;
-    };
 }
 
 app.registerExtension({
@@ -654,8 +952,6 @@ app.registerExtension({
             registerResizeTypeConditionalWidgets(nodeType);
         } else if (nodeData.name === "Yuan_H3MotionContext") {
             registerYuanH3MotionContext(nodeType);
-        } else if (nodeData.name === "Yuan_H3MotionContextLoadLatent") {
-            registerYuanH3MotionContextLoadLatent(nodeType);
         }
     },
 });

@@ -1,8 +1,4 @@
-// ============================================================================
-// Yuan CLIPTimeline 多轨道可视化时间轴编辑器
-// 单类 TimelineEditor + 单 canvas 多轨道 + CSS 注入
-// 节点类型：YuanCLIPTimeline
-// ============================================================================
+// Yuan CLIPTimeline 多轨道可视化时间轴编辑器（单类 TimelineEditor，节点类型 YuanCLIPTimeline）
 
 const { app } = window.comfyAPI.app;
 
@@ -348,9 +344,7 @@ function parseInitial(jsonStr, maxFrames) {
   return defaultTimeline(maxFrames);
 }
 
-// ============================================================================
 // TimelineEditor — 集中式多轨道时间轴编辑器
-// ============================================================================
 
 class TimelineEditor {
   constructor(node, container) {
@@ -3889,9 +3883,7 @@ class TimelineEditor {
   }
 }
 
-// ============================================================================
 // 扩展注册
-// ============================================================================
 
 app.registerExtension({
   name: "Yuan.Tool.CLIP timeline",
