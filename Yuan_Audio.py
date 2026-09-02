@@ -1,7 +1,8 @@
-"""Yuan 音频列表（加载/筛选音频）与 Yuan 音频分流（列表按索引分发到多端口）节点。"""
+"""Yuan 音频列表/分流/加载（播放器裁剪分段）节点。"""
 
 import json
 import os
+import re
 
 import av
 import torch
@@ -199,14 +200,173 @@ class YuanAudioSplit:
         )
 
 
+def _parse_durations(text) -> list:
+    """解析"分段时长"文本：支持逗号(中英文)/顿号/分号/空白分隔，如 "6,3,5"。"""
+    if text is None:
+        return []
+    parts = re.split(r"[,，、;；\s]+", str(text).strip())
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            v = float(p)
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            out.append(v)
+    return out
+
+
+class YuanAudioLoad:
+    """Yuan 加载音频：内嵌播放器 + 时间轴裁剪 + 智能分段。"""
+
+    CATEGORY = _CATEGORY
+    DESCRIPTION = (
+        "加载音频：内置音频预览、时间轴裁剪与播放控制。\n"
+        "自定义裁切：用开始/结束时间(或拖动时间轴手柄)截取一段。\n"
+        "智能分段：按'分段时长'列表(逗号分隔，如 6,3,5)把 [开始时间, 结束时间] "
+        "窗口切分成若干分段，用小方格显示在时间轴上，配合'分段索引'选择输出的分段。"
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        try:
+            files = folder_paths.get_filename_list("audio")
+        except Exception:
+            files = []
+
+        if not files:
+            input_dir = folder_paths.get_input_directory()
+            if os.path.exists(input_dir):
+                try:
+                    files = sorted(folder_paths.filter_files_content_types(
+                        [f for f in os.listdir(input_dir)
+                         if os.path.isfile(os.path.join(input_dir, f))],
+                        ["audio", "video"],
+                    ))
+                except Exception:
+                    files = [
+                        f for f in os.listdir(input_dir)
+                        if os.path.isfile(os.path.join(input_dir, f))
+                        and os.path.splitext(f)[1].lower() in _AUDIO_EXTS
+                    ]
+
+        if not files:
+            files = ["none"]
+
+        return {
+            "required": {
+                "音频": (files, {"audio_upload": True}),
+                "开始时间": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
+                "结束时间": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
+                "时长": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
+                "输出模式": (["自定义裁切", "智能分段"], {"default": "自定义裁切"}),
+                "分段时长": ("STRING", {
+                    "default": "",
+                    "tooltip": "智能分段下每段的时长(秒)，用逗号分隔；例如 6,3,5 表示第1段6秒、第2段3秒、第3段5秒。留空时整个窗口作为 1 段。",
+                }),
+                "分段索引": ("INT", {
+                    "default": 0, "min": 0, "max": 1000000, "step": 1,
+                    "tooltip": "智能分段模式下，选择要输出的分段（第 1 段为 0）。",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "FLOAT", "INT")
+    RETURN_NAMES = ("音频", "时长", "分段总数")
+    OUTPUT_TOOLTIPS = ("裁剪/分段后的音频。", "输出音频的时长（秒）。", "智能分段模式下的分段总数（自定义裁切恒为 1）。")
+    FUNCTION = "execute"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        # 直接放行，避免文件不在下拉列表时 ComfyUI 报 "Value not in list"
+        return True
+
+    def execute(self, 音频, 开始时间, 结束时间, 时长, 输出模式="自定义裁切", 分段时长="6,3,5", 分段索引=0):
+        try:
+            audio_path = folder_paths.get_annotated_filepath(音频) if 音频 != "none" else ""
+        except Exception:
+            audio_path = ""
+
+        # 文件缺失或解码失败时回退为 1 秒静音，避免工作流崩溃
+        if 音频 == "none" or not audio_path or not os.path.exists(audio_path):
+            sample_rate = 44100
+            waveform = torch.zeros((2, 44100))
+        else:
+            try:
+                waveform, sample_rate = _load_audio_file(audio_path)
+            except Exception:
+                sample_rate = 44100
+                waveform = torch.zeros((2, 44100))
+
+        file_duration = waveform.shape[1] / sample_rate
+
+        # 有效裁切窗口 [win_start, win_end]（秒）
+        win_start = min(max(0.0, float(开始时间 or 0)), file_duration)
+        if 结束时间 and float(结束时间) > win_start:
+            win_end = min(float(结束时间), file_duration)
+        else:
+            win_end = file_duration  # 0 表示文件末尾
+        win_start = min(win_start, win_end)
+
+        if 输出模式 == "智能分段":
+            # 在窗口内按"分段时长"列表切分
+            durations = _parse_durations(分段时长)
+            bounds = []
+            cur = win_start
+            for d in durations:
+                if cur >= win_end - 1e-6:
+                    break
+                cur = min(cur + d, win_end)
+                bounds.append(cur)
+            if not bounds:
+                bounds = [win_end]  # 无有效时长输入 -> 整个窗口视为 1 段
+
+            seg_count = len(bounds)
+            sel_idx = max(0, min(int(分段索引 or 0), seg_count - 1))
+            seg_start = win_start if sel_idx == 0 else bounds[sel_idx - 1]
+            seg_end = bounds[sel_idx]
+        else:
+            # 自定义裁切：直接输出 [win_start, win_end]
+            seg_count = 1
+            seg_start = win_start
+            seg_end = win_end
+
+        # 秒 -> 采样帧并裁剪
+        start_frame = int(seg_start * sample_rate)
+        end_frame = int(seg_end * sample_rate)
+        start_frame = min(start_frame, waveform.shape[1])
+        end_frame = min(end_frame, waveform.shape[1])
+        start_frame = min(start_frame, end_frame)
+
+        trimmed_waveform = waveform[:, start_frame:end_frame]
+
+        # 裁剪结果为空时补 1 个采样点，避免下游收到空张量
+        if trimmed_waveform.shape[1] == 0:
+            trimmed_waveform = torch.zeros((waveform.shape[0], 1))
+
+        # ComfyUI 标准 AUDIO 类型: [batch, 声道, 时间]
+        audio_output = {
+            "waveform": trimmed_waveform.unsqueeze(0),
+            "sample_rate": sample_rate,
+        }
+
+        final_duration = float(trimmed_waveform.shape[1] / sample_rate)
+
+        return (audio_output, final_duration, seg_count)
+
+
 NODE_CLASS_MAPPINGS = {
     "YuanAudioList": YuanAudioList,
     "YuanAudioSplit": YuanAudioSplit,
+    "YuanAudioLoad": YuanAudioLoad,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "YuanAudioList": "Yuan 音频列表",
     "YuanAudioSplit": "Yuan 音频分流",
+    "YuanAudioLoad": "Yuan 加载音频",
 }
 
 

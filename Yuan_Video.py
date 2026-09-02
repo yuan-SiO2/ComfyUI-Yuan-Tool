@@ -1,4 +1,4 @@
-"""Yuan 加载视频 UI 节点：内置预览、时间轴裁剪、镜头智能分段与裁剪框交互。"""
+"""Yuan 加载视频节点：内置预览、时间轴裁剪、镜头智能分段与裁剪框交互。"""
 
 import os
 import gc
@@ -437,7 +437,7 @@ def _build_segment_bounds(video_path, actual_start_time, actual_end_time, out_fp
 
 class YuanVideoUI:
     DESCRIPTION = (
-        "加载视频 UI：内置视频预览与时间轴裁剪工具。支持从 input 目录或本地路径加载视频，"
+        "Yuan 加载视频：内置视频预览与时间轴裁剪工具。支持从 input 目录或本地路径加载视频，"
         "按时间/帧两种显示模式裁剪起止范围，可选按镜头智能分段输出指定分段；"
         "输出提取到的图像序列、音频、帧数与分段总数。"
     )
@@ -847,6 +847,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Yuan_VideoUI": "加载视频 UI",
+    "Yuan_VideoUI": "Yuan 加载视频",
 }
 

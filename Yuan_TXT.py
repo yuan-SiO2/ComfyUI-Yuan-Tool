@@ -1494,6 +1494,77 @@ class YUAN_TXTLength:
         return (len(plain),)
 
 
+class YUAN_TXTShotDurations:
+    """分段时间提取：从分镜策划 JSON 的「分镜情节」中按编号顺序提取各分镜时长。"""
+
+    @staticmethod
+    def _fmt_seconds(v):
+        """时长格式化：整数值去小数点（10 而非 10.0），小数保留原值。"""
+        if v is None:
+            return "0"
+        if float(v).is_integer():
+            return str(int(v))
+        return str(float(v))
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "json": (AnyType("*"), {
+                    "forceInput": True,
+                    "tooltip": "JSON 数据输入（分镜策划五档案），支持 JSON 字符串或对象；字符串可为多个 JSON 对象拼接，自动逐段解析合并。"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "FLOAT", "INT", "FLOAT")
+    RETURN_NAMES = ("时长列表", "时长序列", "分镜数量", "总时长")
+    OUTPUT_TOOLTIPS = (
+        "按编号 1-N 顺序提取的各分镜时长，逗号分隔（如 10,9,7,5,9,7），可直接接入「Yuan 加载音频」的分段时长。",
+        "各分镜时长逐个输出（列表端口，按编号顺序）。",
+        "分镜情节中的分镜条目数量。",
+        "所有分镜时长之和（秒）。",
+    )
+    OUTPUT_IS_LIST = (False, True, False, False)
+    FUNCTION = "extract_durations"
+    CATEGORY = "Yuan Tool/文本"
+    DESCRIPTION = (
+        "从分镜策划 JSON 的「分镜情节」中按编号顺序（1-N）提取各分镜时长："
+        "时长取自每个分镜「类型」字段中的第一个数字（如 MV：10秒 → 10、文戏：8s → 8），单位 s/秒/无单位均可。"
+        "时长列表端口输出逗号分隔字符串（可直接接入 Yuan 加载音频的分段时长）；"
+        "时长序列端口按列表逐个输出；无有效分镜时输出空列表文本与 0。"
+    )
+
+    def extract_durations(self, json=None):
+        data = json
+        if isinstance(data, str):
+            data = YUAN_TXTJsonExtractor._parse_json_text(data)
+        if not isinstance(data, dict):
+            data = {}
+
+        分镜情节数据 = data.get("分镜情节", [])
+        # 按编号排序（编号缺失/非法的排最后，保持出现顺序）
+        def _num(item):
+            try:
+                return int(item.get("编号"))
+            except Exception:
+                return float("inf")
+        entries = [it for it in 分镜情节数据 if isinstance(it, dict)] if isinstance(分镜情节数据, list) else []
+        entries.sort(key=_num)
+
+        durations = []
+        for item in entries:
+            dur = YUAN_TXTJsonExtractor._type_duration_seconds(item.get("类型", ""))
+            # 类型字段无数字时按 0 计，保持与分镜数量对齐
+            durations.append(dur if dur is not None else 0.0)
+
+        时长列表 = ",".join(self._fmt_seconds(d) for d in durations)
+        总时长 = float(sum(durations))
+        # OUTPUT_IS_LIST=True 必须返回长度 ≥1 的列表，否则空列表会中断下游执行；空时兜底 [0.0]
+        时长序列 = durations if durations else [0.0]
+        return (时长列表, 时长序列, len(entries), 总时长)
+
+
 NODE_CLASS_MAPPINGS = {
     "YUAN_TXTJsonExtractor": YUAN_TXTJsonExtractor,
     "YUAN_TXTAppearanceOrder": YUAN_TXTAppearanceOrder,
@@ -1503,6 +1574,7 @@ NODE_CLASS_MAPPINGS = {
     "YUAN_TXTShotReplace": YUAN_TXTShotReplace,
     "YUAN_TXTParagraphSplitter": YUAN_TXTParagraphSplitter,
     "YUAN_TXTLength": YUAN_TXTLength,
+    "YUAN_TXTShotDurations": YUAN_TXTShotDurations,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1514,4 +1586,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "YUAN_TXTShotReplace": "分镜角色替换",
     "YUAN_TXTParagraphSplitter": "文本处理",
     "YUAN_TXTLength": "长度",
+    "YUAN_TXTShotDurations": "分段时间提取",
 }
