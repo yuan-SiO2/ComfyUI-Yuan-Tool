@@ -9,6 +9,8 @@ import torch
 
 import folder_paths
 
+from .Yuan_common import list_input_files
+
 _CATEGORY = "Yuan Tool/音频"
 
 # 支持的音频/视频扩展名（视频提取音轨），与前端过滤一致
@@ -237,20 +239,7 @@ class YuanAudioLoad:
             files = []
 
         if not files:
-            input_dir = folder_paths.get_input_directory()
-            if os.path.exists(input_dir):
-                try:
-                    files = sorted(folder_paths.filter_files_content_types(
-                        [f for f in os.listdir(input_dir)
-                         if os.path.isfile(os.path.join(input_dir, f))],
-                        ["audio", "video"],
-                    ))
-                except Exception:
-                    files = [
-                        f for f in os.listdir(input_dir)
-                        if os.path.isfile(os.path.join(input_dir, f))
-                        and os.path.splitext(f)[1].lower() in _AUDIO_EXTS
-                    ]
+            files = list_input_files(["audio", "video"], _AUDIO_EXTS)
 
         if not files:
             files = ["none"]
@@ -377,19 +366,8 @@ try:
 
     @PromptServer.instance.routes.get("/yuan_tool/audio_files")
     async def _list_audio_files(request):
-        input_dir = folder_paths.get_input_directory()
-        os.makedirs(input_dir, exist_ok=True)
-        entries = os.listdir(input_dir)
-        try:
-            files = folder_paths.filter_files_content_types(entries, ["audio", "video"])
-        except Exception:
-            # filter_files_content_types 不可用时按扩展名兜底
-            files = [
-                f for f in entries
-                if os.path.isfile(os.path.join(input_dir, f))
-                and os.path.splitext(f)[1].lower() in _AUDIO_EXTS
-            ]
-        return web.json_response({"files": sorted(files)})
+        files = list_input_files(["audio", "video"], _AUDIO_EXTS)
+        return web.json_response({"files": files})
 except Exception:
     # 独立测试环境（无 ComfyUI 服务端）下跳过路由注册
     pass

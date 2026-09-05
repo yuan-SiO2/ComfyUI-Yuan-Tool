@@ -29,6 +29,8 @@ import folder_paths
 from server import PromptServer
 from aiohttp import web
 
+from .Yuan_common import handle_chunk_upload
+
 # 自定义 socket 类型 — 用字符串定义以保证所有 ComfyUI 版本兼容
 GuideData = "YUAN_CLIP_GUIDE_DATA"
 MotionGuideData = "YUAN_CLIP_MOTION_GUIDE_DATA"
@@ -128,43 +130,27 @@ async def _yuan_clip_timeline_check_file(request):
     return web.json_response({"exists": False})
 
 
-def _read_and_write_file_chunk(file, file_path, mode):
-    chunk_bytes = file.file.read()
-    with open(file_path, mode) as f:
-        f.write(chunk_bytes)
-
-
 @PromptServer.instance.routes.post("/yuan_clip_timeline_upload_chunk")
 async def _yuan_clip_timeline_upload_chunk(request):
-    post = await request.post()
-    file = post.get("file")
-    filename = post.get("filename")
-    chunk_index = int(post.get("chunk_index"))
-    total_chunks = int(post.get("total_chunks"))
-
     upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
-    os.makedirs(upload_dir, exist_ok=True)
-    filename = os.path.basename(filename)
-    file_path = os.path.join(upload_dir, filename)
-    if not os.path.realpath(file_path).startswith(os.path.realpath(upload_dir)):
-        return web.json_response({"error": "无效的文件名"}, status=400)
 
-    mode = "ab" if chunk_index > 0 else "wb"
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _read_and_write_file_chunk, file, file_path, mode)
+    def _validate(file_path):
+        if not os.path.realpath(file_path).startswith(os.path.realpath(upload_dir)):
+            return web.json_response({"error": "无效的文件名"}, status=400)
+        return None
 
-    if chunk_index == total_chunks - 1:
-        audio_file, peaks = None, None
-        try:
-            audio_file, peaks = await loop.run_in_executor(None, _extract_audio_from_video, file_path)
-        except Exception:
-            pass
-        return web.json_response({
-            "name": f"{_TIMELINE_UPLOAD_SUBDIR}/{filename}",
-            "audio_file": audio_file,
-            "peaks": peaks,
-        })
-    return web.json_response({"status": "ok"})
+    async def _on_complete(file_path):
+        loop = asyncio.get_event_loop()
+        audio_file, peaks = await loop.run_in_executor(None, _extract_audio_from_video, file_path)
+        return {"audio_file": audio_file, "peaks": peaks}
+
+    return await handle_chunk_upload(
+        request, upload_dir,
+        normalize_name=os.path.basename,
+        validate=_validate,
+        response_name=lambda s: f"{_TIMELINE_UPLOAD_SUBDIR}/{s}",
+        on_complete=_on_complete,
+    )
 
 
 # ==============================================================================

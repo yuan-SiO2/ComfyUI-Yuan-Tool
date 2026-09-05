@@ -3,7 +3,6 @@
 布局/载荷两补丁带 ABI 标记门控、先自测再安装，失败则拒绝运行。
 """
 
-import asyncio
 import hashlib
 import math
 import os
@@ -15,6 +14,8 @@ import torch
 
 from server import PromptServer
 from aiohttp import web
+
+from .Yuan_common import handle_chunk_upload
 
 from comfy.nested_tensor import NestedTensor
 import comfy.ldm.minimax.model as mm
@@ -920,14 +921,15 @@ class Yuan_H3MotionContext:
                                "排查衔接问题。开启时上下文长度/音频上下文"
                                "长度等参数才生效（输出 \"1:较大值\"）。"}),
                 "上下文长度": (["17", "34", "51", "68"], {
-                    "default": "17",
+                    "default": "34",
                     "tooltip": "从前一片段延续的画面帧数。每 17 帧是 H3 潜空间"
                                "的一整个 VRF 组（5 个潜空间步），只有整组长度"
                                "才能从尾部切片、又被「运动裁剪」整组切回，"
                                "衔接处像素与时间完全对齐；非整组长度会在裁剪后"
                                "打乱剩余潜空间的时序相位，导致画面闪烁。"
                                "17 帧仅勉强流畅，34 帧近乎无缝。更长的窗口"
-                               "固定更多运动，但会从交付片段的头部扣除。"}),
+                               "固定更多运动、锚点更密、桥接力更强，但会从交付"
+                               "片段的头部扣除更多长度。"}),
                 "音频上下文长度": (["0", "17", "34", "51", "68"], {
                     "default": "17",
                     "tooltip": "从上下文潜空间取尾部声音的帧数，独立于画面"
@@ -941,6 +943,15 @@ class Yuan_H3MotionContext:
                                "交付部分生成不受上一片段声音污染的全新音频；"
                                "未连接音频 VAE 时不安装音频引用，模型自由"
                                "生成（固定的画面可能带出上一片段的声音）。"}),
+                "衔接余量": (["0", "17", "34"], {
+                    "default": "17",
+                    "tooltip": '在锚定窗口之外、可见剪辑起点之前多留一段整组'
+                               '长度的「自由沉降区」：模型在这段里不再被强制对齐'
+                               '上片段尾帧，可平滑过渡到全新内容；这段随「运动'
+                               '裁剪」整组移除，不再出现在交付剪辑里。设 0 时'
+                               '可见段紧贴锚定窗（旧行为，贴边可能偏僵硬/抖动）。'
+                               '针对链式生成的「紧贴边界劣化」，不改变潜空间内容、'
+                               '只多裁不删尾，无法解决高频逐链衰减。'}),
             },
             "optional": {
                 "上下文潜空间": ("LATENT", {
@@ -980,14 +991,16 @@ class Yuan_H3MotionContext:
                    "\"状态:长度\"（如 1:34），供「运动裁剪」节点解析。")
 
     def apply(self, 条件化, 潜空间, 启用上下文=True, 模式="自动索引",
-              存储位置="H3-Mubu", 片段序号=1, 手动上传="", 上下文长度="17",
-              音频上下文长度="17", audio_vae=None, 上下文潜空间=None):
+              存储位置="H3-Mubu", 片段序号=1, 手动上传="", 上下文长度="34",
+              音频上下文长度="17", 衔接余量="17", audio_vae=None, 上下文潜空间=None):
         # 「上下文长度」与「音频上下文长度」都只针对上下文潜空间输入端口：
         # 前者取其尾部画面，后者取其尾部声音。两者都只固定到本片段头部、
         # 由「运动裁剪」整组移除，交付部分的画面与音频由模型全新生成。
         # 裁剪帧数输出为字符串"状态:长度"：状态 1=启用上下文（长度为画面/
         # 音频两固定窗口较大值并吸附整组），0=未启用或无上下文（裁 0 帧，
         # 但「运动裁剪」的尾段保存仍按 17 帧执行，供下一片段衔接）。
+        # 「衔接余量」：额外多的整组长度，使可见剪起点比锚定窗更靠后，
+        # 在锚定窗与可见段之间留下一段自由生成、随裁剪移除的沉降区。
         # 总开关关闭：条件化直通、不打包任何上下文、输出 "0:17"，
         # 等效于本片段完全独立生成
         if not 启用上下文:
@@ -1060,18 +1073,27 @@ class Yuan_H3MotionContext:
         run = next(g for g in VIDEO_RUN_GRID if g <= n)
         n = run
 
-        # 裁剪量取画面/音频两固定窗口的较大值并吸附整组：音频窗口可比
-        # 画面窗口长（如 17/68），只裁画面窗口会让固定音频泄漏进交付
-        # 部分；按较大值整段裁掉，两流共用同一时间切点，不做分离差异
+        # 衔接余量：在锚定窗之外、可见剪起点之前多留一段整组长度的沉降区，
+        # 让模型不被强制对齐上片段尾帧、平滑过渡到全新内容。
+        margin = int(衔接余量 or 0)
+
+        # 裁剪量取画面/音频两固定窗口与锚定窗+衔接余量 的较大值并吸附整组：
+        # 音频窗口可比画面窗口长（如 17/68），只裁画面窗口会让固定音频泄漏
+        # 进交付部分；按较大值整段裁掉，两流共用同一时间切点，不做分离差异
         # 裁切后合并
         trim_frames = next(
-            g for g in VIDEO_RUN_GRID if g <= max(n, 音频上下文长度))
+            g for g in VIDEO_RUN_GRID if g <= max(n, 音频上下文长度, n + margin))
 
         if n >= frame_count:
             raise ValueError(
                 "h3_motion_context: asked to pin %d frames into a %d frame clip. "
                 "The pinned run must be a small fraction of the timeline."
                 % (n, frame_count))
+        if trim_frames >= frame_count:
+            raise ValueError(
+                "h3_motion_context: 衔接余量使裁剪量 %d 帧达到/超过本片段总长 "
+                "%d 帧。请减小「衔接余量」或「上下文长度」。"
+                % (trim_frames, frame_count))
 
         if _steps_for_frames(n) is None:
             # 节点提供的窗口都是完整步数，到达这里说明网格变了
@@ -1529,40 +1551,31 @@ def _dir_fingerprint(prefix_path):
 _MANUAL_UPLOAD_SUBDIR = "h3_motion_latent"
 
 
-def _read_and_write_latent_chunk(file, file_path, mode):
-    chunk_bytes = file.file.read()
-    with open(file_path, mode) as f:
-        f.write(chunk_bytes)
-
-
 @PromptServer.instance.routes.post("/yuan_h3_motion_upload_latent")
 async def _yuan_h3_motion_upload_latent(request):
     """接收「H3 运动上下文」节点手动上传的潜空间文件（分块追加写入）。"""
-    post = await request.post()
-    file = post.get("file")
-    filename = post.get("filename")
-    chunk_index = int(post.get("chunk_index"))
-    total_chunks = int(post.get("total_chunks"))
+
+    def _normalize(name):
+        return os.path.basename(name)
+
+    def _validate(file_path):
+        upload_dir = os.path.join(folder_paths.get_input_directory(),
+                                  _MANUAL_UPLOAD_SUBDIR)
+        if not os.path.basename(file_path).lower().endswith(".safetensors"):
+            return web.json_response({"error": "仅支持 .safetensors 文件"}, status=400)
+        if not os.path.realpath(file_path).startswith(os.path.realpath(upload_dir)):
+            return web.json_response({"error": "无效的文件名"}, status=400)
+        return None
+
+    def _response_name(stored):
+        return "%s/%s" % (_MANUAL_UPLOAD_SUBDIR, stored)
 
     upload_dir = os.path.join(folder_paths.get_input_directory(),
                               _MANUAL_UPLOAD_SUBDIR)
-    os.makedirs(upload_dir, exist_ok=True)
-    filename = os.path.basename(filename)
-    if not filename.lower().endswith(".safetensors"):
-        return web.json_response({"error": "仅支持 .safetensors 文件"}, status=400)
-    file_path = os.path.join(upload_dir, filename)
-    if not os.path.realpath(file_path).startswith(os.path.realpath(upload_dir)):
-        return web.json_response({"error": "无效的文件名"}, status=400)
-
-    mode = "ab" if chunk_index > 0 else "wb"
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _read_and_write_latent_chunk,
-                               file, file_path, mode)
-
-    if chunk_index == total_chunks - 1:
-        return web.json_response(
-            {"name": "%s/%s" % (_MANUAL_UPLOAD_SUBDIR, filename)})
-    return web.json_response({"status": "ok"})
+    return await handle_chunk_upload(request, upload_dir,
+                                     normalize_name=_normalize,
+                                     validate=_validate,
+                                     response_name=_response_name)
 
 
 def _resolve_manual_latent_path(手动上传):

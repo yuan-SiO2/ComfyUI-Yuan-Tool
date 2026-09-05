@@ -3,7 +3,6 @@
 import os
 import gc
 import asyncio
-import json
 import math
 import threading
 import tempfile
@@ -14,6 +13,15 @@ import av
 from server import PromptServer
 from aiohttp import web
 import comfy.utils
+
+from .Yuan_common import (
+    handle_chunk_upload,
+    list_input_files,
+    load_json_cache,
+    resolve_media_path,
+    save_json_cache,
+    video_duration,
+)
 
 
 # 自定义 API 路由：从系统任意路径读取视频文件，供前端预览
@@ -46,35 +54,11 @@ async def yuan_check_file(request):
     return web.json_response({"exists": False})
 
 
-def _read_and_write_file_chunk(file, file_path, mode):
-    chunk_bytes = file.file.read()
-    with open(file_path, mode) as f:
-        f.write(chunk_bytes)
-
-
 # 自定义 API 路由：分块上传，绕过 413 Payload Too Large 错误
 @PromptServer.instance.routes.post("/yuan_tool/video_upload_chunk")
 async def yuan_upload_chunk(request):
-    post = await request.post()
-    file = post.get("file")
-    filename = post.get("filename")
-    chunk_index = int(post.get("chunk_index"))
-    total_chunks = int(post.get("total_chunks"))
-
     upload_dir = folder_paths.get_input_directory()
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, filename)
-
-    # 如果不是第一个分块则追加，否则新建文件
-    mode = "ab" if chunk_index > 0 else "wb"
-
-    # 将阻塞的磁盘读写操作放到线程池执行
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _read_and_write_file_chunk, file, file_path, mode)
-
-    if chunk_index == total_chunks - 1:
-        return web.json_response({"name": filename})
-    return web.json_response({"status": "ok"})
+    return await handle_chunk_upload(request, upload_dir)
 
 
 # 智能分段检测（供 /yuan_video_ui_detect_segments API 在线程池中调用）
@@ -82,15 +66,8 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
     """同步执行分段检测 + 缩略图提取，供 API 在线程池中运行，避免阻塞事件循环。"""
     import io, base64
     actual_start_time = max(0.0, start_time)
-    video_duration = 0.0
-    try:
-        with av.open(video_path) as c:
-            vs = c.streams.video[0] if len(c.streams.video) > 0 else None
-            if vs and vs.duration and vs.time_base:
-                video_duration = float(vs.duration * vs.time_base)
-    except Exception:
-        pass
-    actual_end_time = end_time if (end_time > 0 and end_time > actual_start_time) else video_duration
+    video_duration_sec = video_duration(video_path)
+    actual_end_time = end_time if (end_time > 0 and end_time > actual_start_time) else video_duration_sec
     if actual_end_time <= 0:
         actual_end_time = float('inf')
 
@@ -184,17 +161,9 @@ async def yuan_detect_segments(request):
         fps, start_time, end_time = 24.0, 0.0, 0.0
 
     # 与节点一致的路径解析
-    video_path = video
-    if not os.path.exists(video_path):
-        annotated = folder_paths.get_annotated_filepath(video)
-        if os.path.exists(annotated):
-            video_path = annotated
-        else:
-            candidate = os.path.join(folder_paths.get_input_directory(), video)
-            if os.path.exists(candidate):
-                video_path = candidate
-            else:
-                return web.json_response({"error": f"video not found: {video}"}, status=404)
+    video_path = resolve_media_path(video)
+    if not video_path:
+        return web.json_response({"error": f"video not found: {video}"}, status=404)
 
     # 完整结果磁盘缓存：同一视频 + 同一参数直接返回，不重新解码/提取缩略图
     only_cached = request.query.get("cached", "0") == "1"
@@ -287,38 +256,20 @@ def _segment_result_cache_path():
 
 
 def _load_disk_cache():
-    try:
-        with open(_segment_disk_cache_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return load_json_cache(_segment_disk_cache_path())
 
 
 def _save_disk_cache(cache):
-    try:
-        with open(_segment_disk_cache_path(), "w", encoding="utf-8") as f:
-            json.dump(cache, f)
-    except OSError:
-        pass
+    save_json_cache(_segment_disk_cache_path(), cache)
 
 
 def _load_result_cache():
     """完整分段结果缓存（含缩略图），键 = 视频+参数；命中后无需重新解码/提取缩略图。"""
-    try:
-        with open(_segment_result_cache_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return load_json_cache(_segment_result_cache_path())
 
 
 def _save_result_cache(cache):
-    try:
-        with open(_segment_result_cache_path(), "w", encoding="utf-8") as f:
-            json.dump(cache, f)
-    except OSError:
-        pass
+    save_json_cache(_segment_result_cache_path(), cache)
 
 
 def _get_scene_cuts(video_path):
@@ -367,13 +318,7 @@ def _build_segment_bounds(video_path, actual_start_time, actual_end_time, out_fp
     """与节点内一致的智能分段边界计算，返回 (segment_bounds, seg_count)。"""
     end = actual_end_time
     if end == float('inf'):
-        try:
-            with av.open(video_path) as c:
-                vs = c.streams.video[0] if len(c.streams.video) > 0 else None
-                if vs and vs.duration and vs.time_base:
-                    end = float(vs.duration * vs.time_base)
-        except Exception:
-            end = 0
+        end = video_duration(video_path)
     total_out = int(round((end - actual_start_time) * out_fps)) if end > actual_start_time else 0
     total_out = max(total_out, 1)
     if total_out <= 1:
@@ -444,15 +389,8 @@ class YuanVideoUI:
 
     @classmethod
     def INPUT_TYPES(cls):
-        input_dir = folder_paths.get_input_directory()
-        files = []
-        if os.path.exists(input_dir):
-            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
-            try:
-                files = sorted(folder_paths.filter_files_content_types(all_files, ["video"]))
-            except:
-                video_extensions = ('.mp4', '.webm', '.mkv', '.avi', '.mov', '.m4v', '.flv', '.wmv')
-                files = sorted([f for f in all_files if f.lower().endswith(video_extensions)])
+        video_extensions = ('.mp4', '.webm', '.mkv', '.avi', '.mov', '.m4v', '.flv', '.wmv')
+        files = list_input_files(["video"], video_extensions)
 
         if not files or len(files) == 0:
             files = ["无"]
@@ -495,17 +433,9 @@ class YuanVideoUI:
             return (empty_image, empty_audio, 0, 1)
 
         # 1. 优先尝试绝对路径，其次使用 ComfyUI 标准路径解析
-        video_path = 视频  # 先按绝对/精确路径处理
-        if not os.path.exists(video_path):
-            video_path_annotated = folder_paths.get_annotated_filepath(视频)
-            if os.path.exists(video_path_annotated):
-                video_path = video_path_annotated
-            else:
-                video_path_input = os.path.join(folder_paths.get_input_directory(), 视频)
-                if os.path.exists(video_path_input):
-                    video_path = video_path_input
-                else:
-                    raise FileNotFoundError(f"视频文件未找到: {视频}")
+        video_path = resolve_media_path(视频)
+        if not video_path:
+            raise FileNotFoundError(f"视频文件未找到: {视频}")
 
         # 打开容器以读取流和元数据
         container = av.open(video_path)

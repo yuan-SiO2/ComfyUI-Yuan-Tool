@@ -1565,6 +1565,56 @@ class YUAN_TXTShotDurations:
         return (时长列表, 时长序列, len(entries), 总时长)
 
 
+# ==== 预览内容（复刻自 Yuan-TV 的 ShowText|yuanTV） ====
+
+class YUAN_TXTPreviewContent:
+    """预览/编辑任意内容。
+    
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "文本": ("STRING", {"multiline": True, "default": ""}),
+                "显示模式": ("BOOLEAN", {"default": True, "label_on": "预览", "label_off": "编辑"}),
+            },
+            "optional": {
+                "输出内容": (AnyType("*"), {}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "main"
+    OUTPUT_NODE = True
+
+    CATEGORY = "Yuan Tool/文本"
+    SEARCH_ALIASES = ["预览", "显示", "编辑", "inspect", "debug", "show text"]
+    DESCRIPTION = "预览/编辑任意内容。显示模式=预览：只读展示上游内容；显示模式=编辑：以文本内容输出字符串。"
+
+    def main(self, 文本, 显示模式, 输出内容=None):
+        if 显示模式 and 输出内容 is not None:
+            value = self._serialize(输出内容)
+        else:
+            value = 文本
+
+        return {"ui": {"text": (value,)}, "result": (value,)}
+
+    def _serialize(self, source):
+        import torch
+
+        # 限制张量 str() 回退时的输出长度
+        torch.set_printoptions(edgeitems=6)
+        if isinstance(source, str):
+            return source
+        if isinstance(source, (int, float, bool)):
+            return str(source)
+        try:
+            return _json.dumps(source, indent=4, ensure_ascii=False)
+        except Exception:
+            return str(source)
+
+
 NODE_CLASS_MAPPINGS = {
     "YUAN_TXTJsonExtractor": YUAN_TXTJsonExtractor,
     "YUAN_TXTAppearanceOrder": YUAN_TXTAppearanceOrder,
@@ -1575,6 +1625,7 @@ NODE_CLASS_MAPPINGS = {
     "YUAN_TXTParagraphSplitter": YUAN_TXTParagraphSplitter,
     "YUAN_TXTLength": YUAN_TXTLength,
     "YUAN_TXTShotDurations": YUAN_TXTShotDurations,
+    "YUAN_TXTPreviewContent": YUAN_TXTPreviewContent,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1587,4 +1638,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "YUAN_TXTParagraphSplitter": "文本处理",
     "YUAN_TXTLength": "长度",
     "YUAN_TXTShotDurations": "分段时间提取",
+    "YUAN_TXTPreviewContent": "预览内容",
 }

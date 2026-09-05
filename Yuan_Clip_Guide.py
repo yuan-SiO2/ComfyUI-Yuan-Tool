@@ -23,6 +23,7 @@ except ImportError:
     _HAS_AV = False
 
 from .Yuan_CLIP_Timeline import GuideData, MotionGuideData, _resize_image
+from .Yuan_common import resolve_media_path
 
 # IC-LoRA 参数自定义类型 — 用字符串定义以保证所有 ComfyUI 版本兼容
 ICLoRAParameters = "IC_LORA_PARAMETERS"
@@ -264,18 +265,9 @@ class ResampleGuideFrames:
 
 def _resolve_input_video_path(video_file):
     """解析视频文件路径，支持绝对路径、相对路径和 annotated filepath。"""
-    if os.path.isabs(str(video_file)) and os.path.exists(str(video_file)):
-        return str(video_file)
-    input_dir = folder_paths.get_input_directory()
-    candidate = os.path.join(input_dir, str(video_file))
-    if os.path.exists(candidate):
-        return candidate
-    try:
-        annotated = folder_paths.get_annotated_filepath(str(video_file))
-        if annotated and os.path.exists(annotated):
-            return annotated
-    except Exception:
-        pass
+    path = resolve_media_path(str(video_file))
+    if path:
+        return path
     raise FileNotFoundError(f"找不到运动引导视频文件：{video_file}")
 
 
