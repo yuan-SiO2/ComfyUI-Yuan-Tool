@@ -1,22 +1,13 @@
 /**
  * Yuan Tool · 音频节点前端：音频列表（互斥播放/上传/选择/拖拽排序）+ 音频分流（按输出数量修剪端口）。
  */
+import { getApi, isAudioFileName } from "./Yuan_Common.js";
+
 (function () {
     "use strict";
 
     const { app } = window.comfyAPI.app;
 
-    /** 从 window.comfyAPI 获取 api 实例 */
-    function getApi() {
-        try {
-            const c = window.comfyAPI;
-            if (c && c.api) {
-                if (c.api.api && typeof c.api.api.apiURL === "function") return c.api.api;
-                if (typeof c.api.apiURL === "function") return c.api.api;
-            }
-        } catch (_) {}
-        return null;
-    }
     const api = getApi();
 
     // --- 尺寸常量 ---
@@ -32,11 +23,6 @@
         ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma",
         ".aiff", ".aif", ".mp4", ".m4v", ".webm", ".mov", ".avi", ".mkv",
     ];
-    function isAudioFileName(name) {
-        const dot = name.lastIndexOf(".");
-        if (dot < 0) return false;
-        return AUDIO_EXTS.indexOf(name.slice(dot).toLowerCase()) >= 0;
-    }
 
     // --- 工具函数 ---
     /** 构造 /api/view 播放地址，支持 "子目录/文件名" 形式 */

@@ -1,4 +1,5 @@
 // Yuan CLIPTimeline 多轨道可视化时间轴编辑器（单类 TimelineEditor，节点类型 YuanCLIPTimeline）
+import { uploadChunked } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 
@@ -3652,25 +3653,18 @@ class TimelineEditor {
       }
     } catch (_) {}
 
-    // 分片上传
-    const totalChunks = Math.max(1, Math.ceil(size / CHUNK_SIZE));
-    let lastResult = null;
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, size);
-      const chunk = file.slice(start, end);
-      const formData = new FormData();
-      formData.append("file", chunk, filename);
-      formData.append("filename", filename);
-      formData.append("chunk_index", i);
-      formData.append("total_chunks", totalChunks);
-      const res = await fetch("/yuan_clip_timeline_upload_chunk", { method: "POST", body: formData });
-      if (!res.ok) throw new Error(`Upload chunk ${i + 1}/${totalChunks} failed: ${res.status}`);
-      const data = await res.json();
-      if (onProgress) onProgress(i + 1, totalChunks);
-      lastResult = data;
-    }
-    return lastResult;
+    // 分片上传（分块大小/循环由 uploadChunked 统一处理）
+    const data = await uploadChunked(file, {
+      chunkSize: CHUNK_SIZE,
+      filename,
+      sendChunk: async (formData) => {
+        const res = await fetch("/yuan_clip_timeline_upload_chunk", { method: "POST", body: formData });
+        if (!res.ok) throw new Error(`Upload chunk failed: ${res.status}`);
+        return res.json();
+      },
+      onProgress,
+    });
+    return data;
   }
 
   async uploadImageForSegment(idx) {

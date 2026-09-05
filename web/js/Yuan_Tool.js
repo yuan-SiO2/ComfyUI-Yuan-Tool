@@ -1,4 +1,5 @@
 const { app } = window.comfyAPI.app;
+import { uploadChunked } from "./Yuan_Common.js";
 
 // ==================== YuanTool（多帧参考节点，list_mode 动态端口）====================
 function registerYuanTool(nodeType, portMeta) {
@@ -901,21 +902,16 @@ async function yuanH3LatentUploadFile(file, onProgress) {
     // 分块上传潜空间文件到后端 /yuan_h3_motion_upload_latent
     // （避免单次请求超出服务端 body 上限），最后一块的响应携带 {"name": "..."}
     const CHUNK_SIZE = 4 * 1024 * 1024;
-    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
-    let lastResp = null;
-    for (let i = 0; i < totalChunks; i++) {
-        const blob = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-        const formData = new FormData();
-        formData.append("file", blob);
-        formData.append("filename", file.name);
-        formData.append("chunk_index", String(i));
-        formData.append("total_chunks", String(totalChunks));
-        const res = await fetch("/yuan_h3_motion_upload_latent", { method: "POST", body: formData });
-        if (!res.ok) throw new Error(`chunk ${i + 1}/${totalChunks} failed: ${res.status}`);
-        if (i === totalChunks - 1) lastResp = await res.json();
-        if (onProgress) onProgress(i + 1, totalChunks);
-    }
-    return lastResp;
+    return uploadChunked(file, {
+        chunkSize: CHUNK_SIZE,
+        filename: file.name,
+        sendChunk: async (formData) => {
+            const res = await fetch("/yuan_h3_motion_upload_latent", { method: "POST", body: formData });
+            if (!res.ok) throw new Error(`chunk ${res.status} failed`);
+            return res.json();
+        },
+        onProgress,
+    });
 }
 
 app.registerExtension({

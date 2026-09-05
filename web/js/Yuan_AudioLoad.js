@@ -3,7 +3,7 @@
  * （复刻自 Yuan-TV「加载音频 UI」节点，适配本插件 V2/V3 双前端：
  *   V3 下移除隐藏参数的占位输入端口；Vue 控件不走原生 callback，用 onDrawForeground 轮询同步）。
  */
-import { getApi, findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput } from "./Yuan_Common.js";
+import { getApi, findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput, isAudioFileName, chainCallback, hideWidget, showWidget } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 
@@ -22,59 +22,6 @@ const AUDIO_EXTS = [
     ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma",
     ".aiff", ".aif", ".mp4", ".m4v", ".webm", ".mov", ".avi", ".mkv",
 ];
-function isAudioFileName(name) {
-    const dot = name.lastIndexOf(".");
-    if (dot < 0) return false;
-    return AUDIO_EXTS.indexOf(name.slice(dot).toLowerCase()) >= 0;
-}
-
-function chainCallback(object, property, callback) {
-    if (object == undefined) return;
-    if (property in object) {
-        const orig = object[property];
-        object[property] = function () {
-            const r = orig.apply(this, arguments);
-            callback.apply(this, arguments);
-            return r;
-        };
-    } else {
-        object[property] = callback;
-    }
-}
-
-function hideWidget(w) {
-    if (!w) return;
-    w.hidden = true;
-    if (!w.options) w.options = {};
-    w.options.hidden = true;
-    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
-        w.computeSize = () => [0, -4];
-        if (!w._hiddenDrawHooked) {
-            w._origDraw = w.hasOwnProperty("draw") ? w.draw : undefined;
-            w._hiddenDrawHooked = true;
-        }
-        w.draw = () => { };
-    }
-    if (w.element) w.element.style.display = "none";
-}
-
-function showWidget(w) {
-    if (!w) return;
-    w.hidden = false;
-    if (w.options) w.options.hidden = false;
-    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
-        delete w.computeSize;
-        if (w._hiddenDrawHooked) {
-            if (w._origDraw !== undefined) {
-                w.draw = w._origDraw;
-            } else {
-                delete w.draw;
-            }
-            delete w._hiddenDrawHooked;
-        }
-    }
-    if (w.element) w.element.style.display = "";
-}
 
 app.registerExtension({
     name: "Yuan-Tool.AudioLoad",

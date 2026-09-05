@@ -1,7 +1,7 @@
 /**
  * Yuan Tool · 图像点处理前端：为 Yuan_ImagePoint 提供内嵌画布（点/框标注、多帧切换、撤销重做清空）。
  */
-import { getApi, findComfyNodeEl, enforceV3MinSize } from "./Yuan_Common.js";
+import { getApi, findComfyNodeEl, enforceV3MinSize, chainCallback } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 
@@ -20,22 +20,6 @@ const makeUUID = _ =>{
   })
   return uuid
 }
-const chainCallback = (object, property, callback) => {
-  if (object == undefined) {
-    return;
-  }
-  if (property in object) {
-    const callback_orig = object[property]
-    object[property] = function () {
-      const r = callback_orig.apply(this, arguments);
-      callback.apply(this, arguments);
-      return r
-    };
-  } else {
-    object[property] = callback;
-  }
-}
-
 
 app.registerExtension({
     name: "Comfy.Yuan.ImagePoint",

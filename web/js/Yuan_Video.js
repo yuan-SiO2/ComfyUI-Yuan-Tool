@@ -1,5 +1,5 @@
 /** Yuan Tool · 加载视频前端：为 Yuan_VideoUI 节点提供视频预览、时间轴裁剪、镜头智能分段与裁剪框交互 UI。 */
-import { findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput } from "./Yuan_Common.js";
+import { findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput, getApi, hideWidget, showWidget, uploadChunked } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 
@@ -9,54 +9,7 @@ const MANAGED_PARAM_NAMES = [
     "显示模式", "裁剪X", "裁剪Y", "裁剪宽度", "裁剪高度", "输出模式", "分段索引",
 ];
 
-/** 从 window.comfyAPI 获取 api 实例 */
-function getApi() {
-    try {
-        const c = window.comfyAPI;
-        if (c && c.api) {
-            if (c.api.api && typeof c.api.api.apiURL === "function") return c.api.api;
-            if (typeof c.api.apiURL === "function") return c.api.api;
-        }
-    } catch (_) {}
-    return null;
-}
 const api = getApi();
-
-function hideWidget(w) {
-    if (!w) return;
-    w.hidden = true;
-    if (!w.options) w.options = {};
-    w.options.hidden = true;
-
-    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
-        w.computeSize = () => [0, -4];
-        if (!w._hiddenDrawHooked) {
-            w._origDraw = w.hasOwnProperty('draw') ? w.draw : undefined;
-            w._hiddenDrawHooked = true;
-        }
-        w.draw = () => { };
-    }
-    if (w.element) w.element.style.display = "none";
-}
-
-function showWidget(w) {
-    if (!w) return;
-    w.hidden = false;
-    if (w.options) w.options.hidden = false;
-
-    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
-        delete w.computeSize;
-        if (w._hiddenDrawHooked) {
-            if (w._origDraw !== undefined) {
-                w.draw = w._origDraw;
-            } else {
-                delete w.draw;
-            }
-            delete w._hiddenDrawHooked;
-        }
-    }
-    if (w.element) w.element.style.display = "";
-}
 
 app.registerExtension({
     name: "Comfy.YuanTool.VideoUI",
@@ -342,41 +295,32 @@ app.registerExtension({
                         const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks
 
                         if (file.size > CHUNK_SIZE) {
-                            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
                             const safeName = Date.now() + "_" + safeFileName;
-
-                            for (let i = 0; i < totalChunks; i++) {
-                                btnWidget.name = `上传中... ${Math.round((i / totalChunks) * 100)}%`;
-                                node.setDirtyCanvas(true, false);
-
-                                const chunk = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-
-                                const formData = new FormData();
-                                formData.append("file", chunk);
-                                formData.append("filename", safeName);
-                                formData.append("chunk_index", i);
-                                formData.append("total_chunks", totalChunks);
-
-                                const resp = await api.fetchApi("/yuan_tool/video_upload_chunk", {
-                                    method: "POST",
-                                    body: formData,
-                                });
-
-                                if (resp.status !== 200) {
-                                    throw new Error("Chunk upload failed");
-                                }
-
-                                if (i === totalChunks - 1) {
-                                    const data = await resp.json();
-                                    if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(data.name)) {
-                                        videoWidget.options.values.push(data.name);
+                            const data = await uploadChunked(file, {
+                                chunkSize: CHUNK_SIZE,
+                                filename: safeName,
+                                sendChunk: async (formData) => {
+                                    const resp = await api.fetchApi("/yuan_tool/video_upload_chunk", {
+                                        method: "POST",
+                                        body: formData,
+                                    });
+                                    if (resp.status !== 200) {
+                                        throw new Error("Chunk upload failed");
                                     }
-                                    videoWidget.value = data.name;
-                                    node._should_reset_trim = true;
-                                    node.updatePreview(data.name);
-                                    node.syncFramesFromTime();
-                                }
+                                    return resp.json();
+                                },
+                                onProgress: (done, total) => {
+                                    btnWidget.name = `上传中... ${Math.round((done / total) * 100)}%`;
+                                    node.setDirtyCanvas(true, false);
+                                },
+                            });
+                            if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(data.name)) {
+                                videoWidget.options.values.push(data.name);
                             }
+                            videoWidget.value = data.name;
+                            node._should_reset_trim = true;
+                            node.updatePreview(data.name);
+                            node.syncFramesFromTime();
                         } else {
                             // Standard upload for small files
                             const body = new FormData();
@@ -705,6 +649,9 @@ app.registerExtension({
                     if (isSmartMode && node.tryRestoreCachedSegments) node.tryRestoreCachedSegments();
                     // 时间轴显示：自定义裁剪 = 长条，智能分段 = 小方块
                     applyOutputTimelineVisual(isSmartMode);
+                    // 开始-结束-时长：智能分段下只读并展示当前分段，自定义裁剪下恢复可编辑
+                    setTimeBoxReadonly(isSmartMode);
+                    node.syncTimeInputs();
                 };
 
                 outputSegmentedToggle.onclick = doOutputToggle;
@@ -721,6 +668,9 @@ app.registerExtension({
                     if (savedIsSmart && node.tryRestoreCachedSegments) node.tryRestoreCachedSegments();
                     // 时间轴显示：自定义裁剪 = 长条，智能分段 = 小方块
                     applyOutputTimelineVisual(savedIsSmart);
+                    // 开始-结束-时长：智能分段下只读并展示当前分段，自定义裁剪下恢复可编辑
+                    setTimeBoxReadonly(savedIsSmart);
+                    node.syncTimeInputs();
                 };
 
                 // 直接通过原生下拉框切换输出模式时，也同步按钮高亮与检测按钮显隐
@@ -886,9 +836,48 @@ app.registerExtension({
                 timeInputWrap.appendChild(timeGap);
                 timeInputWrap.appendChild(durationBox);
 
-                // widget 值变化时回写输入框（按当前显示模式取对应组的值）
+                // 当前生效的分段（用于智能分段下时间框展示/只读）：
+                // 优先已选中的分段，否则回退到“分段索引”对应的分段（无落入结果时取第 0 段）。
+                const activeSegment = () => {
+                    if (!segmentsCacheData || !segmentsCacheData.segments || !segmentsCacheData.segments.length) return null;
+                    if (selectedSegment && selectedSegment.end > selectedSegment.start) return selectedSegment;
+                    const idx = segmentIndexWidget ? (parseInt(segmentIndexWidget.value) || 0) : 0;
+                    return segmentsCacheData.segments.find((x) => x.index === idx) || segmentsCacheData.segments[0];
+                };
+
+                // 智能分段时时间框只读（范围由小方块 / 分段索引决定）
+                const setTimeBoxReadonly = (ro) => {
+                    const tips = { start: "开始时间（秒）", end: "结束时间（秒）", duration: "时长（秒）" };
+                    const map = { start: startTimeBox, end: endTimeBox, duration: durationBox };
+                    Object.keys(map).forEach((role) => {
+                        const box = map[role];
+                        box.readOnly = ro;
+                        box.style.opacity = ro ? "0.55" : "1";
+                        box.style.cursor = ro ? "not-allowed" : "text";
+                        box.title = ro ? "智能分段下由小方块 / 分段索引决定" : tips[role];
+                    });
+                };
+
+                // widget 值变化时回写输入框（按当前显示模式取对应组的值）；
+                // 智能分段下展示当前选中分段的起止范围（只读）。
                 node.syncTimeInputs = function () {
                     const isFrames = isFramesMode;
+                    const fr = frameRateWidget ? (frameRateWidget.value || 24) : 24;
+
+                    const seg = activeSegment();
+                    if (isSmartMode && seg) {
+                        if (isFrames) {
+                            startTimeBox.value = parseFloat((seg.start * fr).toFixed(3));
+                            endTimeBox.value = parseFloat((seg.end * fr).toFixed(3));
+                            durationBox.value = parseFloat(((seg.end - seg.start) * fr).toFixed(3));
+                        } else {
+                            startTimeBox.value = parseFloat(seg.start.toFixed(2));
+                            endTimeBox.value = parseFloat(seg.end.toFixed(2));
+                            durationBox.value = parseFloat((seg.end - seg.start).toFixed(2));
+                        }
+                        return;
+                    }
+
                     if (isFrames) {
                         if (startFrameWidget) startTimeBox.value = parseFloat(startFrameWidget.value) || 0;
                         if (endFrameWidget) endTimeBox.value = parseFloat(endFrameWidget.value) || 0;
@@ -911,7 +900,9 @@ app.registerExtension({
 
                 // 输入框变化时写入当前显示模式对应的 widget，不换算另一组。
                 // 时长输入框：仅在【当前组内】调整结束值（结束=开始+时长），绝不跨组换算。
+                // 智能分段下范围由小方块 / 分段索引决定，不接收手动修改。
                 const applyTimeBoxChange = (role) => {
+                    if (isSmartMode) return;
                     const isFrames = isFramesMode;
                     const fr = frameRateWidget ? (frameRateWidget.value || 24) : 24;
                     const pick = (r) => isFrames
@@ -1319,6 +1310,7 @@ app.registerExtension({
                             selectedSegment = { start: seg.start, end: seg.end, index: seg.index };
                             if (isSmartMode && segmentIndexWidget) segmentIndexWidget.value = seg.index;
                             renderSegBlocks();
+                            if (node.syncTimeInputs) node.syncTimeInputs();
                             node.setDirtyCanvas(true, false);
                             // 同步预览画面到该分段的起始帧：seg.start 已由后端对齐为「图像」输出首帧的精确 PTS。
                             // 加 1e-6 秒的帧内微小偏移，避免 seek 恰好落在帧边界上被浏览器吸附到相邻帧。
@@ -1356,6 +1348,7 @@ app.registerExtension({
                             segmentsCacheKey = `${videoVal}|${fr}|${st}|${et}`;
                             segmentsCacheData = data;
                             renderSegBlocks();
+                            if (node.syncTimeInputs) node.syncTimeInputs();
                             node.setDirtyCanvas(true, false);
                         }
                     } catch (e) {
@@ -1375,6 +1368,7 @@ app.registerExtension({
                     const key = `${videoVal}|${fr}|${st}|${et}`;
                     if (segmentsCacheKey === key && segmentsCacheData) {
                         renderSegBlocks();
+                        if (node.syncTimeInputs) node.syncTimeInputs();
                         return;
                     }
                     detectBtn.disabled = true;
@@ -1387,11 +1381,29 @@ app.registerExtension({
                         segmentsCacheKey = key;
                         segmentsCacheData = data;
                         renderSegBlocks();
+                        if (node.syncTimeInputs) node.syncTimeInputs();
                     } catch (err) {
                         flashDetectBtn("检测失败");
                     } finally {
                         detectBtn.disabled = false;
                         detectBtn.textContent = "检测分段";
+                    }
+                };
+
+                // 由“分段索引”数值驱动：把当前索引对应的分段设为选中，并同步预览到该分段起始帧。
+                // （小方块点击已自带此逻辑；此处覆盖“直接改分段索引数值”的路径，与小方块点击行为保持一致）
+                const applySegmentFromIndex = () => {
+                    if (!isSmartMode) return;
+                    if (!segmentsCacheData || !segmentsCacheData.segments) return;
+                    const idx = segmentIndexWidget ? (parseInt(segmentIndexWidget.value) || 0) : 0;
+                    const seg = segmentsCacheData.segments.find((x) => x.index === idx);
+                    if (!seg || seg.start == null) return;
+                    selectedSegment = { start: seg.start, end: seg.end, index: seg.index };
+                    if (node.syncTimeInputs) node.syncTimeInputs();
+                    if (videoPreview && duration > 0) {
+                        // 同步预览画面到该分段的起始帧：seg.start 已由后端对齐为「图像」输出首帧的精确 PTS。
+                        // 加 1e-6 秒的帧内微小偏移，避免 seek 恰好落在帧边界上被浏览器吸附到相邻帧。
+                        videoPreview.currentTime = Math.min(seg.start + 1e-6, Math.max(0, duration - 0.01));
                     }
                 };
 
@@ -1401,6 +1413,7 @@ app.registerExtension({
                     segmentIndexWidget.callback = function () {
                         if (origSegCb) origSegCb.apply(this, arguments);
                         if (segmentsCacheData && segmentsCacheData.segments) {
+                            applySegmentFromIndex();
                             renderSegBlocks();
                         }
                     };
@@ -1516,7 +1529,10 @@ app.registerExtension({
                             if (node.syncOutputToggleVisual) node.syncOutputToggleVisual();
                         });
                         poll(segmentIndexWidget, "_yuanLastSeg", () => {
-                            if (segmentsCacheData && segmentsCacheData.segments) renderSegBlocks();
+                            if (segmentsCacheData && segmentsCacheData.segments) {
+                                applySegmentFromIndex();
+                                renderSegBlocks();
+                            }
                         });
                     } catch (_) {}
                 };

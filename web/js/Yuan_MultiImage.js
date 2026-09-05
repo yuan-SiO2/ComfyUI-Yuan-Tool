@@ -1,20 +1,11 @@
 /** Yuan Tool · 加载批量图像前端（多滑轨版） */
+import { getApi } from "./Yuan_Common.js";
+
 (function () {
     "use strict";
 
     const { app } = window.comfyAPI.app;
 
-    /** 从 window.comfyAPI 获取 api 实例 */
-    function getApi() {
-        try {
-            const c = window.comfyAPI;
-            if (c && c.api) {
-                if (c.api.api && typeof c.api.api.apiURL === "function") return c.api.api;
-                if (typeof c.api.apiURL === "function") return c.api.api;
-            }
-        } catch (_) {}
-        return null;
-    }
     const api = getApi();
 
     // --- 尺寸常量 ---

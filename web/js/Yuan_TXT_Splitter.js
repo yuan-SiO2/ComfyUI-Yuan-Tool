@@ -135,3 +135,73 @@ app.registerExtension({
         }
     }
 });
+
+
+// ==== 预览内容节点前端（复刻自 Yuan-TV 的 ShowText，扩展名与原版完全隔离） ====
+// 显示模式=预览：执行后把 ui.text 填入「文本」框并设为只读（不可编辑）
+// 显示模式=编辑：「文本」框可编辑，内容即为输出
+// 节点创建/加载/切换开关时，实时同步「文本」框的只读状态
+
+const PREVIEW_MODE_WIDGET = "显示模式";
+const PREVIEW_TEXT_WIDGET = "文本";
+
+function applyReadonly(node) {
+    const mode = node.widgets?.find((w) => w.name === PREVIEW_MODE_WIDGET);
+    const txt = node.widgets?.find((w) => w.name === PREVIEW_TEXT_WIDGET);
+    if (mode && txt && txt.inputEl) {
+        txt.inputEl.readOnly = !!mode.value; // 预览只读，编辑可编辑
+        txt.inputEl.style.opacity = mode.value ? 0.6 : 1;
+    }
+}
+
+function setupPreview(node) {
+    const mode = node.widgets?.find((w) => w.name === PREVIEW_MODE_WIDGET);
+    applyReadonly(node);
+    // 仅绑定一次回调，切换开关时更新只读状态
+    if (mode && !mode.__yuantool_preview_bound) {
+        mode.__yuantool_preview_bound = true;
+        const old = mode.callback;
+        mode.callback = function () {
+            old?.apply(this, arguments);
+            applyReadonly(node);
+        };
+    }
+}
+
+app.registerExtension({
+    name: "YuanTool.TXT.PreviewContent",
+    async beforeRegisterNodeDef(nodeType, nodeData, app) {
+        if (nodeData.name !== "YUAN_TXTPreviewContent") return;
+
+        // 节点刚创建（widgets 已就绪）：立即应用只读，避免预览模式下默认文本可编辑
+        const onNodeCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            onNodeCreated?.apply(this, arguments);
+            setupPreview(this);
+        };
+
+        // 加载工作流配置后：按保存的模式恢复只读状态
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            onConfigure?.apply(this, arguments);
+            setupPreview(this);
+        };
+
+        // 执行后：预览模式下把结果填入「文本」框并保持只读
+        const onExecuted = nodeType.prototype.onExecuted;
+        nodeType.prototype.onExecuted = function (message) {
+            onExecuted?.apply(this, arguments);
+            setupPreview(this);
+            const mode = this.widgets?.find((w) => w.name === PREVIEW_MODE_WIDGET);
+            const txt = this.widgets?.find((w) => w.name === PREVIEW_TEXT_WIDGET);
+            if (mode?.value && message?.text && txt) {
+                let v = [...message.text];
+                if (!v[0]) v.shift();
+                if (v[0]) {
+                    txt.value = v[0];
+                    app.graph.setDirtyCanvas(true, false);
+                }
+            }
+        };
+    },
+});

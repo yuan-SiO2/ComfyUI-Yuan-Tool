@@ -2,21 +2,13 @@
  * Yuan Tool · Panorama 前端：为 YuanPanoramaPreview 提供自包含 WebGL 球面投影全景查看器。
  * 支持拖拽旋转、滚轮缩放、360°/180° 覆盖、图像与视频（mp4 批次）输入播放。
  */
+import { getApi, imageSourceFromCandidate, lookupNodeOutputEntry } from "./Yuan_Common.js";
+
 (function () {
     "use strict";
 
     const { app } = window.comfyAPI.app;
 
-    function getApi() {
-        try {
-            const c = window.comfyAPI;
-            if (c && c.api) {
-                if (c.api.api && typeof c.api.api.apiURL === "function") return c.api.api;
-                if (typeof c.api.apiURL === "function") return c.api.api;
-            }
-        } catch (_) {}
-        return null;
-    }
     const api = getApi();
     function apiUrl(q) {
         return (api && typeof api.apiURL === "function") ? api.apiURL(q) : q;
@@ -56,61 +48,9 @@
         return v === "180" ? 180 : 360;
     }
 
-    function comfyImageEntryToUrl(entry) {
-        if (!entry || typeof entry !== "object") return "";
-        const filename = String(entry.filename || "").trim();
-        if (!filename) return "";
-        const params = new URLSearchParams();
-        params.set("filename", filename);
-        const viewType = String(
-            entry.storage
-            || (String(entry.type || "").trim().toLowerCase() === "comfy_image" ? "output" : entry.type)
-            || "output"
-        );
-        params.set("type", viewType);
-        if (entry.subfolder) params.set("subfolder", String(entry.subfolder));
-        const q = `/view?${params.toString()}`;
-        return apiUrl(q);
-    }
-
-    function imageSourceFromCandidate(candidate) {
-        if (!candidate) return "";
-        if (typeof candidate === "string") return String(candidate).trim();
-        if (Array.isArray(candidate)) {
-            if (candidate.length === 0) return "";
-            if (candidate.length === 1) return imageSourceFromCandidate(candidate[0]);
-            const filename = typeof candidate[0] === "string" ? String(candidate[0]).trim() : "";
-            if (filename) {
-                return comfyImageEntryToUrl({
-                    filename,
-                    subfolder: String(candidate[1] || "").trim(),
-                    type: String(candidate[2] || "output").trim() || "output",
-                });
-            }
-            for (const e of candidate) {
-                const s = imageSourceFromCandidate(e);
-                if (s) return s;
-            }
-            return "";
-        }
-        if (typeof candidate?.src === "string" && candidate.src) return candidate.src;
-        if (typeof candidate?.url === "string" && candidate.url) return candidate.url;
-        return comfyImageEntryToUrl(candidate);
-    }
-
-    function lookupNodeOutputEntry(nodeId) {
-        const store = app?.nodeOutputs;
-        if (!store || nodeId == null) return null;
-        const raw = String(nodeId);
-        if (store instanceof Map) {
-            return store.get(nodeId) || store.get(raw) || store.get(Number(raw)) || null;
-        }
-        return store[nodeId] || store[raw] || null;
-    }
-
     // 从节点自身输出中找视频
     function getSelfVideoUrl(node) {
-        const outputs = lookupNodeOutputEntry(node?.id);
+        const outputs = lookupNodeOutputEntry(app, node?.id);
         const groups = [
             outputs?.ui?.pano_videos,
             outputs?.pano_videos,
@@ -118,7 +58,7 @@
         for (const g of groups) {
             if (!Array.isArray(g)) continue;
             for (const c of g) {
-                const src = imageSourceFromCandidate(c);
+                const src = imageSourceFromCandidate(c, api);
                 if (src && /\.mp4(\?|$)/i.test(src)) return src;
                 if (src && String(c?.format || "").toLowerCase() === "video/mp4") return src;
             }
@@ -183,7 +123,7 @@
                         // 1.2) 其次使用节点自己显示的缩略图（反映当前节点执行后的 UI 状态）
                         const imgs = Array.isArray(originNode?.imgs) ? originNode.imgs : [];
                         for (const c of imgs) {
-                            const s = imageSourceFromCandidate(c);
+                            const s = imageSourceFromCandidate(c, api);
                             if (s) return s;
                         }
 
@@ -199,13 +139,13 @@
                             urls = typeof app?.getNodeImageUrls === "function" ? (app.getNodeImageUrls(originNode) || []) : [];
                         } catch (_) { urls = []; }
                         for (const c of urls) {
-                            const s = imageSourceFromCandidate(c);
+                            const s = imageSourceFromCandidate(c, api);
                             if (s) return s;
                         }
                     }
 
                     // 2) 检查 originOutputs（可能是当前图执行结果，也可能是被污染的缓存）
-                    const originOutputs = lookupNodeOutputEntry(oid);
+                    const originOutputs = lookupNodeOutputEntry(app, oid);
                     if (originOutputs) {
                         const candidateGroups = [
                             originOutputs?.images,
@@ -216,7 +156,7 @@
                         for (const g of candidateGroups) {
                             if (!Array.isArray(g)) continue;
                             for (const c of g) {
-                                const s = imageSourceFromCandidate(c);
+                                const s = imageSourceFromCandidate(c, api);
                                 if (s) return s;
                             }
                         }
@@ -226,7 +166,7 @@
         }
 
         // 3) 自身预览图（后备：仅在无上游输出时使用）
-        const selfOutput = lookupNodeOutputEntry(node?.id);
+        const selfOutput = lookupNodeOutputEntry(app, node?.id);
         const selfGroups = [
             selfOutput?.ui?.pano_input_images,
             selfOutput?.pano_input_images,
@@ -234,7 +174,7 @@
         for (const g of selfGroups) {
             if (!Array.isArray(g)) continue;
             for (const c of g) {
-                const s = imageSourceFromCandidate(c);
+                const s = imageSourceFromCandidate(c, api);
                 if (s) return s;
             }
         }

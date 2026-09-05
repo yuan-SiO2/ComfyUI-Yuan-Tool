@@ -99,3 +99,94 @@ export function lookupNodeOutputEntry(app, nodeId) {
     }
     return store[nodeId] || store[raw] || null;
 }
+
+/** 判断文件名是否为支持的音频/视频扩展名（含视频提取音轨）。 */
+const _AUDIO_EXTS = [
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma",
+    ".aiff", ".aif", ".mp4", ".m4v", ".webm", ".mov", ".avi", ".mkv",
+];
+export function isAudioFileName(name) {
+    const dot = name.lastIndexOf(".");
+    if (dot < 0) return false;
+    return _AUDIO_EXTS.indexOf(name.slice(dot).toLowerCase()) >= 0;
+}
+
+/** 链式包装 ComfyUI 节点生命周期/绘制回调，保留原回调再追加新逻辑。 */
+export function chainCallback(object, property, callback) {
+    if (object == undefined) return;
+    if (property in object) {
+        const orig = object[property];
+        object[property] = function () {
+            const r = orig.apply(this, arguments);
+            callback.apply(this, arguments);
+            return r;
+        };
+    } else {
+        object[property] = callback;
+    }
+}
+
+/** 隐藏 ComfyUI widget（兼容 V2 原生绘制与 V3 Vue 模式）。 */
+export function hideWidget(w) {
+    if (!w) return;
+    w.hidden = true;
+    if (!w.options) w.options = {};
+    w.options.hidden = true;
+
+    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
+        w.computeSize = () => [0, -4];
+        if (!w._hiddenDrawHooked) {
+            w._origDraw = w.hasOwnProperty('draw') ? w.draw : undefined;
+            w._hiddenDrawHooked = true;
+        }
+        w.draw = () => { };
+    }
+    if (w.element) w.element.style.display = "none";
+}
+
+/** 恢复被 hideWidget 隐藏的 ComfyUI widget。 */
+export function showWidget(w) {
+    if (!w) return;
+    w.hidden = false;
+    if (w.options) w.options.hidden = false;
+
+    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
+        delete w.computeSize;
+        if (w._hiddenDrawHooked) {
+            if (w._origDraw !== undefined) {
+                w.draw = w._origDraw;
+            } else {
+                delete w.draw;
+            }
+            delete w._hiddenDrawHooked;
+        }
+    }
+    if (w.element) w.element.style.display = "";
+}
+
+/** 通用分块上传循环：把大文件切片逐块 POST 到 uploadUrl，返回最后一块响应的 JSON。
+
+    与后端 handle_chunk_upload 对应。sendChunk(formData) 由调用方自定义
+    （用 fetch 或 api.fetchApi、指定 URL、校验状态码），返回解析后的 JSON。
+ */
+export async function uploadChunked(file, {
+    chunkSize = 10 * 1024 * 1024,
+    filename,
+    sendChunk,
+    onProgress,
+} = {}) {
+    const name = filename != null ? filename : file.name;
+    const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+    let last = null;
+    for (let i = 0; i < totalChunks; i++) {
+        const blob = file.slice(i * chunkSize, Math.min((i + 1) * chunkSize, file.size));
+        const formData = new FormData();
+        formData.append("file", blob);
+        formData.append("filename", name);
+        formData.append("chunk_index", String(i));
+        formData.append("total_chunks", String(totalChunks));
+        last = await sendChunk(formData, i, totalChunks, name);
+        if (onProgress) onProgress(i + 1, totalChunks, name);
+    }
+    return last;
+}
