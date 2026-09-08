@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 import folder_paths
+import comfy.nested_tensor
 
 # 模型文件夹注册
 _LATENT_UPSCALE_FOLDER = "latent_upscale_models"
@@ -378,12 +379,18 @@ class Yuan_H3Upscale3D:
                     "display_name": "目标高度",
                     "tooltip": "目标高度（像素），自动对齐到 16 的倍数。仅支持放大：目标小于当前尺寸会报错。仅在「目标尺寸」模式下生效。",
                 }),
+            },
+            "optional": {
+                "conditioning": ("CONDITIONING", {
+                    "display_name": "条件 (Conditioning)",
+                    "tooltip": "可选。如接入 Conditioning，会自动将其中的首尾帧关键帧及参考图 Latent 缩放到与当前目标尺寸一致，避免二采报错。",
+                }),
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("潜空间",)
-    OUTPUT_TOOLTIPS = ("放大后的 H3 latent，可直接送 VAE 解码或二次采样重绘。",)
+    RETURN_TYPES = ("LATENT", "CONDITIONING")
+    RETURN_NAMES = ("潜空间", "条件")
+    OUTPUT_TOOLTIPS = ("放大后的 H3 latent，可直接送 VAE 解码或二次采样重绘。", "对齐当前放大尺寸后的 Conditioning（若未输入则原样返回或为 None）。")
     FUNCTION = "run"
     CATEGORY = "Yuan Tool/放大"
     DESCRIPTION = ("H3 放大：在 latent 空间用训练好的神经网络放大 Minimax H3 视频，"
@@ -392,7 +399,7 @@ class Yuan_H3Upscale3D:
                    "缩放方式，仅支持放大（scale ≥ 1.0 或目标 ≥ 当前尺寸）。"
                    "设备（优先 CUDA）与推理精度（跟随模型权重）均自动检测。")
 
-    def run(self, latent, model_name, resize_type, scale, width, height):
+    def run(self, latent, model_name, resize_type, scale, width, height, conditioning=None):
         if model_name.startswith('('):
             raise ValueError("请将模型文件放入 latent_upscale_models 目录")
 
@@ -417,7 +424,7 @@ class Yuan_H3Upscale3D:
 
         if resize_type == UPSCALE_BY:
             if abs(scale - 1.0) < 1e-6:
-                return (latent,)
+                return (latent, conditioning)
             if scale < 1.0:
                 raise ValueError("仅支持放大 (scale >= 1.0)")
             target_size = (cur_t, int(round(cur_h * scale)), int(round(cur_w * scale)))
@@ -431,7 +438,7 @@ class Yuan_H3Upscale3D:
                     f"目标尺寸小于当前尺寸，仅支持放大（当前 latent {cur_w}x{cur_h}，"
                     f"目标 {t_w}x{t_h}，像素 {t_w*16}x{t_h*16}）")
             if t_h == cur_h and t_w == cur_w:
-                return (latent,)
+                return (latent, conditioning)
             target_size = (cur_t, t_h, t_w)
             # 嵌入需要单一缩放标量：取两个轴向比值的平均作为整体缩放提示
             eff_scale = (t_h / cur_h + t_w / cur_w) / 2.0
@@ -470,10 +477,57 @@ class Yuan_H3Upscale3D:
             torch.cuda.empty_cache()
 
         if is_nested:
-            import comfy.nested_tensor
             streams[0] = out
-            return ({"samples": comfy.nested_tensor.NestedTensor(streams)},)
-        return ({"samples": out},)
+            out_latent = {"samples": comfy.nested_tensor.NestedTensor(streams)}
+        else:
+            out_latent = {"samples": out}
+
+        out_conditioning = conditioning
+        if conditioning is not None:
+            out_conditioning = []
+            target_h, target_w = target_size[1], target_size[2]
+            for t in conditioning:
+                n = [t[0], t[1].copy()]
+                # 处理 keyframes 中的条件 latent 尺寸匹配
+                if "minimax_keyframes" in n[1]:
+                    new_keyframes = []
+                    for kf in n[1]["minimax_keyframes"]:
+                        kf_copy = kf.copy()
+                        if "latent" in kf_copy and isinstance(kf_copy["latent"], torch.Tensor):
+                            z = kf_copy["latent"]
+                            # z 形状为 [B, C, T, H, W] 或 [B, C, H, W]
+                            if z.shape[-2] != target_h or z.shape[-1] != target_w:
+                                z_5d = z if z.ndim == 5 else z.unsqueeze(2)
+                                z_resized = F.interpolate(
+                                    z_5d, size=(z_5d.shape[2], target_h, target_w),
+                                    mode="trilinear", align_corners=False
+                                )
+                                kf_copy["latent"] = z_resized if z.ndim == 5 else z_resized.squeeze(2)
+                        new_keyframes.append(kf_copy)
+                    n[1]["minimax_keyframes"] = new_keyframes
+
+                # 处理 refs 中的图片参考 latent 尺寸匹配
+                if "minimax_refs" in n[1]:
+                    new_refs = []
+                    for ref in n[1]["minimax_refs"]:
+                        ref_copy = ref.copy()
+                        if ref_copy.get("kind") == "image" and "latent" in ref_copy and isinstance(ref_copy["latent"], torch.Tensor):
+                            z = ref_copy["latent"]
+                            if z.shape[-2] != target_h or z.shape[-1] != target_w:
+                                z_5d = z if z.ndim == 5 else z.unsqueeze(2)
+                                z_resized = F.interpolate(
+                                    z_5d, size=(z_5d.shape[2], target_h, target_w),
+                                    mode="trilinear", align_corners=False
+                                )
+                                ref_copy["latent"] = z_resized if z.ndim == 5 else z_resized.squeeze(2)
+                                ref_copy["latent_h"] = target_h
+                                ref_copy["latent_w"] = target_w
+                        new_refs.append(ref_copy)
+                    n[1]["minimax_refs"] = new_refs
+
+                out_conditioning.append(n)
+
+        return (out_latent, out_conditioning)
 
 
 # 节点注册
