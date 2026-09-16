@@ -6,6 +6,7 @@
 """
 
 import hashlib
+import math
 import os
 
 import numpy as np
@@ -21,10 +22,10 @@ from aiohttp import web
 from ..Yuan_common import handle_chunk_upload
 
 try:
-    from safetensors.torch import load_file as _st_load
+    from safetensors.torch import load_file as _st_load, save_file as _st_save
     from safetensors import safe_open as _st_safe_open
 except ImportError:  # ComfyUI 总是自带 safetensors，此处仅是双保险
-    _st_load = _st_safe_open = None
+    _st_load = _st_save = _st_safe_open = None
 
 
 # ============================================================================
@@ -33,11 +34,31 @@ except ImportError:  # ComfyUI 总是自带 safetensors，此处仅是双保险
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FPS = 24  # H3 原生帧率；音频潜空间按 40Hz 采样
+FRAME_RESCALE = 5.0 / 3.0
+AUDIO_HZ = 40.0
 
 
 def _pixel_frames(latent_t):
     """latent_t 个潜空间步覆盖的像素帧数。"""
     return sum(FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
+
+
+def _step_offsets(latent_t):
+    """计算每个潜空间时间步所对应的起始像素帧索引。"""
+    out, acc = [], 0
+    for k in range(latent_t):
+        out.append(acc)
+        acc += FRAME_PER_TOKEN[k % 5]
+    return out
+
+
+def _steps_for_frames(n):
+    """计算精准覆盖 n 个像素帧所需的最少潜空间时间步数。"""
+    k, covered = 0, 0
+    while covered < n:
+        covered += FRAME_PER_TOKEN[k % 5]
+        k += 1
+    return k if covered == n else None
 
 
 def _streams_from_latent(latent):
@@ -55,6 +76,126 @@ def _streams_from_latent(latent):
     if not parts:
         raise ValueError("h3_motion_context: AV latent contains no streams")
     return parts
+
+
+def _repack_av_streams(streams, template=None):
+    """重新打包各独立数据流为 H3 联合潜空间 (NestedTensor)。"""
+    tpl = template.get("samples") if isinstance(template, dict) else template
+    try:
+        import comfy.nested_tensor
+        return comfy.nested_tensor.NestedTensor(tuple(streams))
+    except Exception:
+        pass
+    cls = type(tpl) if tpl is not None and not torch.is_tensor(tpl) else None
+    if cls is not None:
+        try:
+            return cls(tuple(streams))
+        except Exception:
+            pass
+    raise ValueError("h3_motion_context: 无法将 AV 数据流打包为 NestedTensor。")
+
+
+def _video_from_latent(latent):
+    """从 H3 AV 潜空间中提取视频流并保证为 5 维张量 [B, C, T, H, W]。"""
+    video = _streams_from_latent(latent)[0]
+    if video.ndim == 4:
+        video = video.unsqueeze(0)
+    if video.ndim != 5:
+        raise ValueError("h3_motion_context: 期望视频潜空间维度为 [B,C,T,H,W], 实际为 %s" % (tuple(video.shape),))
+    return video
+
+
+def _video_tail_from_latent(latent, n):
+    """直接从纯净潜空间中精准截取最后 n 帧对应的视频潜空间步，跳过像素转码。"""
+    video = _video_from_latent(latent)
+    total = int(video.shape[2])
+    steps = _steps_for_frames(n)
+    if steps is None:
+        raise ValueError(
+            "h3_motion_context: %d 帧无法对应整数个潜空间步，请使用 5, 22, 39 或 56。" % n
+        )
+    if steps > total:
+        raise ValueError("h3_motion_context: 请求 %d 个潜空间步，但输入潜空间仅有 %d 步。" % (steps, total))
+    start = total - steps
+    if start % 5 != 0:
+        raise RuntimeError(
+            "h3_motion_context: 潜空间切片起始相位与循环网格不匹配 (起始相位 %d != 0)。" % (start % 5)
+        )
+    covered = _pixel_frames(steps)
+    blocks = [video[:1, :, start + k:start + k + 1].clone() for k in range(steps)]
+    return blocks, _step_offsets(steps), covered
+
+
+def _audio_tail_from_latent_pure(latent, a_frames):
+    """直接从潜空间中截取最后 a_frames 对应的音频潜空间步，并计算悬空量 overhang。"""
+    parts = _streams_from_latent(latent)
+    if len(parts) < 2:
+        return None, 0, 0.0
+    video, audio = parts[0], parts[1]
+    if video.ndim == 4:
+        video = video.unsqueeze(0)
+    if audio.ndim == 3:
+        audio = audio.unsqueeze(0)
+    if audio.ndim != 4:
+        return None, 0, 0.0
+    total_t = int(audio.shape[-1])
+    frames = _pixel_frames(int(video.shape[2]))
+    overhang = total_t - FRAME_RESCALE * frames
+    if not (-0.5 < overhang < 0.5):
+        overhang = 0.0
+    rt = int(round(a_frames / float(FPS) * AUDIO_HZ))
+    if rt > total_t:
+        rt = total_t
+    if rt < 1:
+        return None, 0, 0.0
+    tail = audio[:1, ..., total_t - rt:].clone()
+    return tail, rt, float(overhang)
+
+
+def _prefix_token_weights(prefix_steps, taper_steps=4, seam_min=0.10):
+    """计算沿前缀潜空间时间步的重绘掩码权重曲线。
+    - 前端远离接缝（将被剪裁丢弃端）: 权重为 1.0 (完全自由重绘扩散，打破历史注意力死锁)
+    - 末端靠近接缝（与当前生成衔接端）: 平滑过渡收敛至 seam_min (例如 0.10)
+    """
+    n = int(prefix_steps)
+    if n < 1:
+        return ()
+    taper = max(1, min(int(taper_steps), n))
+    head = n - taper
+    floor = float(max(0.0, min(1.0, seam_min)))
+    weights = [1.0] * head
+    weights.extend(1.0 + (floor - 1.0) * (float(i + 1) / float(taper)) for i in range(taper))
+    return tuple(weights)
+
+
+def _spatial_video_mask(t_steps, prefix_steps, height, width, device, dtype, seam_min=0.10):
+    """构建与 H3 视频流形状 [B, 1, T, H, W] 一致的去噪掩码。"""
+    t = int(t_steps)
+    h = max(1, int(height))
+    w = max(1, int(width))
+    mask = torch.ones((1, 1, t, h, w), device=device, dtype=dtype)
+    n = max(0, min(int(prefix_steps), t))
+    if n < 1:
+        return mask
+    weights = _prefix_token_weights(n, taper_steps=4, seam_min=seam_min)
+    ramp = torch.tensor(weights, device=device, dtype=dtype)
+    mask[:, :, :n] = ramp.view(1, 1, n, 1, 1)
+    return mask
+
+
+def _soft_av_audio_mask(audio_t, pin_t, device, dtype):
+    """构建音频软释放掩码 [B, 1, 1, T_audio]。"""
+    mask = torch.ones((1, 1, 1, int(audio_t)), device=device, dtype=dtype)
+    n = max(0, min(int(pin_t), int(audio_t)))
+    if n < 1:
+        return mask
+    mask[..., :n] = 0.0
+    release = min(8, n)
+    if release >= 1:
+        idx = torch.arange(1, release + 1, device=device, dtype=dtype)
+        ramp = 0.5 - 0.5 * torch.cos(math.pi * idx / float(release))
+        mask[..., n - release:n] = ramp.reshape(1, 1, 1, -1)
+    return mask
 
 
 def _snap_guide_frames(n):
@@ -136,7 +277,7 @@ def _tail_audio_latent(audio_vae, waveform, sample_rate, frames):
 
 
 # ============================================================================
-# 上下文媒体标记与加载（自动索引 / 手动上传共用）
+# 上下文媒体标记与加载（仅纯净潜空间切片模式）
 # ============================================================================
 
 # 空标记键：片段序号为 0 / 文件未找到时，加载输出带此标记的空媒体，
@@ -149,156 +290,63 @@ CONTEXT_EMPTY_REASON_DETAIL = "_h3_motion_context_empty_reason_detail"
 # 正常加载时携带的片段序号键，用于生成"已关联片段 N"提示
 CONTEXT_CLIP_INDEX_KEY = "_h3_motion_context_clip_index"
 
-# 尾段媒体文件名约定：存储位置目录下 clip_%05d.mp4（片段序号 2 → clip_00002.mp4）
+# 尾段媒体文件名约定：存储位置目录下 clip_%05d.safetensors（片段序号 2 → clip_00002.safetensors）
 CLIP_FILE_PREFIX = "clip"
-CLIP_FILE_EXT = ".mp4"
-# 加载上下文媒体时解码帧的最长边上限：超过该值先等比缩到最长边=1536 再参与
-# 引导，降低解码量与后续 VAE 编码开销；未超限原样返回（字节不变），不破坏
-# 链条内小分辨率尾段的逐字节精确。固定默认，不暴露参数。
-CONTEXT_LOAD_MAX_SIDE = 1536
+LATENT_FILE_EXT = ".safetensors"
 
 
-def _load_media_file(path, clip_index=None):
-    """加载「H3 运动裁剪」保存的尾段媒体：.mp4 经 av 解码为像素帧+波形；
-    旧版 .safetensors（uint8 帧+波形）仍兼容读取。
-
-    返回 {"pixels": [t,H,W,3] float[0,1], "waveform": [1,2,L]（无音轨为 None）,
-    "sample_rate": int}。
-    """
-    lower = (path or "").lower()
-    if lower.endswith(".mp4"):
-        return _read_mp4(path, clip_index=clip_index)
-    return _read_st_media(path, clip_index=clip_index)
-
-
-def _cap_longest_side(frames_u8):
-    """把 uint8 视频帧等比缩到最长边 ≤ CONTEXT_LOAD_MAX_SIDE。
-
-    仅当超上限时才缩放，未超限原样返回（字节不变）——链条内小分辨率尾段
-    保持逐字节精确。支持单帧 [H,W,3] 与帧序列 [T,H,W,3]；解码循环里逐帧
-    调用可在堆叠成大张量前先降内存。"""
-    h, w = int(frames_u8.shape[-3]), int(frames_u8.shape[-2])
-    if max(h, w) <= CONTEXT_LOAD_MAX_SIDE:
-        return frames_u8
-    ratio = CONTEXT_LOAD_MAX_SIDE / float(max(h, w))
-    nh = max(int(h * ratio + 0.5), 2)
-    nw = max(int(w * ratio + 0.5), 2)
-    batched = frames_u8.ndim == 4
-    x = frames_u8 if batched else frames_u8[None]
-    x = x.float().div_(255.0).movedim(-1, 1)  # [*,3,H,W]
-    y = comfy.utils.common_upscale(x, nw, nh, "area", "disabled")
-    out = (y.movedim(1, -1).mul_(255.0).clamp_(0.0, 255.0)
-           .round_().to(torch.uint8))
-    return out if batched else out[0]
-
-
-def _read_st_media(path, clip_index=None):
-    """读取旧版 .safetensors 格式的尾段媒体（uint8 帧 + 音频波形）。"""
-    if _st_load is None:
-        raise RuntimeError("h3_motion_context: safetensors is not "
-                           "available; cannot load context media.")
-    data = _st_load(path)
-    if "video" not in data or "audio" not in data:
-        raise ValueError(
-            "h3_motion_context: %s 不是「H3 运动裁剪」保存的上下文媒体文件"
-            "（缺少 video/audio 数据）。" % path)
-    video = data["video"]
-    # 与主路径一致：4D [T,H,W,3] 即帧序列本身，只有 5D [B,T,H,W,3] 才去批维
-    if video.ndim == 5:
-        video = video[0]
-    if video.ndim == 3:
-        video = video[None]
-    if video.dtype != torch.uint8:
-        raise ValueError(
-            "h3_motion_context: %s 是旧版潜空间格式（latent）。请用新版"
-            "「H3 运动裁剪」重新生成分段媒体文件。" % path)
-    video = _cap_longest_side(video)  # 解码即统一缩放（超上限才缩）
-    pixels = video.float().div_(255.0)
-    wave = data["audio"]
-    if wave.ndim == 3:
-        wave = wave[:1]
-    elif wave.ndim == 2:
-        wave = wave[None]
-    sample_rate = 32000
-    if _st_safe_open is not None:
-        try:
-            with _st_safe_open(path, framework="pt", device="cpu") as f:
-                meta = f.metadata() or {}
-                sample_rate = int(meta.get("sample_rate", 32000))
-                if clip_index is None and meta.get("clip_index"):
-                    clip_index = int(meta["clip_index"])
-        except Exception:
-            pass
-    out = {"pixels": pixels, "waveform": wave, "sample_rate": sample_rate}
-    if clip_index is not None:
-        out[CONTEXT_CLIP_INDEX_KEY] = clip_index
-    return out
-
-
-def _read_mp4(path, clip_index=None):
-    """把「H3 运动裁剪」保存的 .mp4（音视频一体）解码为像素帧与波形。
-
-    视频帧 → uint8 → [0,1] float 的 [t,H,W,3]；音频重采样为 float32 立体声
-    [2,L]（保留容器原始采样率，由调用方后续转 32kHz）；无音轨时 waveform 为 None。"""
-    import av
-    video_frames = []
-    audio_parts = []
-    sample_rate = 32000
-    container = av.open(path)
+def _save_safetensors_media(video_latent, audio_latent, target_path):
+    """安全保存纯净潜空间张量为 safetensors 格式，杜绝任何 VAE 往返编解码画质衰减。"""
+    if _st_save is None:
+        return None
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    tmp_path = target_path + ".tmp"
+    tensors = {}
+    if video_latent is not None:
+        tensors["video"] = video_latent.cpu().contiguous()
+    if audio_latent is not None:
+        tensors["audio"] = audio_latent.cpu().contiguous()
+    if not tensors:
+        return None
     try:
-        video_stream = next((s for s in container.streams if s.type == "video"), None)
-        audio_stream = next((s for s in container.streams if s.type == "audio"), None)
-        if video_stream is None:
-            raise ValueError("h3_motion_context: %s 内没有视频轨。" % path)
-        resampler = None
-        if audio_stream is not None:
-            sample_rate = int(audio_stream.codec_context.sample_rate or 48000)
-            resampler = av.audio.resampler.AudioResampler(
-                format="fltp", layout="stereo", rate=sample_rate)
-        # 视频/音频须在同一次 decode 中交错取帧：先取完单流会把文件读到
-        # EOF，后续再 decode 另一流将拿不到任何帧（av 18 实测返回空）
-        targets = [s for s in (video_stream, audio_stream) if s is not None]
-        for frame in container.decode(*targets):
-            if isinstance(frame, av.VideoFrame):
-                arr = frame.to_ndarray(format="rgb24")  # [H,W,3] uint8
-                # 解码即统一缩放：逐帧等比缩到最长边 ≤ 1536（超上限才缩，
-                # 在堆叠成大张量前先降内存），再参与引导
-                video_frames.append(_cap_longest_side(
-                    torch.from_numpy(np.ascontiguousarray(arr))))
-            elif resampler is not None:
-                for rf in resampler.resample(frame):
-                    # to_ndarray 返回 [声道,样本]，且会按实际样本裁剪——
-                    # 直接用 planes buffer 会连带对齐填充读到多余样本
-                    nd = rf.to_ndarray()
-                    audio_parts.append(torch.from_numpy(
-                        np.ascontiguousarray(nd)))
-        if resampler is not None:
-            for rf in resampler.resample(None):  # 冲刷重采样器尾部
-                nd = rf.to_ndarray()
-                audio_parts.append(torch.from_numpy(
-                    np.ascontiguousarray(nd)))
+        _st_save(tensors, tmp_path, metadata={"format": "yuan_h3_motion_av_v1"})
+        os.replace(tmp_path, target_path)
+        return target_path
     finally:
-        container.close()
-    if not video_frames:
-        raise ValueError("h3_motion_context: %s 未解码到任何视频帧。" % path)
-    pixels = torch.stack(video_frames, 0).float().div_(255.0)
-    waveform = None
-    if audio_parts:
-        wave = torch.cat(audio_parts, 1)  # [声道, L]
-        if wave.shape[0] == 1:  # 单声道提升为立体声
-            wave = wave.repeat(2, 1)
-        elif wave.shape[0] > 2:
-            wave = wave[:2]
-        waveform = wave.unsqueeze(0)  # [1,2,L]
-    out = {"pixels": pixels, "waveform": waveform, "sample_rate": sample_rate}
-    if clip_index is not None:
-        out[CONTEXT_CLIP_INDEX_KEY] = clip_index
-    return out
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    return None
+
+
+def _load_safetensors_media(path):
+    """从本地读取保存的纯净潜空间文件。"""
+    if _st_load is None or not os.path.exists(path):
+        return None
+    try:
+        data = _st_load(path)
+        v = data.get("video")
+        a = data.get("audio")
+        if v is None and a is None:
+            return None
+        video = v.contiguous().clone() if v is not None else None
+        audio = a.contiguous().clone() if a is not None else None
+        samples = []
+        if video is not None:
+            samples.append(video)
+        if audio is not None:
+            samples.append(audio)
+        return {"samples": samples}
+    except Exception:
+        return None
 
 
 def _load_context_media(存储位置, 片段序号=1):
-    """按 存储位置+片段序号 加载本地尾段媒体：序号 0（首片段）返回 first_clip 空标记；
-    >0 按 存储位置/clip_%05d.mp4 加载，未找到时返回 file_not_found 空标记。
+    """按 存储位置+片段序号 加载本地尾段纯净潜空间：序号 0（首片段）返回 first_clip 空标记；
+    >0 仅加载 存储位置/clip_%05d.safetensors 纯净无损潜空间。
+    未找到时返回 file_not_found 空标记。
     两种空标记调用方均直通、不裁头。"""
     try:
         idx = int(片段序号)
@@ -308,22 +356,33 @@ def _load_context_media(存储位置, 片段序号=1):
     if idx == 0:
         return {CONTEXT_EMPTY_MARKER: True,
                 CONTEXT_EMPTY_REASON: "first_clip"}
-    try:
-        path = _clip_file_path(存储位置, idx)
-    except FileNotFoundError:
-        # 兜底：主「存储位置」目录缺失（参数错位）时，扫描 output 目录实际保存位置
-        path = _find_clip_in_output(idx)
-        if path is None:
-            return {CONTEXT_EMPTY_MARKER: True,
-                    CONTEXT_EMPTY_REASON: "file_not_found",
-                    CONTEXT_EMPTY_REASON_DETAIL: str(idx)}
-    return _load_media_file(path, clip_index=idx)
+
+    loc = (存储位置 or "").strip().strip('"').strip("'") or "H3-Mubu"
+    clip_dir = os.path.join(folder_paths.get_output_directory(), loc)
+    lat_path = os.path.join(clip_dir, "%s_%05d%s" % (CLIP_FILE_PREFIX, idx, LATENT_FILE_EXT))
+    if os.path.exists(lat_path):
+        lat_data = _load_safetensors_media(lat_path)
+        if lat_data is not None:
+            lat_data[CONTEXT_CLIP_INDEX_KEY] = idx
+            lat_data["source"] = "pure_latent"
+            return lat_data
+
+    # 兜底：扫描 output 目录查找
+    alt = _find_clip_in_output(idx)
+    if alt is not None:
+        lat_data = _load_safetensors_media(alt)
+        if lat_data is not None:
+            lat_data[CONTEXT_CLIP_INDEX_KEY] = idx
+            lat_data["source"] = "pure_latent"
+            return lat_data
+
+    return {CONTEXT_EMPTY_MARKER: True,
+            CONTEXT_EMPTY_REASON: "file_not_found",
+            CONTEXT_EMPTY_REASON_DETAIL: str(idx)}
 
 
 def _context_latent_fingerprint(存储位置, 片段序号, 手动上传):
-    """IS_CHANGED 缓存指纹：手动上传用文件指纹；片段序号常量 0 输出确定性 0；
-    否则对存储目录全部尾段媒体做综合指纹（内容变→指纹变→下游重跑；同内容→命中）；
-    异常统一返回 NaN 保守重跑。"""
+    """IS_CHANGED 缓存指纹。"""
     if (手动上传 or "").strip():
         try:
             path = _resolve_manual_media_path(手动上传)
@@ -340,8 +399,6 @@ def _context_latent_fingerprint(存储位置, 片段序号, 手动上传):
         fp = _dir_fingerprint(_build_load_path(存储位置))
     except Exception:
         return float("NaN")
-    # 与加载时的兜底扫描保持一致：主存储位置目录不存在（参数错位）时，
-    # 改扫 output 目录下实际保存的文件做指纹，避免缓存漏跑/误缓存
     if fp.startswith("missing"):
         alt = _find_clip_in_output(片段序号)
         if alt:
@@ -358,151 +415,78 @@ def _context_latent_fingerprint(存储位置, 片段序号, 手动上传):
 # ============================================================================
 
 class Yuan_H3MotionContext:
-    """把上一片段尾部画面/音频固定为本片段开头：以 resolved_frame_index=0 锚定，
-    与官方 Add Guide 同路径——画面经视频 VAE 编码、音频经音频 VAE 编码后追加进
-    minimax_keyframes（可与官方引导节点自由混用）。画面编码前做往返偏色闭环补偿
-    （按逐通道均值抵消视频 VAE 编码→解码的非恒等 DC 偏移，防链条逐段累积发黄，
-    且不引入锐化）。上下文来源由「模式」决定：上传 / 端口 / 自动索引。"""
+    """把上一片段尾部画面/音频固定为本片段开头：
+    支持双轨引导模式：
+    1. 引导+重绘 (推荐)：将前序潜空间直接写入当前潜空间作为运动初值，并生成平滑梯度的 noise_mask
+       （被丢弃端 1.0 完全重绘打破死锁，接缝端平滑收敛至重绘幅度）。彻底根治多段拼接画面累积劣化与高分辨率失聪！
+    2. 引导 (传统硬锁)：以 resolved_frame_index=0 作为 minimax_keyframes 锚定（兼容老工作流）。
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "条件化": ("CONDITIONING", {
-                    "tooltip": "正向条件化。本节点向其追加关键帧引导后输出，"
-                               "可与官方 Add Guide 等 H3 条件节点串联。"}),
+                    "tooltip": "正向条件化。本节点输出，可与官方 Add Guide 等 H3 条件节点串联。"}),
                 "潜空间": ("LATENT", {
-                    "tooltip": "本片段的 H3 AV 潜空间（采样器或空 latent 节点"
-                               "输出）。仅读取形状（时长/分辨率/音频轨长度），"
-                               "不修改其内容。"}),
+                    "tooltip": "本片段的 H3 AV 潜空间（采样器或空 latent 节点输出）。"}),
                 "VAE": ("VAE", {
-                    "tooltip": "H3 视频 VAE。把上一片段尾帧编码为关键帧"
-                               " latent，与官方 Add Guide 连接 image 的路径"
-                               "相同。"}),
-                "模式": (["上传", "端口", "自动索引"], {
-                    "default": "自动索引",
-                    "tooltip": "上下文来源三选一：上传——仅用手动上传的媒体"
-                               "文件；端口——仅用「上下文图像」「上下文音频」"
-                               "端口的连线（如直接连上一片段「H3 运动裁剪」"
-                               "的输出）；自动索引——按 存储位置+片段序号 "
-                               "自动加载本地保存的尾段媒体。"}),
+                    "tooltip": "H3 视频 VAE。"}),
                 "启用上下文": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "总开关。关闭时条件化直通、不固定任何引导，"
-                               "输出 \"0:尾段长度\"——本片段完全独立生成，"
-                               "但「运动裁剪」的尾段仍按两窗口较大值保存，"
-                               "供下一片段衔接。"}),
+                    "tooltip": "总开关。关闭时条件化与潜空间直通、不固定任何引导。"}),
+                "引导方式": (["引导+重绘", "引导"], {
+                    "default": "引导+重绘",
+                    "tooltip": "引导方式：引导+重绘 (推荐，彻底根治多段画面累积劣化与高分辨率提示词失效) / 引导 (传统关键帧硬锁)。"}),
+                "重绘幅度": ("FLOAT", {
+                    "default": 0.10, "min": 0.00, "max": 0.50, "step": 0.01,
+                    "tooltip": "【仅引导+重绘有效】两段接缝处允许重绘的比例。0.10 兼具物理接缝平滑与提示词自由度。"}),
+                "模式": (["上传", "端口", "自动索引"], {
+                    "default": "自动索引",
+                    "tooltip": "上下文来源三选一：上传——仅用手动上传的媒体文件；端口——仅用「上下文图像」「上下文音频」端口；自动索引——按 存储位置+片段序号 自动加载本地保存的尾段媒体。"}),
                 "存储位置": ("STRING", {
                     "default": "H3-Mubu",
-                    "tooltip": "自动索引模式下加载的目录名（ComfyUI 输出"
-                               "文件夹下的子目录）。与「H3 运动裁剪」的"
-                               "「存储位置」一致即可对应加载。"}),
+                    "tooltip": "自动索引模式下加载的目录名（ComfyUI 输出文件夹下的子目录）。与「H3 运动裁剪」的「存储位置」一致即可对应加载。"}),
                 "片段序号": ("INT", {
                     "default": 1, "min": 0, "max": 9999,
-                    "tooltip": "自动索引模式下加载的片段序号：设为上一片段"
-                               "「H3 运动裁剪」保存时使用的相同序号即可对应"
-                               "加载（clip_00002.mp4 这类文件）。0 表示"
-                               "链条第一个片段，不加载、直通。"}),
+                    "tooltip": "自动索引模式下加载的片段序号。0 表示链条第一个片段，不加载、直通。"}),
                 "上下文长度": (["5", "22", "39", "56"], {
-                    "default": "5",
-                    "tooltip": "固定到本片段开头的画面帧数，必须是 H3 引导"
-                               "片段的合法长度（17k+5：5/22/39/56，与官方"
-                               " Add Guide 的多帧引导一致），其他值向下吸附。"
-                               "「运动裁剪」将从交付部分裁掉同等帧数，接缝处"
-                               "画面从引导末端无缝续接。锚窗越长自由帧越易被"
-                               "拉向上一段画面并逐段污染，默认 5 帧短锚接缝"
-                               "依然无缝、污染最小；长锚仅强延续需求时用。"}),
+                    "default": "22",
+                    "tooltip": "固定到本片段开头的画面帧数，必须是 H3 引导片段的合法长度（17k+5：5/22/39/56，推荐 22 帧）。"}),
                 "音频上下文长度": (["0", "5", "22", "39", "56"], {
-                    "default": "5",
-                    "tooltip": "从上一片段尾部固定的音频时长（按帧数换算），"
-                               "经音频 VAE 编码后随关键帧锚定在本片段开头，"
-                               "交付音频从固定窗口末端无缝续接。0=不固定音频"
-                               "（模型自由生成，固定的画面可能带出上一片段"
-                               "场景的声音）。建议与「上下文长度」保持一致"
-                               "（超出时按画面窗收窄），大于 0 时需连接 "
-                               "audio_vae。"}),
+                    "default": "22",
+                    "tooltip": "从上一片段尾部固定的音频时长（按帧数换算）。0=不固定音频。"}),
             },
             "optional": {
                 "audio_vae": ("VAE", {
-                    "tooltip": "H3 音频 VAE。「音频上下文长度」大于 0 时必须"
-                               "连接，用于把上一片段尾部的音频波形编码为关键"
-                               "帧音频潜空间。"}),
+                    "tooltip": "H3 音频 VAE。「音频上下文长度」大于 0 时必须连接。"}),
                 "上下文图像": ("IMAGE", {
-                    "tooltip": "端口模式下的上一片段尾部画面（如直接连上一"
-                               "片段「H3 运动裁剪」的「图像」输出）。本节点"
-                               "取其尾部「上下文长度」帧作引导。"}),
+                    "tooltip": "端口模式下的上一片段尾部画面。"}),
                 "上下文音频": ("AUDIO", {
-                    "tooltip": "端口模式下的上一片段尾部音频（如直接连上一"
-                               "片段「H3 运动裁剪」的「音频」输出）。「音频"
-                               "上下文长度」大于 0 时必须连接。"}),
+                    "tooltip": "端口模式下的上一片段尾部音频。"}),
                 "手动上传": ("STRING", {
                     "default": "",
-                    "tooltip": "上传模式下由「上传上下文」按钮写入的媒体文件"
-                               "路径，也可手填（支持 input:/output:/temp: "
-                               "前缀）。"}),
+                    "tooltip": "上传模式下媒体文件路径。"}),
             },
         }
 
-    RETURN_TYPES = ("CONDITIONING", "STRING")
-    RETURN_NAMES = ("条件化", "裁剪帧数")
+    RETURN_TYPES = ("CONDITIONING", "STRING", "LATENT")
+    RETURN_NAMES = ("条件化", "裁剪帧数", "潜空间")
     FUNCTION = "apply"
     CATEGORY = "Yuan Tool/MiniMax"
-    DESCRIPTION = ("把上一片段尾部的视频图像与音频固定为本片段开头的"
-                   "关键帧引导，全面对齐官方 Add Guide for MiniMax H3 的"
-                   "数据路径：图像经视频 VAE 编码、音频经音频 VAE 编码，"
-                   "锚定在第 0 帧并追加进正向条件化。支持 上传/端口/自动"
-                   "索引 三种上下文来源。裁剪帧数输出为字符串\"状态:长度\""
-                   "（如 1:22），供「H3 运动裁剪」解析。")
+    DESCRIPTION = ("把上一片段尾部的视频图像与音频作为本片段开头的运动引导。"
+                   "支持'引导+重绘'软掩码模式（根治画面劣化与提示词失效）与'引导'硬锁模式。"
+                   "输出包含更新后的条件化、裁剪帧数以及带 noise_mask 的潜空间。")
 
-    def apply(self, 条件化, 潜空间, VAE, 启用上下文=True, 模式="自动索引",
-              存储位置="H3-Mubu", 片段序号=1, 上下文长度="5",
-              音频上下文长度="5", audio_vae=None,
+    def apply(self, 条件化, 潜空间, VAE, 启用上下文=True, 引导方式="引导+重绘", 重绘幅度=0.10,
+              模式="自动索引", 存储位置="H3-Mubu", 片段序号=1, 上下文长度="22",
+              音频上下文长度="22", audio_vae=None,
               上下文图像=None, 上下文音频=None, 手动上传=""):
-        # 引导窗口与音频窗口的请求值；无上下文/直通路径下，尾段保存长度
-        # 仍按两窗口较大值输出，保证下一片段有可衔接的媒体文件
-        g_req = _snap_guide_frames(int(上下文长度 or 0))
+        g_req = _snap_guide_frames(int(上下文长度 or 22))
         a_req = int(音频上下文长度 or 0)
         idle_tail = max(g_req, a_req)
-        if not 启用上下文:
-            return {"result": (条件化, "0:%d" % idle_tail), "ui": {
-                "h3_hint": "上下文已关闭，直通"}}
-        # 上下文来源由「模式」决定：上传（只用上传文件）/ 端口（只用连线）/ 自动索引
-        if 模式 == "上传":
-            if not (手动上传 or "").strip():
-                raise ValueError(
-                    "h3_motion_context: 「上传」模式下需先通过「上传上下文」"
-                    "按钮上传媒体文件（.mp4），或填写「手动上传」路径。")
-            media = _load_media_file(_resolve_manual_media_path(手动上传),
-                                     clip_index=None)
-            hint = "已上传上下文文件"
-        elif 模式 == "端口":
-            if 上下文图像 is None:
-                raise ValueError(
-                    "h3_motion_context: 「端口」模式下「上下文图像」"
-                    "端口必须连接。")
-            waveform = None
-            sample_rate = 32000
-            if isinstance(上下文音频, dict):
-                waveform = 上下文音频.get("waveform")
-                sample_rate = int(上下文音频.get("sample_rate", 32000))
-            media = {"pixels": 上下文图像, "waveform": waveform,
-                     "sample_rate": sample_rate}
-            hint = "已关联上下文"
-        else:  # 自动索引
-            media = _load_context_media(存储位置, 片段序号)
-            if media.get(CONTEXT_EMPTY_MARKER):
-                reason = media.get(CONTEXT_EMPTY_REASON, "first_clip")
-                if reason == "file_not_found":
-                    detail = media.get(CONTEXT_EMPTY_REASON_DETAIL, "?")
-                    return {"result": (条件化, "0:%d" % idle_tail), "ui": {
-                        "h3_hint": "未找到片段 %s 文件" % detail}}
-                return {"result": (条件化, "0:%d" % idle_tail), "ui": {
-                    "h3_hint": "片段\"0\"，直通"}}
-            hint = "已关联片段 %s 文件" % media.get(
-                CONTEXT_CLIP_INDEX_KEY, "?")
 
-        # 仅读取本片段形状：按「通道数 24」从 AV 两流中识别视频流（不假设顺序），
-        # 兼容 NestedTensor 与普通 (video, audio) 元组
+        # 1. 仅读取本片段形状
         parts = _streams_from_latent(潜空间)
         video = None
         for pt in parts:
@@ -512,115 +496,107 @@ class Yuan_H3MotionContext:
                 break
         if video is None:
             raise ValueError(
-                "h3_motion_context: 未在 AV 潜空间中找到 24 通道视频流，流形状="
-                "%s。请连接 MiniMax H3 采样器/空潜空间节点的输出。"
-                % ([tuple(t.shape) for t in parts],))
+                "h3_motion_context: 未在 AV 潜空间中找到 24 通道视频流。请连接 MiniMax H3 采样器/空潜空间节点的输出。")
         latent_t = int(video.shape[2])
         width = int(video.shape[4]) * 16
         height = int(video.shape[3]) * 16
         frame_count = _pixel_frames(latent_t)
-        track_steps = None
-        for pt in parts:
-            if pt.ndim >= 1 and pt.shape[0] == 1 and pt.ndim >= 3 and pt is not video:
-                try:
-                    track_steps = int(pt.shape[-1])
-                except (TypeError, ValueError):
-                    pass
 
-        pixels = media["pixels"]
-        # 媒体像素约定 [T,H,W,3]；仅去掉真实的批维（5D [B,T,H,W,3]）。
-        # 4D 就是帧序列本身，不能截断——早期把 4D 误当批维截成首帧，正是
-        # 「裁剪保存的尾段加载后只剩 1 帧/引导断裂」的根因之一。
-        if pixels.ndim == 5:
-            pixels = pixels[0]
-        elif pixels.ndim == 3:  # 单帧 [H,W,3] 补帧轴，交由下方帧数校验兜底
-            pixels = pixels[None]
-        available = int(pixels.shape[0])
-        # 引导长度：min(请求,可用) 后吸附 17k+5（官方对多帧引导同款向下裁剪）
-        g = _snap_guide_frames(min(g_req, available))
-        if g < 5:
-            raise ValueError(
-                "h3_motion_context: 上下文媒体仅有 %d 帧画面，至少需要 5 帧"
-                "才能固定引导。" % available)
-        if g > frame_count:
-            raise ValueError(
-                "h3_motion_context: 引导片段 %d 帧超出本片段总长 %d 帧。"
-                % (g, frame_count))
+        audio_stream = parts[1] if len(parts) > 1 else None
+        if audio_stream is not None and audio_stream.ndim == 3:
+            audio_stream = audio_stream.unsqueeze(0)
 
-        # 引导帧：取尾部 g 帧，按官方 Add Guide 同款 center 裁剪缩放到
-        # 本片段分辨率，经视频 VAE 编码为关键帧 latent（编码时做逐通道均值
-        # 往返偏色闭环补偿，切断链条逐段累积的发黄漂移）
-        guide = _resize_guide(pixels[available - g:], width, height)
-        if width % 16 or height % 16:
-            raise ValueError(
-                "h3_motion_context: 本片段分辨率 %dx%d 不是 16 的倍数，无法"
-                "编码引导。请调整工作流的目标分辨率。"
-                % (width, height))
-        try:
-            keyframe = {"resolved_frame_index": 0,
-                        "latent": _encode_guide_color_neutral(
-                            VAE, guide, width, height, g)}
-        except RuntimeError as e:
-            raise RuntimeError(
-                "h3_motion_context: VAE 编码引导片段失败。\n"
-                "  引导帧形状 guide=%s（g=%d 帧, 目标分辨率 %dx%d）\n"
-                "  本片段视频潜空间形状=%s（像素 %dx%d, 共 %d 帧）\n"
-                "  原始错误：%s\n"
-                "请检查「H3 运动上下文」的「潜空间」是否接自 H3 采样器输出、"
-                "上下文的画面分辨率是否与片段一致（不一致时按本片段分辨率"
-                "缩放）。"
-                % (tuple(guide.shape), g, width, height,
-                   tuple(video.shape), width, height, frame_count, e))
+        out_latent = dict(潜空间)
 
-        # 音频引导：取尾部音频窗（帧数换算样本）经音频 VAE 编码，按官方规则裁到本片段音频轨剩余长度（frame_idx=0→全轨可用）
+        if not 启用上下文:
+            return {"result": (条件化, "0:%d" % idle_tail, out_latent), "ui": {
+                "h3_hint": "上下文已关闭，直通"}}
+
+        # 2. 加载上一片段纯净潜空间切片（零 VAE 重编码衰减）
+        media = _load_context_media(存储位置, 片段序号)
+        if media.get(CONTEXT_EMPTY_MARKER):
+            reason = media.get(CONTEXT_EMPTY_REASON, "first_clip")
+            if reason == "file_not_found":
+                detail = media.get(CONTEXT_EMPTY_REASON_DETAIL, "?")
+                return {"result": (条件化, "0:%d" % idle_tail, out_latent), "ui": {
+                    "h3_hint": "未找到片段 %s 潜空间切片" % detail}}
+            return {"result": (条件化, "0:%d" % idle_tail, out_latent), "ui": {
+                "h3_hint": "片段\"0\"，直通"}}
+
+        hint = "已关联片段 %s 纯净潜空间" % media.get(CONTEXT_CLIP_INDEX_KEY, "?")
+
+        # 仅从无损潜空间切片提取
+        blocks, offsets, covered = _video_tail_from_latent(media, g_req)
+        head_video_lat = torch.cat(blocks, dim=2)
+        g = covered
         a = 0
-        waveform = media.get("waveform")
+        head_audio_lat = None
+        head_audio_pin_t = 0
         if a_req > 0:
-            if waveform is None or int(waveform.shape[-1]) < 1:
-                raise ValueError(
-                    "h3_motion_context: 「音频上下文长度」大于 0，但当前"
-                    "上下文%s无音频可用。「端口」模式需连接「上下文音频」，"
-                    "或把「音频上下文长度」设为 0。"
-                    % ("" if 模式 == "端口" else "文件"))
-            if audio_vae is None:
-                raise ValueError(
-                    "h3_motion_context: 「音频上下文长度」大于 0 时需连接 "
-                    "audio_vae（H3 音频 VAE）。")
-            if waveform.ndim == 2:
-                waveform = waveform[None]
-            sr = int(media.get("sample_rate") or 32000)
-            avail_frames = int(waveform.shape[-1]) / float(sr) * FPS
-            # 音频锚窗上限收窄到画面锚窗 g：音频引导不应覆盖出画面引导之外
-            # （否则该区段只有音频、无画面可对应，且下方裁剪量 max(g,a) 会
-            # 白白多裁 a-g 帧新画面）
-            a = min(a_req, int(avail_frames), g)
-            if a < 1:
-                raise ValueError(
-                    "h3_motion_context: 上下文音频可用时长不足 1 帧，无法固定"
-                    "音频引导。")
-            z = _tail_audio_latent(audio_vae, waveform, sr, a)
-            if track_steps is not None and int(z.shape[-1]) > track_steps:
-                z = z[..., :track_steps].clone()
-            keyframe["audio_latent"] = z
+            audio_lat, ref_a_t, _overhang = _audio_tail_from_latent_pure(media, min(a_req, g))
+            if audio_lat is not None and ref_a_t > 0:
+                head_audio_lat = audio_lat
+                head_audio_pin_t = ref_a_t
+                a = int(round(ref_a_t / float(AUDIO_HZ) * FPS))
 
-        # 裁剪量：覆盖画面引导窗与音频窗的较大值——音频窗比画面窗长时只裁
-        # 画面窗会让固定音频泄漏进交付部分
         cut = max(g, a)
         if cut >= frame_count:
-            raise ValueError(
-                "h3_motion_context: 裁剪量 %d 帧达到/超过本片段总长 %d 帧。"
-                "请减小「上下文长度」或「音频上下文长度」。"
-                % (cut, frame_count))
+            raise ValueError("h3_motion_context: 裁剪量 %d 帧达到/超过本片段总长 %d 帧。" % (cut, frame_count))
 
-        # 追加进正向条件化（与官方 Add Guide 相同：读取已有列表、追加、
-        # 整表写回，可与官方引导节点自由混用）
-        keyframes = list(条件化[0][1].get("minimax_keyframes", []))
-        keyframes.append(keyframe)
-        out = node_helpers.conditioning_set_values(
-            条件化, {"minimax_keyframes": keyframes})
-        if a > 0:
-            hint += "（含音频）"
-        return {"result": (out, "1:%d" % cut), "ui": {
+        # 3. 分支处理：引导+重绘 VS 传统硬锁
+        out_cond = 条件化
+        if 引导方式 == "引导+重绘":
+            patched_video = video.clone()
+            t_head = min(int(head_video_lat.shape[2]), int(patched_video.shape[2]) - 1)
+            patched_video[:, :, :t_head] = head_video_lat[:, :, :t_head].to(
+                device=patched_video.device, dtype=patched_video.dtype
+            )
+
+            patched_audio = audio_stream.clone() if audio_stream is not None else None
+            if patched_audio is not None and head_audio_lat is not None and head_audio_pin_t > 0:
+                t_aud = min(head_audio_pin_t, int(patched_audio.shape[-1]))
+                patched_audio[..., :t_aud] = head_audio_lat[..., :t_aud].to(
+                    device=patched_audio.device, dtype=patched_audio.dtype
+                )
+
+            new_samples = [patched_video]
+            if patched_audio is not None:
+                new_samples.append(patched_audio)
+            out_latent["samples"] = _repack_av_streams(new_samples, 潜空间)
+
+            # 构建带平滑过渡梯度的 noise_mask
+            video_mask = _spatial_video_mask(
+                int(patched_video.shape[2]),
+                t_head,
+                height=int(patched_video.shape[3]),
+                width=int(patched_video.shape[4]),
+                device=patched_video.device,
+                dtype=torch.float32,
+                seam_min=重绘幅度,
+            )
+            mask_streams = [video_mask]
+            if patched_audio is not None:
+                audio_mask = _soft_av_audio_mask(
+                    int(patched_audio.shape[-1]),
+                    head_audio_pin_t,
+                    device=patched_audio.device,
+                    dtype=torch.float32,
+                )
+                mask_streams.append(audio_mask)
+            out_latent["noise_mask"] = _repack_av_streams(mask_streams, 潜空间)
+            hint += "（引导+重绘: %.2f）" % 重绘幅度
+        else:
+            # 传统引导：挂在 minimax_keyframes 上
+            keyframe = {"resolved_frame_index": 0, "latent": head_video_lat}
+            if head_audio_lat is not None:
+                keyframe["audio_latent"] = head_audio_lat
+            keyframes = list(条件化[0][1].get("minimax_keyframes", []))
+            keyframes.append(keyframe)
+            out_cond = node_helpers.conditioning_set_values(条件化, {"minimax_keyframes": keyframes})
+            if a > 0:
+                hint += "（含音频硬锁）"
+
+        return {"result": (out_cond, "1:%d" % cut, out_latent), "ui": {
             "h3_hint": hint}}
 
     @classmethod
@@ -758,132 +734,39 @@ class Yuan_H3MotionContextTrim:
         audio_cut = min(audio_cut, int(wave.shape[-1]))
         delivered_pixels = pixels[n:]
         delivered_wave = wave[..., audio_cut:]
-        # 第二次裁切（受「保存到本地」开关控制）：在交付部分尾部按解析长度再切后段存盘，
-        # 供下一片段「H3 运动上下文」取尾部窗口；交付帧数不足时保存整个交付部分。
+        # 第二次裁切（受「保存到本地」开关控制）：仅保存纯净无损 Latent 切片 (.safetensors)，彻底杜绝反复编解码画质劣化
         if 保存到本地 and tail > 0:
             t_frames = min(tail, total - n)
-            tail_pixels = delivered_pixels[delivered_pixels.shape[0] - t_frames:]
-            tail_samples = int(round(t_frames / float(FPS) * sample_rate))
-            tail_samples = min(tail_samples, int(delivered_wave.shape[-1]))
-            tail_wave = (delivered_wave[..., delivered_wave.shape[-1] - tail_samples:]
-                         if tail_samples > 0 else delivered_wave[..., :0])
-            _save_av_media(tail_pixels, tail_wave, sample_rate,
-                           存储位置, 片段序号)
+            loc = (存储位置 or "").strip().strip('"').strip("'") or "H3-Mubu"
+            clip_dir = os.path.join(folder_paths.get_output_directory(), loc)
+            tail_lat_path = os.path.join(clip_dir, "%s_%05d%s" % (CLIP_FILE_PREFIX, int(片段序号), LATENT_FILE_EXT))
+            tail_lat_steps = _steps_for_frames(t_frames)
+            if tail_lat_steps is not None and video.shape[2] >= tail_lat_steps:
+                start_step = int(video.shape[2]) - tail_lat_steps
+                sub_video_lat = video[:1, :, start_step:].clone()
+                sub_aud_lat = None
+                if audio.shape[-1] > 0:
+                    rt = int(round(t_frames / float(FPS) * AUDIO_HZ))
+                    if rt > 0:
+                        sub_aud_lat = audio[:1, ..., max(0, int(audio.shape[-1]) - rt):].clone()
+                _save_safetensors_media(sub_video_lat, sub_aud_lat, tail_lat_path)
+
         return (delivered_pixels,
                 {"waveform": delivered_wave, "sample_rate": sample_rate})
 
 
-def _save_av_media(pixels, waveform, sample_rate, 存储位置, 片段序号):
-    """把尾段媒体（像素帧+音频波形）混流存为 {输出}/{存储位置}/clip_%05d.mp4。
-
-    视频用 libx264 无损模式（yuv444p + crf 0）作为引导中间格式：画面是下一片段
-    VAE 重编码的引导源，任何有损伪影都会随链条逐段累积（画面污染）；无损保存把
-    该累积归零。音频仍 aac。重生成同一片段覆盖自身、不堆叠；文件名与「H3 运动
-    上下文」自动索引加载约定一致（读取端对旧 yuv420 文件同样可解码）。
-    """
-    import av
-    # pixels 约定 [T,H,W,3]；仅当仍带 [B,...] 批维（5D）时才塌缩首帧轴
-    if pixels.ndim == 5:
-        pixels = pixels[0]
-    if waveform is not None and waveform.ndim == 2:
-        waveform = waveform[None]
-    has_audio = waveform is not None and int(waveform.shape[-1]) > 0
-    loc = (存储位置 or "").strip().strip('"').strip("'") or "H3-Mubu"
-    clip_dir = os.path.join(folder_paths.get_output_directory(), loc)
-    os.makedirs(clip_dir, exist_ok=True)
-    path = os.path.join(clip_dir, "%s_%05d%s" % (CLIP_FILE_PREFIX,
-                                                 int(片段序号),
-                                                 CLIP_FILE_EXT))
-    # 原子写：先写同目录临时文件，编码成功后再 os.replace 覆盖目标——
-    # 读取方永远不会读到半截文件；失败时旧文件保留
-    tmp_path = "%s.tmp%d" % (path, os.getpid())
-    try:
-        os.remove(tmp_path)  # 清理上一次异常遗留的临时文件
-    except OSError:
-        pass
-    h, w = int(pixels.shape[1]), int(pixels.shape[2])
-    video_u8 = (pixels.clamp(0.0, 1.0).mul(255.0).round_()
-                .to(torch.uint8).cpu().numpy())
-    # 写入模式靠文件扩展名推断封装格式；tmp 后缀 .tmp<pid> 无法识别，
-    # 必须显式指定 format="mp4"
-    container = av.open(tmp_path, mode="w", format="mp4")
-    try:
-        # 两个流须先于任何写包建好（av 18 在已有时间戳后再加流会报
-        # "Cannot rebase to zero time"）；先建后按序编码并无冲突
-        vstream = container.add_stream("libx264", rate=FPS)
-        vstream.width = w
-        vstream.height = h
-        # 无损引导中间格式：h264 无损仅支持 4:4:4（yuv444p）+ qp 0。
-        # crf 16/yuv420p 的量化与色度抽样伪影会随多段再生逐段累积成画面污染，
-        # 故引导源用 crf 0 无损（文件较大，但仅尾段短窗、且不对外分发）
-        vstream.pix_fmt = "yuv444p"
-        vstream.options = {"crf": "0", "preset": "slow"}
-        astream = None
-        if has_audio:
-            astream = container.add_stream("aac", rate=int(sample_rate))
-            astream.layout = "stereo"
-        for i in range(video_u8.shape[0]):
-            frame = av.VideoFrame.from_ndarray(
-                np.ascontiguousarray(video_u8[i]), format="rgb24")
-            for pkt in vstream.encode(frame):
-                container.mux(pkt)
-        for pkt in vstream.encode():
-            container.mux(pkt)
-        if astream is not None:
-            wave = waveform[0]
-            if wave.shape[0] == 1:
-                wave = wave.repeat(2, 1)
-            elif wave.shape[0] > 2:
-                wave = wave[:2]
-            wave = wave.to(torch.float32).cpu()
-            total = int(wave.shape[-1])
-            chunk = int(sample_rate) // 10  # 0.1s 一块，控内存
-            n = 0
-            while n < total:
-                seg = wave[:, n:n + chunk]
-                aframe = av.AudioFrame(format="fltp", layout="stereo",
-                                       samples=int(seg.shape[-1]))
-                aframe.sample_rate = int(sample_rate)
-                for ch in range(2):
-                    aframe.planes[ch].update(
-                        np.ascontiguousarray(seg[ch].numpy()))
-                for pkt in astream.encode(aframe):
-                    container.mux(pkt)
-                n += chunk
-            for pkt in astream.encode():
-                container.mux(pkt)
-    finally:
-        container.close()
-    # 封装全部成功且容器已关闭落盘后，才将临时文件原子替换为正式文件；
-    # 中途任何异常都会在上方上抛（跳过此行），旧文件保持完整可用
-    os.replace(tmp_path, path)
-
-
 # ============================================================================
-# 存储位置/文件名解析（约定：存储位置目录下 clip_%05d.mp4）
+# 存储位置/文件名解析（约定：存储位置目录下 clip_%05d.safetensors）
 # ============================================================================
-
-def _clip_file_path(存储位置, idx):
-    """返回 clip_%05d.mp4 绝对路径（不存在抛 FileNotFoundError，由调用方兜底扫描 output 目录）。"""
-    loc = (存储位置 or "").strip().strip('"').strip("'") or "H3-Mubu"
-    path = os.path.join(folder_paths.get_output_directory(), loc,
-                        "%s_%05d%s" % (CLIP_FILE_PREFIX, int(idx),
-                                       CLIP_FILE_EXT))
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            "h3_motion_context: no clip media for index %d (%s)."
-            % (int(idx), path))
-    return path
-
 
 def _find_clip_in_output(idx):
     """兜底搜索：主「存储位置」解析失败时（工作流参数可能错位），扫描 output 目录
-    全部子目录找 clip_%05d.mp4，命中多个取 mtime 最新的。"""
+    全部子目录找 clip_%05d.safetensors，命中多个取 mtime 最新的。"""
     try:
         idx_i = int(idx)
     except (TypeError, ValueError):
         return None
-    target = "%s_%05d%s" % (CLIP_FILE_PREFIX, idx_i, CLIP_FILE_EXT)
+    target = "%s_%05d%s" % (CLIP_FILE_PREFIX, idx_i, LATENT_FILE_EXT)
     out = folder_paths.get_output_directory()
     if not out or not os.path.isdir(out):
         return None
@@ -912,7 +795,7 @@ def _build_load_path(存储位置):
 
 
 def _dir_fingerprint(prefix_path):
-    """目录级综合指纹：对 prefix_path 所在目录下所有 clip_*.mp4/.safetensors 按
+    """目录级综合指纹：对 prefix_path 所在目录下所有 clip_*.safetensors 按
     「文件名+mtime+size」哈希（仅读元数据），任一文件增/删/改都改变指纹。
 
     IS_CHANGED 专用：链接输入拿不到真实片段序号、无法定位单文件，故对整目录做指纹
@@ -924,15 +807,14 @@ def _dir_fingerprint(prefix_path):
         p = "H3-Mubu/clip"
     h = hashlib.sha256()
     h.update(p.encode("utf-8"))
-    # 候选目录顺序与 _clip_file_path 一致：先 output 目录下的原路径
+    # 候选目录顺序
     for c in (os.path.join(folder_paths.get_output_directory(), p), p):
         dir_part = os.path.dirname(c)
         prefix = os.path.basename(c)
         if dir_part and prefix and os.path.isdir(dir_part):
             files = sorted(f for f in os.listdir(dir_part)
                            if f.startswith(prefix)
-                           and (f.endswith(CLIP_FILE_EXT)
-                                or f.endswith(".safetensors")))
+                           and f.endswith(LATENT_FILE_EXT))
             for fname in files:
                 h.update(fname.encode("utf-8"))
                 try:
