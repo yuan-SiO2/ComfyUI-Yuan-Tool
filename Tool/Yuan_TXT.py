@@ -1,5 +1,22 @@
-import re
 import json as _json
+import logging
+import os
+import re
+
+import folder_paths
+import numpy as np
+import torch
+from PIL import Image, ImageColor, ImageDraw, ImageFont
+
+
+# ==== 图像文本标签：本节点的字体目录 ====
+FONTS_FOLDER = "yuan_tool_fonts"
+DEFAULT_FONT = "default"
+
+_font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+os.makedirs(_font_dir, exist_ok=True)
+if FONTS_FOLDER not in folder_paths.folder_names_and_paths:
+    folder_paths.add_model_folder_path(FONTS_FOLDER, _font_dir)
 
 
 class AnyType(str):
@@ -1566,7 +1583,204 @@ class YUAN_TXTPreviewContent:
             return str(source)
 
 
+# ==== 图像文本标签 ====
+
+DIRECTION_UP = "上方"
+DIRECTION_DOWN = "下方"
+DIRECTION_LEFT = "左侧"
+DIRECTION_RIGHT = "右侧"
+DIRECTION_OVERLAY = "覆盖"
+
+
+def _parse_color(color_string):
+    """把取色器输出的颜色字符串解析为 RGB 或 RGBA 整数元组。"""
+    try:
+        return ImageColor.getrgb(str(color_string).strip())
+    except ValueError:
+        logging.warning("无法解析颜色 '%s'，已回退为白色。", color_string)
+        return (255, 255, 255)
+
+
+class YUAN_TXTLabelColor:
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        fonts = folder_paths.get_filename_list(FONTS_FOLDER)
+        # 只列出本节点 fonts 文件夹里的字体；目录为空时回退到内置字体
+        font_choices = fonts if fonts else [DEFAULT_FONT]
+        return {
+            "required": {
+                "image": ("IMAGE", {
+                    "display_name": "图像",
+                    "tooltip": "要添加标签的图像，支持批量。"
+                }),
+                "text": ("STRING", {
+                    "multiline": True,
+                    "default": "Text",
+                    "display_name": "文字",
+                    "tooltip": "要绘制的文字，支持多行与自动换行。"
+                }),
+                "text_x": ("INT", {
+                    "default": 10, "min": 0, "max": 4096, "step": 1,
+                    "display_name": "文字横向偏移",
+                    "tooltip": "文字距标签边缘的横向像素偏移。"
+                }),
+                "text_y": ("INT", {
+                    "default": 2, "min": 0, "max": 4096, "step": 1,
+                    "display_name": "文字纵向偏移",
+                    "tooltip": "文字距标签顶部的纵向像素偏移。"
+                }),
+                "height": ("INT", {
+                    "default": 48, "min": -1, "max": 4096, "step": 1,
+                    "display_name": "标签高度",
+                    "tooltip": "标签高度（像素）；-1 为按文字行数自动计算。"
+                }),
+                "font_size": ("INT", {
+                    "default": 32, "min": 0, "max": 4096, "step": 1,
+                    "display_name": "字号",
+                    "tooltip": "文字字号（像素）。"
+                }),
+                "font_color": ("COLOR", {
+                    "default": "#ffffff",
+                    "display_name": "文字颜色",
+                    "tooltip": "文字颜色（取色器选择）。"
+                }),
+                "label_color": ("COLOR", {
+                    "default": "#000000",
+                    "display_name": "标签颜色",
+                    "tooltip": "标签底色；方向为“覆盖”时不生效。"
+                }),
+                "font": (font_choices, {
+                    "default": font_choices[0],
+                    "display_name": "字体",
+                    "tooltip": "标签字体，仅列出本节点 fonts 文件夹中的字体。"
+                }),
+                "direction": ([DIRECTION_UP, DIRECTION_DOWN, DIRECTION_LEFT, DIRECTION_RIGHT, DIRECTION_OVERLAY], {
+                    "default": DIRECTION_UP,
+                    "display_name": "方向",
+                    "tooltip": "标签拼接位置；“覆盖”为直接叠加在原图上。"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("图像",)
+    OUTPUT_TOOLTIPS = ("添加标签后的图像。",)
+    FUNCTION = "add_label"
+    CATEGORY = "Yuan Tool/文本"
+    SEARCH_ALIASES = [
+        "addlabel", "add label", "label", "text", "caption",
+        "subtitle", "watermark", "标签", "文字标签", "图像文本标签", "添加标签", "取色器",
+    ]
+    DESCRIPTION = (
+        "把文字绘制成标签，拼接在图像的上/下/左/右；“覆盖”为直接叠加在原图上。\n"
+        "文字颜色与标签颜色用取色器选择，字体取自本节点 fonts 文件夹。"
+    )
+
+    def add_label(self, image, text, text_x, text_y, height, font_size, font_color,
+                  label_color, font, direction):
+        width = image.shape[2]
+        channels = image.shape[3]
+        # 与输入保持一致，alpha 图像仍保持 4 通道
+        pil_mode = "RGBA" if channels == 4 else "RGB"
+
+        font_path = None if font == DEFAULT_FONT else folder_paths.get_full_path(FONTS_FOLDER, font)
+        if font != DEFAULT_FONT and font_path is None:
+            logging.warning("字体 '%s' 不存在，已改用默认字体。", font)
+
+        # 解析取色器传入的颜色
+        font_color_rgb = _parse_color(font_color)
+        label_color_rgb = _parse_color(label_color)
+
+        font_color_tuple = tuple(font_color_rgb[:3])
+        label_color_tuple = tuple(label_color_rgb[:3])
+        if pil_mode == "RGBA":
+            font_color_tuple += (font_color_rgb[3] if len(font_color_rgb) > 3 else 255,)
+            label_color_tuple += (label_color_rgb[3] if len(label_color_rgb) > 3 else 255,)
+
+        horizontal = direction in (DIRECTION_LEFT, DIRECTION_RIGHT)
+        # 左/右侧的标签会旋转 90°，因此要沿图像高度方向排版
+        strip_length = image.shape[1] if horizontal else width
+
+        def load_font():
+            size = max(1, font_size)
+            if font_path is None:
+                return ImageFont.load_default(size=size)
+            return ImageFont.truetype(font_path, size)
+
+        def process_image(input_image, caption_text):
+            label_font = load_font()
+            lines = []
+            for text_line in caption_text.split('\n'):
+                if text_line.strip() == "":
+                    # 保留空行，以便支持连续换行
+                    lines.append("")
+                    continue
+                words = text_line.split()
+                current_line = []
+                for word in words:
+                    if current_line:
+                        test_line = " ".join(current_line + [word])
+                    else:
+                        test_line = word
+                    try:
+                        test_line_width = label_font.getbbox(test_line)[2]
+                    except Exception:
+                        test_line_width = label_font.getsize(test_line)[0]
+                    if test_line_width <= strip_length - 2 * text_x:
+                        current_line.append(word)
+                    else:
+                        lines.append(" ".join(current_line))
+                        current_line = [word]
+                if current_line:
+                    lines.append(" ".join(current_line))
+
+            if direction == DIRECTION_OVERLAY:
+                pil_image = Image.fromarray((input_image.cpu().numpy() * 255).astype(np.uint8))
+            elif height == -1:
+                # 自动计算所需高度
+                margin = 8
+                required_height = (text_y + len(lines) * font_size) + margin
+                pil_image = Image.new(pil_mode, (strip_length, required_height), label_color_tuple)
+            else:
+                pil_image = Image.new(pil_mode, (strip_length, height), label_color_tuple)
+
+            draw = ImageDraw.Draw(pil_image)
+
+            y_offset = text_y
+            for line in lines:
+                try:
+                    draw.text((text_x, y_offset), line, font=label_font, fill=font_color_tuple, features=['-liga'])
+                except Exception:
+                    draw.text((text_x, y_offset), line, font=label_font, fill=font_color_tuple)
+                y_offset += font_size
+
+            return torch.from_numpy(np.array(pil_image).astype(np.float32) / 255.0).unsqueeze(0)
+
+        processed_images = [process_image(img, text) for img in image]
+        processed_batch = torch.cat(processed_images, dim=0)
+
+        # 根据方向拼接
+        if direction == DIRECTION_DOWN:
+            combined_images = torch.cat((image, processed_batch), dim=1)
+        elif direction == DIRECTION_LEFT:
+            # 标签沿图像高度排版后顺时针旋转 90°，拼接到图像左侧
+            processed_batch = torch.rot90(processed_batch, 3, (1, 2))
+            combined_images = torch.cat((processed_batch, image), dim=2)
+        elif direction == DIRECTION_RIGHT:
+            # 逆时针旋转 90°，拼接到图像右侧（首行文字贴近图像）
+            processed_batch = torch.rot90(processed_batch, 1, (1, 2))
+            combined_images = torch.cat((image, processed_batch), dim=2)
+        elif direction == DIRECTION_UP:
+            combined_images = torch.cat((processed_batch, image), dim=1)
+        else:
+            combined_images = processed_batch
+
+        return (combined_images,)
+
+
 NODE_CLASS_MAPPINGS = {
+    "YUAN_TXTLabelColor": YUAN_TXTLabelColor,
     "YUAN_TXTJsonExtractor": YUAN_TXTJsonExtractor,
     "YUAN_TXTJsonSwitch": YUAN_TXTJsonSwitch,
     "YUAN_TXTAppearanceOrder": YUAN_TXTAppearanceOrder,
@@ -1580,6 +1794,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "YUAN_TXTLabelColor": "图像文本标签",
     "YUAN_TXTJsonExtractor": "JSON提取",
     "YUAN_TXTJsonSwitch": "JSON提取开关",
     "YUAN_TXTAppearanceOrder": "出场排序",
