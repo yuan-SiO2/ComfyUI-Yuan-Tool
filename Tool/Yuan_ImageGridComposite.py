@@ -17,6 +17,14 @@ class YuanImageGridComposite:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "index": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 999999,
+                    "step": 1,
+                    "display_name": "编号",
+                    "tooltip": "写入文件名 _00001_ 这一段的编号；同一编号重复运行会覆盖原文件。",
+                }),
                 "images": ("IMAGE", {
                     "display_name": "图像",
                     "tooltip": "要拼接的批量图像。",
@@ -41,14 +49,6 @@ class YuanImageGridComposite:
                     "default": "Mabuya/ComfyUI",
                     "display_name": "文件名前缀",
                     "tooltip": "输出目录下的文件名前缀，可含子目录与 %变量%（如 %year%-%month%-%day%）。",
-                }),
-                "index": ("INT", {
-                    "default": 1,
-                    "min": 1,
-                    "max": 999999,
-                    "step": 1,
-                    "display_name": "编号",
-                    "tooltip": "写入文件名 _00001_ 这一段的编号；同一编号重复运行会覆盖原文件。",
                 }),
             },
         }
@@ -104,15 +104,13 @@ class YuanImageGridComposite:
                 row, col = divmod(cell, grid_width)
                 canvas[row * cell_h:(row + 1) * cell_h, col * cell_w:(col + 1) * cell_w, :] = image
 
-        return {
-            "ui": {"images": self._save(canvas, filename_prefix, index)},
-            "result": (canvas.unsqueeze(0),),
-        }
+        self._save(canvas, filename_prefix, index)
+        return (canvas.unsqueeze(0),)
 
     @staticmethod
     def _save(image, filename_prefix, index):
         # 落盘目录与「保存图像」一致：前缀可含子目录与 %变量%，子目录不存在时自动创建
-        full_folder, filename, _, subfolder, _ = folder_paths.get_save_image_path(
+        full_folder, filename, _, _, _ = folder_paths.get_save_image_path(
             filename_prefix,
             folder_paths.get_output_directory(),
             image.shape[1],
@@ -121,7 +119,6 @@ class YuanImageGridComposite:
         file = f"{filename}_{index:05}_.png"
         array = np.clip(image.cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
         Image.fromarray(array).save(os.path.join(full_folder, file), compress_level=4)
-        return [{"filename": file, "subfolder": subfolder, "type": "output"}]
 
 
 NODE_CLASS_MAPPINGS = {
