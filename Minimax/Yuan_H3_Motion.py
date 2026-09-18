@@ -1813,7 +1813,11 @@ class Yuan_H3MotionContextTrim:
     吸附到 17 的倍数，避免打乱剩余潜空间的 VRF 相位导致闪烁），音频按
     40Hz/24fps = 5/3 同步裁步，尾段以 safetensors（latent_%05d_.safetensors）
     保存，输出 LATENT（直连下一片段「H3 运动上下文」的「上下文潜空间」）。
-    跳过解码/重编码无质量损失，但要求两片段分辨率一致。"""
+    跳过解码/重编码无质量损失，但要求两片段分辨率一致。
+
+    「解码模式」：只走「视频图像」的解码段，输出整段 IMAGE+AUDIO，不裁头、
+    不存盘——纯解码器用法。前端在该模式下移除「裁剪帧数」输入端口并隐藏
+    「片段序号」「保存到本地」「存储位置」，后端对应参数一律不读。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1824,14 +1828,18 @@ class Yuan_H3MotionContextTrim:
                                "流）。「视频图像」模式解码后裁切，「潜空间」"
                                "模式直接在其上裁切。"}),
                 # 「衔接模式」放在第一个 widget，与「H3 运动上下文」的同名参数位置一致
-                "衔接模式": (["视频图像", "潜空间"], {
+                "衔接模式": (["视频图像", "解码模式", "潜空间"], {
                     "default": "视频图像",
-                    "tooltip": "衔接数据路径二选一，与「H3 运动上下文」的"
-                               "同名参数保持一致。视频图像——解码为图像+音频"
+                    "tooltip": "数据处理路径三选一。视频图像——解码为图像+音频"
                                "后再裁切，输出 IMAGE+AUDIO，尾段存 .mp4，"
-                               "分辨率可与下一片段不同；潜空间——直接裁切 AV "
-                               "潜空间，输出 LATENT，尾段存 .safetensors，"
-                               "无质量损失但要求两片段分辨率一致。"}),
+                               "分辨率可与下一片段不同；解码模式——与视频图像"
+                               "同源但只解码不裁切：输出整段 IMAGE+AUDIO，"
+                               "不裁头也不存盘，「裁剪帧数」端口随「片段序号」"
+                               "「保存到本地」「存储位置」一并隐藏（该选项"
+                               "仅本节点有，与「H3 运动上下文」的衔接模式无"
+                               "需一致）；潜空间——直接裁切 AV 潜空间，输出"
+                               " LATENT，尾段存 .safetensors，无质量损失但"
+                               "要求两片段分辨率一致。"}),
                 "片段序号": ("INT", {
                     "default": 1, "min": 1, "max": 9999,
                     "tooltip": "本片段在链条中的序号。「视频图像」模式设为2"
@@ -1886,7 +1894,8 @@ class Yuan_H3MotionContextTrim:
     DESCRIPTION = ("按「H3 运动上下文」输出的裁剪帧数字符串\"状态:长度\"对 H3 "
                    "采样器的 AV 潜空间做两段式裁切，尾段存盘供下一片段衔接。"
                    "「视频图像」模式解码为图像+音频后按像素裁切，输出"
-                   "图像/音频；「潜空间」模式直接按整 VRF 组裁切，输出潜空间。")
+                   "图像/音频；「潜空间」模式直接按整 VRF 组裁切，输出潜空间；"
+                   "「解码模式」只解码不裁切，输出整段图像/音频。")
 
     def trim(self, 潜空间, 裁剪帧数=None, 片段序号=1, 保存到本地=True,
              存储位置="H3-Mubu", 衔接模式="视频图像", VAE=None, audio_vae=None):
@@ -1903,6 +1912,11 @@ class Yuan_H3MotionContextTrim:
                 "h3_motion_context: 「视频图像」衔接模式需要连接 audio_vae"
                 "（H3 音频 VAE）以解码音频流；若要直接裁切潜空间请把"
                 "「衔接模式」改为「潜空间」。")
+        # 「解码模式」：只走「视频图像」的解码段，不裁头、不存盘。前端在此模式已移除
+        # 「裁剪帧数」输入端口并隐藏「片段序号」「保存到本地」「存储位置」，故这里
+        # 不读这些参数，原样输出整段图像+音频。
+        if 衔接模式 == "解码模式":
+            return self._decode_only(潜空间, VAE, audio_vae)
         # 解析裁剪帧数字符串"状态:长度"："1:22"→裁头22帧且尾段存22帧；"0:22"→不裁头、
         # 尾段仍存22帧供衔接；兼容纯数字手填输入（按启用语义：n=tail=该值）。
         # 端口未接入：forceInput 输入由前端直接建数据端口、没有同名 widget，未连线时
@@ -1932,34 +1946,12 @@ class Yuan_H3MotionContextTrim:
         n = max(0, n)
         tail = max(0, tail)
         # 像素域裁切：任意帧数均可，无需吸附整组（无 VRF 相位约束）
-        parts = _streams_from_latent(潜空间)
-        if len(parts) < 2:
-            raise ValueError(
-                "h3_motion_context: 裁剪需要含视频和音频两流的 AV 潜空间，"
-                "得到 %d 个流。请连接 H3 采样器的输出。"
-                % len(parts))
-        video, audio = parts[0], parts[1]
-        if video.ndim == 4:
-            video = video.unsqueeze(0)
-        if audio.ndim == 3:
-            audio = audio.unsqueeze(0)
-        # 解码：视频流 → [T,H,W,3] 像素帧；音频流 → [1,2,L] 波形
-        # （VAE 包装器 decode 返回 [B,L,2]，movedim 回 ComfyUI AUDIO
-        # 约定的 [B,声道,样本]）
-        pixels = VAE.decode(video)
-        if pixels.ndim == 5:
-            pixels = pixels[0]
+        pixels, wave, sample_rate = self._decode_av(潜空间, VAE, audio_vae)
         total = int(pixels.shape[0])
         if n >= total:
             raise ValueError(
                 "h3_motion_context: asked to trim %d frames from a %d frame "
                 "clip" % (n, total))
-        sample_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
-        wave = audio_vae.decode(audio)
-        if wave.ndim == 3:
-            wave = wave.movedim(1, -1)  # [1,L,2] → [1,2,L]
-        elif wave.ndim == 2:
-            wave = wave[None].movedim(1, -1)  # [L,2] → [1,2,L]
         audio_cut = int(round(n / float(FPS) * sample_rate))
         audio_cut = min(audio_cut, int(wave.shape[-1]))
         delivered_pixels = pixels[n:]
@@ -1977,6 +1969,40 @@ class Yuan_H3MotionContextTrim:
                            存储位置, 片段序号)
         return (delivered_pixels,
                 {"waveform": delivered_wave, "sample_rate": sample_rate})
+
+    def _decode_av(self, 潜空间, VAE, audio_vae):
+        """AV 潜空间 → 像素帧与波形（「视频图像」与「解码模式」共用的解码段）。
+
+        返回 (pixels [T,H,W,3], wave [B,2,L], sample_rate)。"""
+        parts = _streams_from_latent(潜空间)
+        if len(parts) < 2:
+            raise ValueError(
+                "h3_motion_context: 需要含视频和音频两流的 AV 潜空间，"
+                "得到 %d 个流。请连接 H3 采样器的输出。"
+                % len(parts))
+        video, audio = parts[0], parts[1]
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        if audio.ndim == 3:
+            audio = audio.unsqueeze(0)
+        # 解码：视频流 → [T,H,W,3] 像素帧；音频流 → [1,2,L] 波形
+        # （VAE 包装器 decode 返回 [B,L,2]，movedim 回 ComfyUI AUDIO
+        # 约定的 [B,声道,样本]）
+        pixels = VAE.decode(video)
+        if pixels.ndim == 5:
+            pixels = pixels[0]
+        sample_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
+        wave = audio_vae.decode(audio)
+        if wave.ndim == 3:
+            wave = wave.movedim(1, -1)  # [1,L,2] → [1,2,L]
+        elif wave.ndim == 2:
+            wave = wave[None].movedim(1, -1)  # [L,2] → [1,2,L]
+        return pixels, wave, sample_rate
+
+    def _decode_only(self, 潜空间, VAE, audio_vae):
+        """「解码模式」：把整段 AV 潜空间解码为图像+音频，不裁切、不存盘。"""
+        pixels, wave, sample_rate = self._decode_av(潜空间, VAE, audio_vae)
+        return (pixels, {"waveform": wave, "sample_rate": sample_rate})
 
     def _trim_latent(self, 潜空间, 裁剪帧数=None, 片段序号=1,
                      保存到本地=True, 存储位置="H3-Mubu"):
