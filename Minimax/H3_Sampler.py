@@ -123,7 +123,11 @@ def _euler_step(state, denoised, sigma, sigma_next):
 
 
 def _resize_keyframes(cond, h, w):
-    """关键帧条件的 latent 与生成网格同尺寸，这里缩放到低分辨率网格。"""
+    """关键帧条件的 latent 与生成网格同尺寸，这里缩放到低分辨率网格。
+
+    逐帧做空间缩放，绝不在时间维上插值；缩放后补一次逐通道逐帧均值匹配，
+    抵消 bilinear 带来的颜色漂移（低分辨率网格本就无法表达的方差不予恢复）。
+    """
     out = []
     for tensor, d in cond:
         kfs = d.get("minimax_keyframes")
@@ -136,9 +140,21 @@ def _resize_keyframes(cond, h, w):
             kf = dict(kf)
             lat = kf.get("latent")
             if lat is not None and (lat.shape[-2] != h or lat.shape[-1] != w):
-                kf["latent"] = torch.nn.functional.interpolate(
-                    lat.float(), size=(lat.shape[2], h, w), mode="trilinear", align_corners=False
-                ).to(lat)
+                if lat.ndim == 5:
+                    batch, channels, frames = lat.shape[:3]
+                    resized_latent = torch.nn.functional.interpolate(
+                        lat.float().permute(0, 2, 1, 3, 4).reshape(
+                            batch * frames, channels, lat.shape[-2], lat.shape[-1]),
+                        size=(h, w), mode="bilinear", align_corners=False
+                    )
+                    resized_latent = resized_latent.reshape(batch, frames, channels, h, w).permute(0, 2, 1, 3, 4)
+                else:
+                    resized_latent = torch.nn.functional.interpolate(
+                        lat.float(), size=(h, w), mode="bilinear", align_corners=False
+                    )
+                source_mean = lat.float().mean(dim=(-2, -1), keepdim=True)
+                resized_mean = resized_latent.mean(dim=(-2, -1), keepdim=True)
+                kf["latent"] = (resized_latent + (source_mean - resized_mean)).to(lat)
             resized.append(kf)
         d["minimax_keyframes"] = resized
         out.append((tensor, d))
@@ -356,6 +372,9 @@ class Yuan_H3ProgressiveSampler:
             "h3_sigma_refiner": ("BOOLEAN", {"default": False, "label_on": "Sigma 加密：开启",
                 "label_off": "Sigma 加密：关闭", "display_name": "Sigma 加密",
                 "tooltip": "开启后先对传入 sigmas 做低噪尾部加密，消除高速运动边缘的颗粒与闪烁；关闭则直接使用传入的 sigmas。参数固定为额外步数=1、起始 sigma=0.70、结束 sigma=0.00、间隔=cosine。"}),
+            "upscaler_unload": ("BOOLEAN", {"default": True, "label_on": "放大后卸载：开启",
+                "label_off": "放大后卸载：关闭", "display_name": "放大后卸载",
+                "tooltip": "提升结束后立即把外部提升器从显存卸载，再进入高分辨率阶段。仅在反复复用提升器且显存宽裕时才需要关闭。"}),
         }}
 
     RETURN_TYPES = ("LATENT",)
@@ -369,10 +388,14 @@ class Yuan_H3ProgressiveSampler:
 
     def sample(self, model, positive, vae, latent_image, sampler, sigmas, seed,
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model,
-               highres_tiling=False, h3_sigma_refiner=False):
+               highres_tiling=False, h3_sigma_refiner=False, upscaler_unload=True):
+        if rho == 0.0 and upscaler_model == "none":
+            raise ValueError("H3 渐进式采样器：修正比例为 0 且提升器模型为 none 时，SelfLift-zero 修正与外部"
+                             "提升都被关闭，等于什么都没做。请把修正比例设为大于 0，或选择一个外部 H3 提升器。")
         lifter = None
         if upscaler_model != "none":
-            lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model)
+            lifter = lambda z, hw: h3_upscaler.learned_latent_lift(
+                z, hw, upscaler_model, force_unload=upscaler_unload)
         return (progressive_sample(model, positive, vae, latent_image, sampler, sigmas, seed,
                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
                                    latent_lifter=lifter, highres_tiling=highres_tiling,

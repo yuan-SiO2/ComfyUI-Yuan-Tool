@@ -132,10 +132,12 @@ def _inference_memory_required(model, z0_low, out_hw):
     return feature_elements * model.conv_in.weight.element_size() * 8
 
 
-def learned_latent_lift(z0_low, out_hw, model_name, device=None):
+def learned_latent_lift(z0_low, out_hw, model_name, device=None, force_unload=False):
     """把低分辨率干净端点提升到目标 latent 尺寸。
 
     z0_low：[B, 24, T, h, w] 的 H3 视频 latent，返回 [B, 24, T, H, W]。
+    force_unload：提升结束后（含失败）把提升器从显存卸载。patcher 仍留在
+    _model_cache 中，下次提升重新加载时无需再读文件。
     """
     H, W = out_hw
     if device is None:
@@ -146,15 +148,21 @@ def learned_latent_lift(z0_low, out_hw, model_name, device=None):
     patcher = _load_model(model_name, device)
     model = patcher.model
     memory_required = _inference_memory_required(model, z0_low, (H, W))
-    comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
-    dtype = model.conv_in.weight.dtype
-    # H3 VAE latent 均值/标准差归一化
-    mean = torch.tensor(LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
-    std = torch.tensor(LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+    try:
+        comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
+        dtype = model.conv_in.weight.dtype
+        # H3 VAE latent 均值/标准差归一化
+        mean = torch.tensor(LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+        std = torch.tensor(LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
 
-    x = z0_low.to(device=device, dtype=dtype)
-    with torch.no_grad():
-        x = (x - mean) / std
-        out = model(x, scale=scale, target_size=(z0_low.shape[2], H, W))
-        out = (out * std + mean).float().to(comfy.model_management.intermediate_device())
-    return out
+        x = z0_low.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            x = (x - mean) / std
+            out = model(x, scale=scale, target_size=(z0_low.shape[2], H, W))
+            out = (out * std + mean).float().to(comfy.model_management.intermediate_device())
+        return out
+    finally:
+        if force_unload:
+            # 高分辨率阶段紧接其后且不会再用到提升器，卸载可省下一份常驻权重与工作区
+            comfy.model_management.unload_model_and_clones(patcher, unload_additional_models=False)
+            comfy.model_management.soft_empty_cache()
