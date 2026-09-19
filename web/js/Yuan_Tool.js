@@ -974,8 +974,9 @@ async function yuanH3ContextUploadFile(file, onProgress) {
 
 function registerYuanH3MotionContextTrim(nodeType, portMeta) {
     const LINK_VIDEO = "视频图像"; // 「衔接模式」取值：解码为图像+音频后裁切
+    const LINK_DECODE = "解码模式"; // 「衔接模式」取值：只解码为图像+音频，不裁切、不存盘
     const LINK_LATENT = "潜空间"; // 「衔接模式」取值：直接裁切 AV 潜空间
-    const LINK_VALUES = [LINK_VIDEO, LINK_LATENT];
+    const LINK_VALUES = [LINK_VIDEO, LINK_DECODE, LINK_LATENT];
     // 输出槽定义：两模式类型完全不同（IMAGE+AUDIO ↔ LATENT），切换时整体重建
     const OUT_VIDEO = [{ name: "图像", type: "IMAGE" }, { name: "音频", type: "AUDIO" }];
     const OUT_LATENT = [{ name: "潜空间", type: "LATENT" }];
@@ -984,6 +985,9 @@ function registerYuanH3MotionContextTrim(nodeType, portMeta) {
         { name: "VAE", key: "_yuanH3TrimSavedVaeLink" },
         { name: "audio_vae", key: "_yuanH3TrimSavedAudioVaeLink" },
     ];
+    // 仅裁切模式（视频图像/潜空间）需要：「解码模式」是纯解码，端口移除、参数隐藏
+    const TRIM_PORT = "裁剪帧数";
+    const TRIM_WIDGETS = ["片段序号", "保存到本地", "存储位置"];
 
     // combo 自愈：旧工作流无此 widget 值（位置还原得到 undefined）时兜底为默认值
     const normalizeCombo = (widget, values, fallback) => {
@@ -1111,8 +1115,46 @@ function registerYuanH3MotionContextTrim(nodeType, portMeta) {
                 const mode = normalizeCombo(linkWidget, LINK_VALUES, LINK_VIDEO);
                 self._lastTrimModeValue = mode;
                 const isLatent = mode === LINK_LATENT;
+                const isDecode = mode === LINK_DECODE;
 
-                // 1) 解码端口仅「视频图像」模式存在（离开时保存连接、返回时恢复）
+                // 0) 「裁剪帧数」端口仅裁切模式需要：解码模式移除（离开时保存连接、返回时恢复）。
+                //    端口按名字恢复，加载期前端按「名字」对齐存档连线，故端口次序变动不丢连线。
+                {
+                    const inp = self.inputs && self.inputs.find((i) => i.name === TRIM_PORT);
+                    if (isDecode) {
+                        if (inp && inp.link != null) {
+                            const l = yuanH3LinkObj(app.graph, inp.link);
+                            if (l) self._yuanH3TrimSavedTrimLink = { origin_id: l.origin_id, origin_slot: l.origin_slot };
+                        }
+                        if (inp) {
+                            const idx = self.inputs.findIndex((i) => i.name === TRIM_PORT);
+                            if (idx !== -1) self.removeInput(idx);
+                        }
+                    } else if (!inp) {
+                        const meta = (portMeta && portMeta[TRIM_PORT]) || {};
+                        yuanEnsureInput(self, TRIM_PORT, "STRING", {
+                            optional: true, tooltip: meta.tooltip,
+                        });
+                        const saved = self._yuanH3TrimSavedTrimLink;
+                        self._yuanH3TrimSavedTrimLink = null;
+                        if (saved && app && app.graph && typeof app.graph.getNodeById === "function") {
+                            const ni = self.inputs.find((i) => i.name === TRIM_PORT);
+                            const ts = self.inputs.indexOf(ni);
+                            const origin = app.graph.getNodeById(saved.origin_id);
+                            if (origin) { try { origin.connect(saved.origin_slot, self, ts); } catch (_) {} }
+                        }
+                    }
+                }
+
+                // 0b) 解码模式隐藏「片段序号」「保存到本地」「存储位置」（widget 保留但不可见，
+                //     值仍随工作流序列化，切回裁切模式即恢复显示）；V3 下另清掉其空端口占位
+                for (const nm of TRIM_WIDGETS) {
+                    const wd = self.widgets && self.widgets.find((x) => x.name === nm);
+                    if (wd) wd.hidden = isDecode;
+                }
+                if (isDecode) yuanRemoveHiddenWidgetPorts(self, TRIM_WIDGETS);
+
+                // 1) 解码端口仅「潜空间」模式移除（视频图像/解码模式都要解码，离开时保存连接、返回时恢复）
                 for (const spec of DECODE_PORTS) {
                     const inp = self.inputs && self.inputs.find((i) => i.name === spec.name);
                     if (isLatent) {
