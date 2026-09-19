@@ -135,7 +135,11 @@ class YUAN_TXTJsonExtractor:
             "optional": {
                 "开关配置": (AnyType("*"), {
                     "forceInput": True,
-                    "tooltip": "接「JSON提取开关」输出，传入七项开关；未接入时按默认值执行（仅情节输出默认整合格式，其余开启）。"
+                    "tooltip": "接「JSON提取开关」输出，传入八项开关；未接入时按默认值执行（情节输出与情节衔接默认关闭，其余开启）。"
+                }),
+                "情节衔接文本": (AnyType("*"), {
+                    "forceInput": True,
+                    "tooltip": "接外部文本。情节衔接开启时，分镜序列中场景描述行的场景全名保留、「，」之后的描述替换为该文本；关闭或未接入时输出原场景档案描述。"
                 }),
             },
         }
@@ -328,6 +332,15 @@ class YUAN_TXTJsonExtractor:
         return prefix.strip()
 
     @staticmethod
+    def _apply_plot_link(scene_desc, link_text):
+        """情节衔接：保留场景全名，把第一个逗号（中/英文）后的描述替换为 link_text；无逗号时名称即全文，名称后补「，」再接 link_text。"""
+        for sep in ("，", ","):
+            if sep in scene_desc:
+                name = scene_desc.split(sep)[0].strip()
+                return f"{name}，{link_text}"
+        return f"{scene_desc.strip()}，{link_text}"
+
+    @staticmethod
     def _match_scene_index(title, scenes):
         """根据分镜标题智能匹配场景档案索引：标题取「-」前部分、档案取「，」前部分，双向包含匹配，匹配不到返回 -1。"""
         if not title or not isinstance(scenes, list) or not scenes:
@@ -490,15 +503,15 @@ class YUAN_TXTJsonExtractor:
                     next_num += 1
         return audio_by_tag, speaking_tags, winners
 
-    # 七个选项开关的聚合键序（「JSON提取开关」子节点的输出与其一致）
-    SWITCH_KEYS = ("角色开关", "音色开关", "道具开关", "场景开关", "BGM开关", "情节开关", "台词开关")
-    # 未接入子节点时的默认值（除情节输出默认整合格式外，其余默认开启）
-    SWITCH_DEFAULTS = (True, True, True, True, True, False, True)
+    # 八个选项开关的聚合键序（「JSON提取开关」子节点的输出与其一致）
+    SWITCH_KEYS = ("角色开关", "音色开关", "道具开关", "场景开关", "BGM开关", "情节开关", "台词开关", "情节衔接开关")
+    # 未接入子节点时的默认值（除情节输出、情节衔接默认关闭外，其余默认开启）
+    SWITCH_DEFAULTS = (True, True, True, True, True, False, True, False)
 
     @classmethod
     def _parse_switch_config(cls, 开关配置):
-        """解析「开关配置」为七个布尔值元组：None→默认值；dict→按键名取值（缺失键取默认）；
-        7元列表/元组→按 SWITCH_KEYS 顺序取值；其他类型容错回退默认值。"""
+        """解析「开关配置」为八个布尔值元组：None→默认值；dict→按键名取值（缺失键取默认）；
+        8元列表/元组→按 SWITCH_KEYS 顺序取值；其他类型容错回退默认值。"""
         if 开关配置 is None:
             return cls.SWITCH_DEFAULTS
         values = dict(zip(cls.SWITCH_KEYS, cls.SWITCH_DEFAULTS))
@@ -513,9 +526,11 @@ class YUAN_TXTJsonExtractor:
                     values[k] = v
         return tuple(values[k] for k in cls.SWITCH_KEYS)
 
-    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 开关配置=None):
-        # 形参名与输入端口名一致；七个选项开关来自「开关配置」（未接入时取默认值）
-        角色开关, 音色开关, 道具开关, 场景开关, BGM开关, 情节开关, 台词开关 = self._parse_switch_config(开关配置)
+    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 开关配置=None, 情节衔接文本=None):
+        # 形参名与输入端口名一致；八个选项开关来自「开关配置」（未接入时取默认值）
+        角色开关, 音色开关, 道具开关, 场景开关, BGM开关, 情节开关, 台词开关, 情节衔接开关 = self._parse_switch_config(开关配置)
+        # 情节衔接文本：未接入时不参与替换（空文本同样不替换）
+        衔接文本 = self._list_to_lines(情节衔接文本).strip() if 情节衔接文本 is not None else ""
         data = json
 
         # 字符串自动解析为 dict（支持多个 JSON 对象拼接合并）
@@ -636,6 +651,9 @@ class YUAN_TXTJsonExtractor:
             场景描述 = ""
             if idx >= 0 and isinstance(场景档案数据, list) and idx < len(场景档案数据) and 场景档案数据[idx] is not None:
                 场景描述 = str(场景档案数据[idx])
+            # 情节衔接：开关开启且接入衔接文本时，保留场景全名、把「，」后的描述替换为衔接文本
+            if 情节衔接开关 and 衔接文本 and 场景描述:
+                场景描述 = self._apply_plot_link(场景描述, 衔接文本)
 
             # 角色/道具/场景索引：对应档案的 0 基序号，未匹配为空；由对应输出开关控制，关时输出空文本
             角色索引 = ",".join(str(i) for i in char_indices) if 角色开关 else ""
@@ -733,7 +751,7 @@ class YUAN_TXTJsonExtractor:
         }
 
 
-# ==== JSON提取开关（JSON提取 的子节点）：七个选项开关聚合为单个「开关配置」端口输出 ====
+# ==== JSON提取开关（JSON提取 的子节点）：八个选项开关聚合为单个「开关配置」端口输出 ====
 
 class YUAN_TXTJsonSwitch:
     # 输出接「JSON提取」的「开关配置」可选端口；未接入时 JSON提取 按默认值执行
@@ -792,6 +810,13 @@ class YUAN_TXTJsonSwitch:
                     "display_name": "台词保护",
                     "tooltip": "开=引号对与 <d>...</d> 内的名称不替换、原文保留；关=整段正常替换。",
                 }),
+                "情节衔接开关": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "替换描述",
+                    "label_off": "原场景",
+                    "display_name": "情节衔接",
+                    "tooltip": "开=分镜序列中场景描述行保留场景全名、把「，」后的描述替换为「情节衔接文本」接入的文本；关=输出原场景档案描述。"
+                }),
             },
         }
 
@@ -800,7 +825,7 @@ class YUAN_TXTJsonSwitch:
     FUNCTION = "get_switches"
     CATEGORY = "Yuan Tool/文本"
 
-    def get_switches(self, 角色开关, 音色开关, 道具开关, 场景开关, BGM开关, 情节开关, 台词开关):
+    def get_switches(self, 角色开关, 音色开关, 道具开关, 场景开关, BGM开关, 情节开关, 台词开关, 情节衔接开关):
         # 聚合为开关配置 dict，须包在元组中返回（裸 dict 会被 ComfyUI 当作 ui/result/expand 特殊返回，
         # 导致零输出、下游 IndexError）；键序与 YUAN_TXTJsonExtractor.SWITCH_KEYS 一致
         return ({
@@ -811,6 +836,7 @@ class YUAN_TXTJsonSwitch:
             "BGM开关": BGM开关,
             "情节开关": 情节开关,
             "台词开关": 台词开关,
+            "情节衔接开关": 情节衔接开关,
         },)
 
 
