@@ -52,7 +52,11 @@ def _tile_payload(payload, context, video, audio, axis, start, end):
     if payload.get("keyframes"):
         keyframes = []
         for keyframe in payload["keyframes"]:
-            latent = keyframe["latent"]
+            latent = keyframe.get("latent")
+            if latent is None:
+                # 纯音频锚点没有视频 latent，不占空间维，原样沿用
+                keyframes.append(keyframe)
+                continue
             if latent.shape[-2:] != (height, width):
                 raise ValueError("H3 渐进式采样器：分块模式下 H3 关键帧必须与目标 latent 的高宽一致")
             region = latent.narrow(axis, start, end - start)
@@ -60,7 +64,8 @@ def _tile_payload(payload, context, video, audio, axis, start, end):
                 region, (1, 2, 2)).contiguous()})
         tiled["keyframes"] = keyframes
         # 参考条件不参与裁切，其行数由自身尺寸决定、不随分块变化，直接沿用
-        tiled["cond_video_latents"] = [keyframe["latent"] for keyframe in keyframes] + [
+        # 只把带 latent 的关键帧计入 cond_video_latents，与核心口径保持一致
+        tiled["cond_video_latents"] = [kf["latent"] for kf in keyframes if kf.get("latent") is not None] + [
             ref["latent"] for ref in (payload.get("refs") or []) if "latent" in ref]
     tile_height = end - start if axis == 3 else height
     tile_width = end - start if axis == 4 else width
@@ -145,7 +150,11 @@ def _condition_elements(condition, tile_height, tile_width, channels):
     text = condition.get("cross_attn")
     elements = text.shape[-2] * channels * 4 if text is not None else 0
     for keyframe in condition.get("minimax_keyframes") or []:
-        shape = keyframe["latent"].shape
+        latent = keyframe.get("latent")
+        if latent is None:
+            # 纯音频锚点不占视频空间
+            continue
+        shape = latent.shape
         elements += shape[1] * shape[2] * tile_height * tile_width
     for reference in condition.get("minimax_refs") or []:
         latent = reference.get("latent")
