@@ -125,7 +125,7 @@ class YUAN_TXTJsonExtractor:
                     "default": 1,
                     "min": 1,
                     "step": 1,
-                    "tooltip": "选择「编号」分镜。分镜序列输出：定义块 + 整体风格 + [Shot N]时间段 + 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>，情节开时输出情节纯文本）；索引输出各档案 0 基序号，索引时长取「类型」时长。"
+                    "tooltip": "选择「编号」分镜。分镜序列输出：定义块 + 整体风格 + [Shot N]时间段 + 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>，情节开时输出情节纯文本）；定义块 <Picture N> 行只输出「补充：」之前的内容（中英文冒号与大小写兼容）；索引输出各档案 0 基序号，索引时长取「类型」时长。"
                 }),
                 "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
                     "default": "角色档案",
@@ -205,13 +205,33 @@ class YUAN_TXTJsonExtractor:
         return data
 
     @staticmethod
-    def _extract_name(entry):
-        """从档案条目中提取名称（第一个逗号前的部分）。"""
-        s = str(entry) if entry is not None else ""
+    def _before_first_comma(s):
+        """取第一个中/英文逗号之前的部分（无逗号返回整串）；按最早出现的分隔符切分——档案描述里常含另一种逗号，不能固定优先某一种。"""
+        text = str(s) if s is not None else ""
+        cut = -1
         for sep in ("，", ","):
-            if sep in s:
-                return s.split(sep)[0].strip()
-        return s.strip()
+            p = text.find(sep)
+            if p != -1 and (cut == -1 or p < cut):
+                cut = p
+        return (text[:cut] if cut != -1 else text).strip()
+
+    @staticmethod
+    def _extract_name(entry):
+        """从档案条目中提取名称（第一个中/英文逗号前的部分）。"""
+        return YUAN_TXTJsonExtractor._before_first_comma(entry)
+
+    # 「补充」截断标记：中文「补充」/英文 supplement 均可，冒号兼容中英文（：/:），忽略大小写
+    SUPPLEMENT_RE = re.compile(r'(?:补充|supplement)\s*[：:]', re.IGNORECASE)
+
+    @staticmethod
+    def _strip_supplement(text):
+        """截断档案描述中「补充：」及其后的内容，并去掉标记前的尾部分隔符；无标记时原样返回。"""
+        if not text:
+            return text
+        m = YUAN_TXTJsonExtractor.SUPPLEMENT_RE.search(text)
+        if not m:
+            return text
+        return text[:m.start()].rstrip(" \t；;，,、。.")
 
     @staticmethod
     def _find_appearing_indices(text, char_names, prop_names):
@@ -334,11 +354,8 @@ class YUAN_TXTJsonExtractor:
     @staticmethod
     def _apply_plot_link(scene_desc, link_text):
         """情节衔接：保留场景全名，把第一个逗号（中/英文）后的描述替换为 link_text；无逗号时名称即全文，名称后补「，」再接 link_text。"""
-        for sep in ("，", ","):
-            if sep in scene_desc:
-                name = scene_desc.split(sep)[0].strip()
-                return f"{name}，{link_text}"
-        return f"{scene_desc.strip()}，{link_text}"
+        name = YUAN_TXTJsonExtractor._before_first_comma(scene_desc)
+        return f"{name}，{link_text}"
 
     @staticmethod
     def _match_scene_index(title, scenes):
@@ -349,13 +366,7 @@ class YUAN_TXTJsonExtractor:
         if not prefix:
             return -1
         for idx, scene in enumerate(scenes):
-            scene_str = str(scene) if scene is not None else ""
-            scene_name = scene_str
-            for sep in ("，", ","):
-                if sep in scene_name:
-                    scene_name = scene_name.split(sep)[0]
-                    break
-            scene_name = scene_name.strip()
+            scene_name = YUAN_TXTJsonExtractor._before_first_comma(scene)
             if not scene_name:
                 continue
             if prefix in scene_name or scene_name in prefix:
@@ -374,10 +385,7 @@ class YUAN_TXTJsonExtractor:
                 continue
             name = str(entry)
             if name not in index_map:
-                for sep in ("，", ","):
-                    if sep in name:
-                        name = name.split(sep)[0].strip()
-                        break
+                name = YUAN_TXTJsonExtractor._before_first_comma(name)
             if name in index_map:
                 idx = index_map[name]
                 if idx not in result:
@@ -408,13 +416,7 @@ class YUAN_TXTJsonExtractor:
             if not m:
                 continue
             desc = m.group(2)
-            name = ""
-            for sep in ("，", ","):
-                if sep in desc:
-                    name = desc.split(sep)[0].strip()
-                    break
-            if not name:
-                name = desc.strip()
+            name = YUAN_TXTJsonExtractor._before_first_comma(desc)
             if name:
                 pairs.append((name, f"<Picture {m.group(1)}>"))
         return pairs
@@ -672,7 +674,8 @@ class YUAN_TXTJsonExtractor:
                 if 情节开关:
                     角色道具场景 = "\n".join(输出块) + "\n"
                 else:
-                    编号行 = [f"<Picture {i + 1}>：{d}" for i, d in enumerate(输出块)]
+                    # <Picture N> 行只输出「补充」标记之前的内容（补充后的英文/道具补充描述不输出）
+                    编号行 = [f"<Picture {i + 1}>：{self._strip_supplement(d)}" for i, d in enumerate(输出块)]
                     角色道具场景 = "retention_analysis:\n" + "\n".join(编号行) + "\n"
             else:
                 角色道具场景 = ""
