@@ -139,7 +139,7 @@ class YUAN_TXTJsonExtractor:
                 }),
                 "情节衔接文本": (AnyType("*"), {
                     "forceInput": True,
-                    "tooltip": "接外部文本。情节衔接开启时，分镜序列中场景描述行的场景全名保留、「，」之后的描述替换为该文本；关闭或未接入时输出原场景档案描述。"
+                    "tooltip": "接外部文本。情节衔接开启时，在分镜序列定义块中场景行之后新增一行（编号顺延，如场景为 <Picture 3> 则新增 <Picture 4>），内容为该文本原文；关闭或未接入时不新增。"
                 }),
             },
         }
@@ -352,12 +352,6 @@ class YUAN_TXTJsonExtractor:
         return prefix.strip()
 
     @staticmethod
-    def _apply_plot_link(scene_desc, link_text):
-        """情节衔接：保留场景全名，把第一个逗号（中/英文）后的描述替换为 link_text；无逗号时名称即全文，名称后补「，」再接 link_text。"""
-        name = YUAN_TXTJsonExtractor._before_first_comma(scene_desc)
-        return f"{name}，{link_text}"
-
-    @staticmethod
     def _match_scene_index(title, scenes):
         """根据分镜标题智能匹配场景档案索引：标题取「-」前部分、档案取「，」前部分，双向包含匹配，匹配不到返回 -1。"""
         if not title or not isinstance(scenes, list) or not scenes:
@@ -531,7 +525,7 @@ class YUAN_TXTJsonExtractor:
     def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 开关配置=None, 情节衔接文本=None):
         # 形参名与输入端口名一致；八个选项开关来自「开关配置」（未接入时取默认值）
         角色开关, 音色开关, 道具开关, 场景开关, BGM开关, 情节开关, 台词开关, 情节衔接开关 = self._parse_switch_config(开关配置)
-        # 情节衔接文本：未接入时不参与替换（空文本同样不替换）
+        # 情节衔接文本：未接入时不新增行（空文本同样不新增）
         衔接文本 = self._list_to_lines(情节衔接文本).strip() if 情节衔接文本 is not None else ""
         data = json
 
@@ -653,16 +647,13 @@ class YUAN_TXTJsonExtractor:
             场景描述 = ""
             if idx >= 0 and isinstance(场景档案数据, list) and idx < len(场景档案数据) and 场景档案数据[idx] is not None:
                 场景描述 = str(场景档案数据[idx])
-            # 情节衔接：开关开启且接入衔接文本时，保留场景全名、把「，」后的描述替换为衔接文本
-            if 情节衔接开关 and 衔接文本 and 场景描述:
-                场景描述 = self._apply_plot_link(场景描述, 衔接文本)
 
             # 角色/道具/场景索引：对应档案的 0 基序号，未匹配为空；由对应输出开关控制，关时输出空文本
             角色索引 = ",".join(str(i) for i in char_indices) if 角色开关 else ""
             道具索引 = ",".join(str(i) for i in prop_indices) if 道具开关 else ""
             场景索引 = (str(idx) if idx >= 0 else "") if 场景开关 else ""
 
-            # 按开关过滤：先角色再道具最后场景；情节模式为纯描述文本，否则加 retention_analysis: 前缀与 <Picture N> 序号
+            # 按开关过滤：先角色再道具最后场景；情节衔接开启时在场景行之后追加一行（内容为衔接文本原文，不替换场景描述）
             输出块 = []
             if 角色开关:
                 输出块.extend(角色描述列表)
@@ -670,15 +661,17 @@ class YUAN_TXTJsonExtractor:
                 输出块.extend(道具描述列表)
             if 场景开关 and 场景描述:
                 输出块.append(场景描述)
-            if 输出块:
-                if 情节开关:
-                    角色道具场景 = "\n".join(输出块) + "\n"
-                else:
-                    # <Picture N> 行只输出「补充」标记之前的内容（补充后的英文/道具补充描述不输出）
-                    编号行 = [f"<Picture {i + 1}>：{self._strip_supplement(d)}" for i, d in enumerate(输出块)]
-                    角色道具场景 = "retention_analysis:\n" + "\n".join(编号行) + "\n"
+            衔接行 = 衔接文本 if (情节衔接开关 and 衔接文本) else ""
+            if 情节开关:
+                行列表 = 输出块 + ([衔接行] if 衔接行 else [])
+                角色道具场景 = ("\n".join(行列表) + "\n") if 行列表 else ""
             else:
-                角色道具场景 = ""
+                # <Picture N> 行只输出「补充」标记之前的内容（补充后的英文/道具补充描述不输出）；
+                # 情节衔接行按原文输出、编号顺延（场景为 <Picture 3> 时衔接行即 <Picture 4>）
+                行列表 = [f"<Picture {i + 1}>：{self._strip_supplement(d)}" for i, d in enumerate(输出块)]
+                if 衔接行:
+                    行列表.append(f"<Picture {len(行列表) + 1}>：{衔接行}")
+                角色道具场景 = ("retention_analysis:\n" + "\n".join(行列表) + "\n") if 行列表 else ""
 
             # 索引时长：优先取「类型」字段中的时长；未含数字时回退为时间段文本中的最大结束时间
             索引时长 = self._type_duration_seconds(matched_type)
@@ -815,10 +808,10 @@ class YUAN_TXTJsonSwitch:
                 }),
                 "情节衔接开关": ("BOOLEAN", {
                     "default": False,
-                    "label_on": "替换描述",
-                    "label_off": "原场景",
+                    "label_on": "新增行",
+                    "label_off": "不新增",
                     "display_name": "情节衔接",
-                    "tooltip": "开=分镜序列中场景描述行保留场景全名、把「，」后的描述替换为「情节衔接文本」接入的文本；关=输出原场景档案描述。"
+                    "tooltip": "开=分镜序列定义块在场景行之后新增一行「<Picture N>：情节衔接文本」（编号顺延），场景描述行原样输出；关=不新增。"
                 }),
             },
         }
