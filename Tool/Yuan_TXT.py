@@ -34,8 +34,12 @@ QUOTE_PAIRS = [
     ("“",  "”",  3),
     ("‘",  "’",  4),
     ("「", "」", 5),
-    ("『", "』", 6),
+    ('『', "』", 6),
 ]
+
+# 半角撇号作缩写/所有格（谢枕's、<Picture 1>'s、swordsman's）时不算引号边界；
+# 仅当前一字符属于下列「引号起始上下文」（空白或左括号/引号/分隔标点）时，才把它当引号处理
+APOSTROPHE_OPENER_CHARS = frozenset(" \t\r\n([{<“‘「『（【《，,:：;；、—")
 
 
 def _build_quote_protect_mask(text):
@@ -56,6 +60,10 @@ def _build_quote_protect_mask(text):
     i = 0
     while i < n:
         ch = text[i]
+        # 后接字母的半角撇号：若前一字符不是引号起始上下文，视为缩写/所有格（谢枕's、<Picture 1>'s），跳过不参与配对
+        if ch == "'" and i + 1 < n and text[i + 1].isalpha() and i > 0 and text[i - 1] not in APOSTROPHE_OPENER_CHARS:
+            i += 1
+            continue
         # 尝试作为 opening：半角引号 " / ' 既可开也可关，同 rank 未闭合栈顶在则作 closing（优先关闭）
         if ch in opening_map:
             if ch in ('"', "'"):
@@ -125,7 +133,7 @@ class YUAN_TXTJsonExtractor:
                     "default": 1,
                     "min": 1,
                     "step": 1,
-                    "tooltip": "选择「编号」分镜。分镜序列输出：定义块 + 整体风格 + [Shot N]时间段 + 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>，情节开时输出情节纯文本）；定义块 <Picture N> 行只输出「补充：」之前的内容（中英文冒号与大小写兼容）；索引输出各档案 0 基序号，索引时长取「类型」时长。"
+                    "tooltip": "选择「编号」分镜。分镜序列输出：定义块 + 首段时间段 + [Shot N]后续时间段 + 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>，情节开时输出情节纯文本）；定义块 <Picture N> 行只输出「补充：」之前的内容（中英文冒号与大小写兼容）；索引输出各档案 0 基序号，索引时长取「类型」时长。"
                 }),
                 "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
                     "default": "角色档案",
@@ -311,8 +319,8 @@ class YUAN_TXTJsonExtractor:
         return float(m.group(1))
 
     @staticmethod
-    def _build_detailed_description(整体风格, 时间段, 环境音, BGM, 类型="", bgm_enabled=True):
-        """整合分镜序列：整体风格 → [Shot N]时间段 → 环境音 → BGM；武戏不加编号；bgm_enabled=False 时 BGM 输出 N/A。"""
+    def _build_detailed_description(时间段, 环境音, BGM, 类型="", bgm_enabled=True):
+        """整合分镜序列：首段时间段 → [Shot N]后续时间段 → 环境音 → BGM；武戏不加编号；bgm_enabled=False 时 BGM 输出 N/A。"""
         if isinstance(时间段, str):
             shot_lines = 时间段.split("\n") if 时间段.strip() else []
         elif isinstance(时间段, list):
@@ -320,18 +328,19 @@ class YUAN_TXTJsonExtractor:
         else:
             shot_lines = []
         is_action = "武戏" in str(类型 or "")
-        # 时间段逐行编号 [Shot N]（武戏不加编号），跳过空行，编号连续
+        # 首段时间段作为 detailed_description 首段（不加编号）；第二段起编号 [Shot N]（武戏不加编号），跳过空行，编号连续
         numbered = []
         for line in shot_lines:
             s = str(line) if line is not None else ""
-            if s.strip():
-                if is_action:
-                    numbered.append(s)
-                else:
-                    numbered.append(f"[Shot {len(numbered) + 1}] {s}")
-        blocks = ["detailed_description:" + ("\n" + 整体风格 if 整体风格 else "")]
-        if numbered:
-            blocks.append("\n\n".join(numbered))
+            if not s.strip():
+                continue
+            if not numbered or is_action:
+                numbered.append(s)
+            else:
+                numbered.append(f"[Shot {len(numbered)}] {s}")
+        blocks = ["detailed_description:" + ("\n" + numbered[0] if numbered else "")]
+        if len(numbered) > 1:
+            blocks.append("\n\n".join(numbered[1:]))
         blocks.append("overall_soundscape:" + ("\n" + 环境音 if 环境音 else ""))
         if bgm_enabled:
             blocks.append("non_diegetic_music:" + ("\n" + BGM if BGM else ""))
@@ -597,7 +606,7 @@ class YUAN_TXTJsonExtractor:
         if 情节开关 and 情节条目 is not None and str(情节条目.get("情节") or "").strip():
             分镜序列整合 = str(情节条目.get("情节"))
         else:
-            分镜序列整合 = self._build_detailed_description(整体风格, 时间段, 环境音, BGM, matched_type, BGM开关)
+            分镜序列整合 = self._build_detailed_description(时间段, 环境音, BGM, matched_type, BGM开关)
 
         # 角色道具场景定义（内部变量）：按 角色→道具→场景 顺序生成档案完整描述，供前置与名称替换
         # 角色/道具/场景索引：匹配到的档案 0 基序号（角色/道具逗号分隔，场景单个），未匹配为空
