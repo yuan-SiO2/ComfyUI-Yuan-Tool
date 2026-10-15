@@ -187,13 +187,14 @@ def _basic_guider_sample(model, noise, positive, sampler, sigmas, latent_image,
                          callback=callback, disable_pbar=disable_pbar, seed=seed)
 
 
-def progressive_sample(model, positive, vae, latent_image, sampler, sigmas, seed,
+def progressive_sample(low_res_model, positive, vae, latent_image, sampler, sigmas, seed,
                        transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None,
-                       highres_tiling=False, h3_sigma_refiner=False):
+                       highres_tiling=False, h3_sigma_refiner=False, high_res_model=None):
     """渐进分辨率采样主体流程。
 
     低分辨率前缀 → 过渡（预测端点、成对提升、伪影修正、重新加噪）→ 全分辨率收尾，
-    整个调度保持原有 NFE 次数。
+    整个调度保持原有 NFE 次数。低分辨率前缀使用 low_res_model；分辨率提升后的收尾使用
+    high_res_model，未接入时沿用 low_res_model（与 SelfLift 双模型语义一致）。
     """
     if h3_sigma_refiner:
         sigmas = _refine_sigmas(sigmas)
@@ -208,13 +209,17 @@ def progressive_sample(model, positive, vae, latent_image, sampler, sigmas, seed
         raise ValueError("H3 渐进式采样器：权重必须满足 0 <= 修正强度下限 <= 修正强度上限 <= 1")
     _validate_latent_input(latent_image)
 
+    model = low_res_model
     model_sampling = model.get_model_object("model_sampling")
     _validate_sampling(model_sampling, sampler)
 
     streams, nested = _streams(comfy.sample.fix_empty_latent_channels(
         model, latent_image["samples"], latent_image.get("downscale_ratio_spacial", None),
         latent_image.get("downscale_ratio_temporal", None)))
-    high_model = h3_tiling.tiled_model(model, [tuple(stream.shape) for stream in streams]) if highres_tiling else model
+    # 高分辨率收尾阶段使用的模型：接入 high_res_model 时用高分辨率模型，未接入时沿用低分辨率模型
+    hires_base = high_res_model if high_res_model is not None else model
+    _validate_sampling(hires_base.get_model_object("model_sampling"), sampler)
+    high_model = h3_tiling.tiled_model(hires_base, [tuple(stream.shape) for stream in streams]) if highres_tiling else hires_base
     video = streams[0].ndim == 5
     if video:
         b, c, t, H, W = streams[0].shape
@@ -339,7 +344,8 @@ class Yuan_H3ProgressiveSampler:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "model": ("MODEL", {"display_name": "模型"}),
+            "low_res_model": ("MODEL", {"display_name": "低分辨率模型",
+                "tooltip": "低分辨率前缀使用的模型：前 transition_step 次去噪评估。未接入高分辨率模型时，本模型也负责分辨率提升后的收尾阶段。"}),
             "positive": ("CONDITIONING", {"display_name": "正向条件",
                 "tooltip": "唯一条件输入。本节点按原生“基本引导器”语义采样：只使用正条件、不做 CFG，因此不需要负条件与 cfg。"}),
             "vae": ("VAE", {"display_name": "视频VAE",
@@ -366,6 +372,8 @@ class Yuan_H3ProgressiveSampler:
                 "tooltip": "修正强度上限。SelfLift-zero 诊断建议保持 1.0。"}),
             "upscaler_model": _upscaler_input(),
         }, "optional": {
+            "high_res_model": ("MODEL", {"display_name": "高分辨率模型",
+                "tooltip": "高分辨率阶段模型：分辨率提升后的收尾采样使用。不接时沿用低分辨率模型。两阶段必须使用兼容的架构、latent 格式、采样参数化与 VAE。"}),
             "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启",
                 "label_off": "高分辨率分块：关闭", "display_name": "高分辨率分块",
                 "tooltip": "实验性：在高分辨率准备阶段根据可用显存选择 1–8 个空间分块。音频输入与参考条件保持完整，音频预测取各块平均。质量与速度可能变化。"}),
@@ -384,11 +392,13 @@ class Yuan_H3ProgressiveSampler:
     CATEGORY = "Yuan Tool/MiniMax"
     DESCRIPTION = ("H3 渐进式采样器：先在空间降采样的 latent 上跑前段采样步，把干净端点提升到"
                    "目标分辨率并在过渡 sigma 处重新加噪，再以全分辨率跑完剩余调度。采样只使用"
-                   "正条件、不做 CFG；过渡点可选像素-VAE 锚点修正，用于抑制提升引入的伪影。")
+                   "正条件、不做 CFG；过渡点可选像素-VAE 锚点修正，用于抑制提升引入的伪影。"
+                   "支持双模型接入：低分辨率前缀用低分辨率模型，收尾阶段可另接高分辨率模型，"
+                   "不接时沿用低分辨率模型。")
 
-    def sample(self, model, positive, vae, latent_image, sampler, sigmas, seed,
+    def sample(self, low_res_model, positive, vae, latent_image, sampler, sigmas, seed,
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model,
-               highres_tiling=False, h3_sigma_refiner=False, upscaler_unload=True):
+               high_res_model=None, highres_tiling=False, h3_sigma_refiner=False, upscaler_unload=True):
         if rho == 0.0 and upscaler_model == "none":
             raise ValueError("H3 渐进式采样器：修正比例为 0 且提升器模型为 none 时，SelfLift-zero 修正与外部"
                              "提升都被关闭，等于什么都没做。请把修正比例设为大于 0，或选择一个外部 H3 提升器。")
@@ -396,10 +406,10 @@ class Yuan_H3ProgressiveSampler:
         if upscaler_model != "none":
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(
                 z, hw, upscaler_model, force_unload=upscaler_unload)
-        return (progressive_sample(model, positive, vae, latent_image, sampler, sigmas, seed,
+        return (progressive_sample(low_res_model, positive, vae, latent_image, sampler, sigmas, seed,
                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
                                    latent_lifter=lifter, highres_tiling=highres_tiling,
-                                   h3_sigma_refiner=h3_sigma_refiner),)
+                                   h3_sigma_refiner=h3_sigma_refiner, high_res_model=high_res_model),)
 
 
 NODE_CLASS_MAPPINGS = {
