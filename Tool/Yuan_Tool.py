@@ -136,13 +136,8 @@ class YuanTool:
             prepare(background, target_size, preserve_full=False) if background is not None else None
         )
 
-        # 背景帧数与每图帧数一致；slot1 额外 1 帧用于 VAE 8 帧分组对齐（无主体或帧数为 1 时无意义）
-        bg_frame_count = frame_multiplier if background_image is not None else 0
-        first_slot_extra = 1 if (subjects and frame_multiplier > 1) else 0
-        frame_count = len(subjects) * frame_multiplier + first_slot_extra + bg_frame_count
-        frames = self._expand_frames_with_info(
-            subjects, background_image, frame_multiplier, frame_count
-        )
+        # 背景帧数与每图帧数一致；首帧额外 1 帧用于 VAE 8 帧分组对齐（无主体或帧数为 1 时无意义）
+        frames = self._expand_frames(subjects, background_image, frame_multiplier)
 
         # 有帧则堆叠输出；完全无有效输入时输出 1 张 64×64 全黑空图（与 GetImage 兜底一致）
         if frames:
@@ -224,27 +219,18 @@ class YuanTool:
         )
 
     @staticmethod
-    def _expand_frames_with_info(subjects, background, frame_multiplier, frame_count):
+    def _expand_frames(subjects, background, frame_multiplier):
+        """按每图帧数展开主体帧，并在末尾追加背景帧；首帧额外 +1 用于 VAE 分组对齐。"""
         frames = []
 
-        # slot1 额外 1 帧吸收 VAE 的独立首帧（frame 0 不参与 8 帧分组），使后续帧边界对齐 8 帧分组、避免混合帧
+        # 首帧额外 1 帧吸收 VAE 的独立首帧（frame 0 不参与 8 帧分组），使后续帧边界对齐 8 帧分组
         for index, image in enumerate(subjects):
             extra = 1 if (index == 0 and frame_multiplier > 1) else 0
-            repeats = frame_multiplier + extra
-            frames.extend([image] * repeats)
+            frames.extend([image] * (frame_multiplier + extra))
 
-        # 仅当提供了背景图时才添加背景帧（帧数与 frame_multiplier 一致）
+        # 仅当提供了背景图时才添加背景帧
         if background is not None:
             frames.extend([background] * frame_multiplier)
-
-        if len(frames) > frame_count:
-            frames = frames[:frame_count]
-        elif len(frames) < frame_count:
-            # 不足帧填充：有背景用背景，无背景用最后一个主体帧（避免空白）
-            filler = background if background is not None else (subjects[-1] if subjects else None)
-            if filler is not None:
-                while len(frames) < frame_count:
-                    frames.append(filler)
 
         return frames
 
@@ -256,14 +242,14 @@ class GetImage:
     OUTPUT_TOOLTIPS = ("按指定索引从批量图像中筛选出的帧（顺序保持）。",)
     FUNCTION = "indexedimagesfrombatch"
     CATEGORY = "Yuan Tool/图像"
-    DESCRIPTION = "从批量中筛选一张或者多张图像。用逗号分隔索引（从 0 起），支持多行；无效索引会被自动忽略，全无效时回退到第 0 张。"
+    DESCRIPTION = "从批量中筛选一张或者多张图像。用逗号、中文逗号或空白分隔索引（从 0 起），支持多行；无效索引会被自动忽略，没有任何有效索引时输出 1 张 64×64 空图作为兜底。"
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "images": ("IMAGE", {"display_name": "输入图像", "tooltip": "要筛选的图像批次（batch）"}),
-                "indexes": ("STRING", {"default": "0, 1, 2", "multiline": True, "display_name": "索引列表", "tooltip": "逗号分隔的索引（从 0 起），如 0,2,5；也支持多行。超出范围的索引会被忽略。"}),
+                "indexes": ("STRING", {"default": "0, 1, 2", "multiline": True, "display_name": "索引列表", "tooltip": "用逗号、中文逗号或换行分隔的索引（从 0 起），如 0,2,5；超出范围的索引会被忽略。"}),
             },
         }
 
@@ -272,10 +258,8 @@ class GetImage:
 
         valid_indices = []
         if batch_size > 0:
-            for token in indexes.split(','):
-                token = token.strip()
-                if not token:
-                    continue
+            normalized = indexes.replace(",", " ").replace("，", " ")
+            for token in normalized.split():
                 try:
                     idx = int(token)
                 except ValueError:

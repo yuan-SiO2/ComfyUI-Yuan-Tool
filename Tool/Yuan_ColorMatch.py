@@ -3,6 +3,7 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 
 _COLOR_MATCH_METHODS = ['mkl', 'hm', 'reinhard', 'mvgd', 'hm-mvgd-hm', 'hm-mkl-hm']
@@ -54,29 +55,25 @@ class YuanColorMatch:
         image_ref = image_ref.cpu()
         image_target = image_target.cpu()
         batch_size = image_target.size(0)
-
-        images_target = image_target.squeeze()
-        images_ref = image_ref.squeeze()
-
-        image_ref_np = images_ref.numpy()
-        images_target_np = images_target.numpy()
+        ref_batch = image_ref.size(0)
 
         def process(i):
-            """对第 i 帧执行色彩迁移。"""
+            """对第 i 帧执行色彩迁移；参考图不足时复用最后一帧。"""
             cm = ColorMatcher()
-            # 批次为 1 时直接使用整体数组，否则按帧索引
-            image_target_np_i = images_target_np if batch_size == 1 else images_target[i].numpy()
-            image_ref_np_i = image_ref_np if image_ref.size(0) == 1 else images_ref[i].numpy()
+            target_i = image_target[0] if batch_size == 1 else image_target[i]
+            ref_i = image_ref[0] if ref_batch == 1 else image_ref[min(i, ref_batch - 1)]
+            target_np = target_i.numpy()
+            ref_np = ref_i.numpy()
             try:
-                # 注意：src 是目标图（要被改色的图），ref 是参考图（提供色彩分布）
-                image_result = cm.transfer(src=image_target_np_i, ref=image_ref_np_i, method=method)
+                # src 是待改色图，ref 是提供色彩分布的参考图
+                image_result = cm.transfer(src=target_np, ref=ref_np, method=method)
                 # 强度混合：在原目标图与匹配结果之间线性插值
                 if strength != 1:
-                    image_result = image_target_np_i + strength * (image_result - image_target_np_i)
-                return torch.from_numpy(image_result)
+                    image_result = target_np + strength * (image_result - target_np)
+                return torch.from_numpy(np.ascontiguousarray(image_result))
             except Exception:
                 # 失败时回退到原图，不打印日志
-                return torch.from_numpy(image_target_np_i)
+                return torch.from_numpy(np.ascontiguousarray(target_np))
 
         # 多线程仅在批量大于 1 时启用
         if multithread and batch_size > 1:

@@ -126,8 +126,9 @@ class Yuan_Canvas:
             "names_sigs": _images_batch_signature(images_tensor),
         }
 
-        configChanged = self.configCache != config
-        self.configCache = config
+        # 配置缓存必须放在类上：节点每次执行都会新建实例，实例属性无法跨执行保留
+        configChanged = Yuan_Canvas.configCache != config
+        Yuan_Canvas.configCache = config
 
         # 始终落盘 images batch 供前端获取；前端按 configChanged 与画布是否已有图像决定是否重新下载
         images_entries = _save_images_batch_with_sig(images_tensor)

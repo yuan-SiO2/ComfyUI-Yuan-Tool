@@ -87,7 +87,8 @@ class YuanLoadImageOutput:
                 alpha = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
                 masks.append((1.0 - torch.from_numpy(alpha)).unsqueeze(0))
             else:
-                masks.append(torch.zeros((1, 64, 64), dtype=torch.float32))
+                # 无 alpha 时输出与图像同尺寸的全 0 遮罩，保证多帧 cat 形状一致
+                masks.append(torch.zeros((1, rgb.size[1], rgb.size[0]), dtype=torch.float32))
 
         return (torch.cat(images, dim=0), torch.cat(masks, dim=0))
 

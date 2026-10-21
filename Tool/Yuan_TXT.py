@@ -426,7 +426,7 @@ class YUAN_TXTJsonExtractor:
 
     @staticmethod
     def _parse_voice_indices(text):
-        """解析角色索引串（如「0,4,1」）为整数列表；容错中文逗号/空格/非法项，返回 []。"""
+        """解析逗号分隔的整数索引串（如「0,4,1」），容错中文逗号/空格/非法项。"""
         if not text:
             return []
         values = []
@@ -1083,8 +1083,9 @@ class YUAN_TXTReplace:
         return "".join(out)
 
     def replace_text(self, text, 查找文本, 替换文本, 台词开关):
-        find_lines = 查找文本.split("\n")
-        replace_lines = 替换文本.split("\n")
+        # splitlines 同时兼容 LF/CRLF，避免 \r 残留在查找串里导致匹配失败
+        find_lines = 查找文本.splitlines()
+        replace_lines = 替换文本.splitlines()
 
         # 台词开关：开启时逐轮以当前文本重建保护掩码进行保护替换
         protect = bool(台词开关)
@@ -1094,7 +1095,7 @@ class YUAN_TXTReplace:
         count = min(len(find_lines), len(replace_lines))
         for i in range(count):
             find_str = find_lines[i]
-            replace_str = replace_lines[i] if i < len(replace_lines) else ""
+            replace_str = replace_lines[i]
             if find_str:
                 pairs.append((find_str, replace_str))
 
@@ -1246,7 +1247,7 @@ class YUAN_TXTParagraphSplitter:
             else:
                 text = collected_texts[0]
         if not text:
-            return (0, "",) + ("",) * self.MAX_OUTPUTS
+            return (0, [""],) + ("",) * self.MAX_OUTPUTS
 
         if 分段方式 == "端口":
             if collected_texts:
@@ -1391,6 +1392,9 @@ class YUAN_TXTParagraphSplitter:
             to = ["\n".join(to)] if to else [""]
 
         cnt = len(to)
+        # 「总段」是 OUTPUT_IS_LIST 端口：空列表会让下游直接不执行，用单个空串占位
+        if 输出模式 and not to:
+            to = [""]
 
         max_out = self.MAX_OUTPUTS
         po = [""] * max_out
@@ -1442,14 +1446,7 @@ class YUAN_TXTLength:
         if val is None:
             return ""
         if isinstance(val, list):
-            parts = []
-            for v in val:
-                parts.append("" if v is None else str(v))
-            return "\n".join(parts)
-        if isinstance(val, (dict, tuple)):
-            return str(val)
-        if isinstance(val, (int, float, bool)):
-            return str(val)
+            return "\n".join("" if v is None else str(v) for v in val)
         return str(val)
 
     def count_length(self, text, 长度模式):
@@ -1567,7 +1564,7 @@ class YUAN_TXTShotDurations:
         return (时长列表, 时长序列, len(entries), 总时长)
 
 
-# ==== 预览内容（复刻自 Yuan-TV 的 ShowText|yuanTV） ====
+# ==== 预览内容 ====
 
 class YUAN_TXTPreviewContent:
 
@@ -1584,6 +1581,8 @@ class YUAN_TXTPreviewContent:
         }
 
     RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("内容",)
+    OUTPUT_TOOLTIPS = ("预览模式下为序列化后的文本，编辑模式下为输入文本。",)
     FUNCTION = "main"
     OUTPUT_NODE = True
 
@@ -1600,8 +1599,6 @@ class YUAN_TXTPreviewContent:
         return {"ui": {"text": (value,)}, "result": (value,)}
 
     def _serialize(self, source):
-        import torch
-
         # 限制张量 str() 回退时的输出长度
         torch.set_printoptions(edgeitems=6)
         if isinstance(source, str):
@@ -1736,35 +1733,55 @@ class YUAN_TXTLabelColor:
         def load_font():
             size = max(1, font_size)
             if font_path is None:
-                return ImageFont.load_default(size=size)
+                try:
+                    return ImageFont.load_default(size=size)
+                except TypeError:
+                    # Pillow < 10.1 的 load_default 不接受 size
+                    return ImageFont.load_default()
             return ImageFont.truetype(font_path, size)
+
+        def measure(label_font, content):
+            """测量文本宽度，按 Pillow 版本依次尝试 getlength / getbbox / getsize。"""
+            try:
+                return label_font.getlength(content)
+            except Exception:
+                try:
+                    return label_font.getbbox(content)[2]
+                except Exception:
+                    return label_font.getsize(content)[0]
+
+        def wrap_line(label_font, text_line, max_width):
+            """按宽度折行：中文逐字断行，拉丁文按词断行；超宽单词单独占一行。"""
+            if max_width <= 0:
+                return [text_line]
+            tokens = re.findall(r"[A-Za-z0-9_\-.']+|[\u3000-\u9fff\uff00-\uffef]|.", text_line)
+            wrapped = []
+            current = ""
+            for token in tokens:
+                if token.isspace():
+                    if current and not current.endswith(" "):
+                        current += " "
+                    continue
+                candidate = current + token if current else token
+                if not current or measure(label_font, candidate) <= max_width:
+                    current = candidate
+                else:
+                    wrapped.append(current.rstrip())
+                    current = token
+            if current.strip():
+                wrapped.append(current.rstrip())
+            return wrapped or [""]
 
         def process_image(input_image, caption_text):
             label_font = load_font()
             lines = []
+            max_width = strip_length - 2 * max(0, text_x)
             for text_line in caption_text.split('\n'):
                 if text_line.strip() == "":
                     # 保留空行，以便支持连续换行
                     lines.append("")
                     continue
-                words = text_line.split()
-                current_line = []
-                for word in words:
-                    if current_line:
-                        test_line = " ".join(current_line + [word])
-                    else:
-                        test_line = word
-                    try:
-                        test_line_width = label_font.getbbox(test_line)[2]
-                    except Exception:
-                        test_line_width = label_font.getsize(test_line)[0]
-                    if test_line_width <= strip_length - 2 * text_x:
-                        current_line.append(word)
-                    else:
-                        lines.append(" ".join(current_line))
-                        current_line = [word]
-                if current_line:
-                    lines.append(" ".join(current_line))
+                lines.extend(wrap_line(label_font, text_line, max_width))
 
             if direction == DIRECTION_OVERLAY:
                 pil_image = Image.fromarray((input_image.cpu().numpy() * 255).astype(np.uint8))

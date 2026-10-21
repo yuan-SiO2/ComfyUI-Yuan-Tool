@@ -143,6 +143,9 @@ class YuanMultiImage:
             tracks = json.loads(tracks_data) if tracks_data and tracks_data.strip() else []
         except (json.JSONDecodeError, TypeError):
             tracks = []
+        # 兼容非法/旧版结构：只有列表才按滑轨索引取用
+        if not isinstance(tracks, list):
+            tracks = []
 
         results = []
         for i in range(self.MAX_TRACKS):
