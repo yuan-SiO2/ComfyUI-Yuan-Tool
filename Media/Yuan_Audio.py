@@ -140,7 +140,7 @@ class YuanAudioList:
             except Exception:
                 continue
 
-        return (audios,)
+        return (audios if audios else [_silence_audio()],)
 
 
 class YuanAudioSplit:
@@ -266,7 +266,7 @@ class YuanAudioLoad:
         # 直接放行，避免文件不在下拉列表时 ComfyUI 报 "Value not in list"
         return True
 
-    def execute(self, 音频, 开始时间, 结束时间, 时长, 输出模式="自定义裁切", 分段时长="6,3,5", 分段索引=0):
+    def execute(self, 音频, 开始时间, 结束时间, 时长, 输出模式="自定义裁切", 分段时长="", 分段索引=0):
         try:
             audio_path = folder_paths.get_annotated_filepath(音频) if 音频 != "none" else ""
         except Exception:
@@ -287,8 +287,12 @@ class YuanAudioLoad:
 
         # 有效裁切窗口 [win_start, win_end]（秒）
         win_start = min(max(0.0, float(开始时间 or 0)), file_duration)
-        if 结束时间 and float(结束时间) > win_start:
-            win_end = min(float(结束时间), file_duration)
+        requested_end = float(结束时间 or 0)
+        if requested_end <= win_start and 时长 and float(时长) > 0:
+            # 「时长」由前端时间轴镜像维护，结束时间未设置时用它兜底
+            requested_end = win_start + float(时长)
+        if requested_end > win_start:
+            win_end = min(requested_end, file_duration)
         else:
             win_end = file_duration  # 0 表示文件末尾
         win_start = min(win_start, win_end)

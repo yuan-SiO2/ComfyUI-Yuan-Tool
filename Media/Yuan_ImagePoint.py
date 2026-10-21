@@ -1,4 +1,4 @@
-"""图像点处理 节点：在内嵌画布上标注正面点/负面点/边界框（复刻自 YuanEditor，多帧可逐帧标注）。"""
+"""图像点处理节点：在内嵌画布上标注正面点/负面点/边界框，支持多帧逐帧标注。"""
 
 import json
 import random
@@ -31,11 +31,11 @@ def tensor_to_pil(images: torch.Tensor):
     for img in images:
         img_np = img.numpy()
         if img_np.shape[-1] == 1:
-            pil_images.append(Image.fromarray(img_np.squeeze(-1), mode='L'))
+            pil_images.append(Image.fromarray(img_np.squeeze(-1)))
         elif img_np.shape[-1] == 3:
-            pil_images.append(Image.fromarray(img_np, mode='RGB'))
+            pil_images.append(Image.fromarray(img_np))
         elif img_np.shape[-1] == 4:
-            pil_images.append(Image.fromarray(img_np, mode='RGBA'))
+            pil_images.append(Image.fromarray(img_np))
         else:
             raise ValueError(f"Unsupported channel count: {img_np.shape[-1]}")
     return pil_images
@@ -101,7 +101,7 @@ class Yuan_ImagePoint:
     CATEGORY = "Yuan Tool/图像"
 
     DESCRIPTION = (
-        "图像点处理（复刻自 YuanEditor / Frames Editor）：在内嵌画布上为图像标注正面点/负面点/边界框。\n"
+        "图像点处理：在内嵌画布上为图像标注正面点/负面点/边界框。\n"
         "左键添加正面点、右键添加负面点、拖拽添加边界框；多帧可逐帧标注，输出坐标 JSON 与边界框供下游使用。"
     )
 
@@ -182,7 +182,7 @@ class Yuan_ImagePoint:
         else:
             preview = _save_preview_images(
                 preview_images,
-                filename_prefix="ComfyUI_temp_" + ''.join(random.choice("abcdefghijklmnopqrstupvxyz") for _ in range(5)),
+                filename_prefix="ComfyUI_temp_" + ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5)),
             )
             preview_str = json.dumps(preview, ensure_ascii=False)
             self.state['last_images_hash'] = rescale_hash

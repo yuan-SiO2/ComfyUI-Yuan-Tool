@@ -24,16 +24,26 @@ from ..Yuan_common import (
 )
 
 
-# 自定义 API 路由：从系统任意路径读取视频文件，供前端预览
+# 自定义 API 路由：从系统任意路径读取视频/音频/图片，供前端预览
+_VIEW_ALLOWED_EXTS = (
+    ".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".flv", ".wmv",
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus",
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp",
+)
+
+
 @PromptServer.instance.routes.get("/yuan_tool/video_custom_view")
 async def yuan_custom_view(request):
     file_path = request.query.get("filename", "")
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        return web.FileResponse(file_path)
-    return web.Response(status=404, text="File not found")
+    if not os.path.isabs(file_path) or not os.path.isfile(file_path):
+        return web.Response(status=404, text="File not found")
+    # 仅允许媒体扩展名，避免把任意本地文件当预览暴露出去
+    if os.path.splitext(file_path)[1].lower() not in _VIEW_ALLOWED_EXTS:
+        return web.Response(status=403, text="Unsupported file type")
+    return web.FileResponse(file_path)
 
 
-# 自定义 API 路由：上传前查重（仅检查 input 目录根路径，与 WhatDreamsCost 完全隔离）
+# 自定义 API 路由：上传前查重（仅检查 input 目录根路径）
 @PromptServer.instance.routes.get("/yuan_tool/video_check_file")
 async def yuan_check_file(request):
     filename = os.path.basename(request.query.get("filename", ""))
@@ -170,7 +180,7 @@ async def yuan_detect_segments(request):
     result_key = None
     try:
         st = os.stat(video_path)
-        # v3：段尾时间从"网格时间 round"改为"输出末帧精确 PTS + 1e-6"，旧缓存内的 end 值播放时会串到下一分镜首帧，必须失效
+        # 缓存版本号；检测结果结构或语义变化时递增即可让旧缓存失效
         result_key = f"{os.path.abspath(video_path)}|{st.st_size}|{int(st.st_mtime)}|{fps}|{start_time}|{end_time}|v3"
     except OSError:
         pass
@@ -390,7 +400,7 @@ class YuanVideoUI:
         video_extensions = ('.mp4', '.webm', '.mkv', '.avi', '.mov', '.m4v', '.flv', '.wmv')
         files = list_input_files(["video"], video_extensions)
 
-        if not files or len(files) == 0:
+        if not files:
             files = ["无"]
 
         return {
@@ -398,10 +408,10 @@ class YuanVideoUI:
                 "视频": (files,),
                 "开始时间": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
                 "结束时间": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
-                "时长": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
+                "时长": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "tooltip": "由前端时间轴维护的窗口时长；后端以「开始时间/结束时间」为准。"}),
                 "开始帧": ("INT", {"default": 0, "min": 0, "max": 10000000, "step": 1}),
                 "结束帧": ("INT", {"default": 0, "min": 0, "max": 10000000, "step": 1}),
-                "时长帧数": ("INT", {"default": 0, "min": 0, "max": 10000000, "step": 1}),
+                "时长帧数": ("INT", {"default": 0, "min": 0, "max": 10000000, "step": 1, "tooltip": "由前端时间轴维护的窗口帧数；后端以「开始帧/结束帧」为准。"}),
                 "最长边": ("INT", {"default": 1536, "min": 0, "max": 100000, "step": 8, "tooltip": "输出视频的最长边像素，等比缩放另一条边；0 表示保持原始尺寸。"}),
                 "帧率": ("INT", {"default": 24, "min": 1, "max": 120, "step": 1, "tooltip": "强制以指定帧率提取视频帧。"}),
                 "显示模式": (["秒", "帧"], {"default": "秒"}),
@@ -424,7 +434,7 @@ class YuanVideoUI:
         return True
 
     def load_video(self, 视频, 帧率, 显示模式, 开始时间, 结束时间, 时长, 开始帧, 结束帧, 时长帧数, 最长边=1536, 裁剪X=0.0, 裁剪Y=0.0, 裁剪宽度=1.0, 裁剪高度=1.0, 输出模式="自定义裁剪输出", 分段索引=0, **kwargs):
-        if not 视频:
+        if not 视频 or 视频 == "无":
             # 未加载视频时返回空默认值
             empty_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             empty_audio = {"waveform": torch.zeros((1, 1, 44100)), "sample_rate": 44100}
@@ -440,9 +450,9 @@ class YuanVideoUI:
 
         # 视频流与总时长
         video_stream = container.streams.video[0] if len(container.streams.video) > 0 else None
-        video_duration = 0
+        source_duration = 0
         if video_stream and video_stream.duration and video_stream.time_base:
-            video_duration = float(video_stream.duration * video_stream.time_base)
+            source_duration = float(video_stream.duration * video_stream.time_base)
 
         orig_w = video_stream.codec_context.width if video_stream else 512
         orig_h = video_stream.codec_context.height if video_stream else 512
@@ -507,10 +517,10 @@ class YuanVideoUI:
         if 显示模式 == "帧":
             fr = float(帧率) if 帧率 > 0 else 24.0
             actual_start_time = float(开始帧) / fr
-            actual_end_time = float(结束帧) / fr if (结束帧 > 0 and 结束帧 > 开始帧) else video_duration
+            actual_end_time = float(结束帧) / fr if (结束帧 > 0 and 结束帧 > 开始帧) else source_duration
         else:
             actual_start_time = 开始时间
-            actual_end_time = 结束时间 if (结束时间 > 0 and 结束时间 > 开始时间) else video_duration
+            actual_end_time = 结束时间 if (结束时间 > 0 and 结束时间 > 开始时间) else source_duration
 
         if actual_end_time <= 0:
             actual_end_time = float('inf') # 时长未知时的回退值
@@ -556,7 +566,7 @@ class YuanVideoUI:
             expected_target_time = decode_start_time
 
             # 预计算期望帧数
-            alloc_end_time = decode_end_time if decode_end_time != float('inf') else video_duration
+            alloc_end_time = decode_end_time if decode_end_time != float('inf') else source_duration
             expected_frames = 0
             if alloc_end_time > 0:
                 duration_to_extract = alloc_end_time - decode_start_time
@@ -644,8 +654,8 @@ class YuanVideoUI:
                         image_tensor[frames_loaded] = torch.from_numpy(frame_rgb).float().div_(255.0)
                         frames_loaded += 1
                     else:
-                        # 预分配失败时的列表回退
-                        frames.append(frame_rgb)
+                        # 预分配失败时的列表回退（必须拷贝，frame_rgb 可能复用同一块缩放缓冲）
+                        frames.append(frame_rgb.copy())
 
                     if pbar:
                         pbar.update(1)
@@ -704,6 +714,12 @@ class YuanVideoUI:
                     for r_frame in resampled_frames:
                         audio_data.append(r_frame.to_ndarray())
 
+                # 冲刷重采样器，取出尾部不足一帧的样本（部分版本无返回值时直接跳过）
+                flushed_frames = resampler.resample(None)
+                if flushed_frames:
+                    for r_frame in flushed_frames:
+                        audio_data.append(r_frame.to_ndarray())
+
                 if audio_data:
                     # 沿采样轴水平拼接所有帧
                     waveform_np = np.concatenate(audio_data, axis=1)
@@ -736,11 +752,8 @@ class YuanVideoUI:
         # 始终关闭容器以释放系统内存锁
         container.close()
 
-        # 返回前主动回收解码/转换产生的临时大块内存，缓解"切换分段内存叠加"
-        try:
-            del _resize_dst
-        except Exception:
-            pass
+        # 释放解码/缩放临时缓冲后再回收内存
+        _resize_dst = None
         gc.collect()
 
         # 输出组装
