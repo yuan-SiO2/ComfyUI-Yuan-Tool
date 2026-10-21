@@ -143,10 +143,6 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 
 - [yolain/ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use)
 
-- [Comfy-Org/Nvidia\_RTX\_Nodes\_ComfyUI](https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI)
-
-- [NikoDemon80/ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
-
 - [LBH-123-AI/Comfyui\_Minimax\_h3\_latent\_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
 
 - [facok/comfyui-SelfLift](https://github.com/facok/comfyui-SelfLift)
