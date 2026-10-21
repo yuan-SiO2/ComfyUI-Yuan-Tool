@@ -147,5 +147,3 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 
 - [facok/comfyui-SelfLift](https://github.com/facok/comfyui-SelfLift)
 
-- [comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI)
-
