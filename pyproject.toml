@@ -1,7 +1,7 @@
 [project]
 name = "Yuan-Tool"
-description = "A ComfyUI custom node for creating fixed-frame MP4 reference videos from multiple subject images and a background image, designed for LTX 2.3 Tool (Multiple-Subject-Reference) LoRA workflows."
-version = "1.0.0"
+description = "ComfyUI custom nodes for MiniMax H3 video generation and LTX timeline workflows: image, text, audio, video, CLIP guide, latent upscale and sampling nodes."
+version = "1.0.1"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
@@ -18,4 +18,4 @@ dependencies = { file = ["requirements.txt"] }
 
 [tool.comfy]
 PublisherId = "yuan-SiO2"
-DisplayName = "多帧参考"
+DisplayName = "Yuan Tool"

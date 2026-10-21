@@ -1,7 +1,12 @@
+# torch 由 ComfyUI 提供，此处不声明以避免覆盖已匹配 CUDA 的版本
 opencv-python
 numpy
-torch
 Pillow
 color-matcher
 nvidia-vfx
 av
+torchaudio
+# 智能分段（可选）：缺失时「加载视频」的镜头检测退化为单段
+scenedetect
+# 视频保存：FFmpeg 编码（也可改用系统 ffmpeg 或环境变量 YUAN_FFMPEG_PATH）
+imageio-ffmpeg>=0.4.9
