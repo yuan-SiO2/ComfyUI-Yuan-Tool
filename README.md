@@ -95,33 +95,7 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 | **Yuan CLIP 时间轴 (Timeline)** | 可视化时间轴编辑器，编排提示词与运动引导（详见下方工作流说明）                              |
 | **Yuan 引导注入 (Guide)**        | 接收时间轴引导数据，编码构帧后拼接注入潜空间，实现时间感知注意力惩罚；可选 IC\_LORA 与 MSR LoRA 适配 |
 
-## Yuan 视频保存
-
-- **输入**：图像（IMAGE）；可选音频（AUDIO），接入后自动混入视频。
-- **输出**：文件列表（列表端口），给出本次保存的视频/动图绝对路径；PNG 序列会展开为每一帧的实际路径。
-- **常显参数**：帧率、文件名前缀（默认 `Yuan Video/ComfyUI`，保存到 `output/Yuan Video/`）、保存到输出目录；点「展开高级设置」后显示 循环次数、输出格式、往返播放，以及当前输出格式专用参数（画质、像素格式、写入元数据、按音频长度裁剪、ProRes 档位、码率、FFV1 参数、Gifski 质量等）。
-- **预览**：运行后在节点内播放，支持原生播放控制；**声音跟随鼠标**——指针在节点内时播放声音，移出节点或浏览器窗口立即静音。右键菜单可打开预览、保存预览、复制输出路径、保存首帧图片。ProRes、FFV1、PNG 序列等浏览器无法直接播放的格式会自动回退显示首帧。预览状态（上次文件、暂停）随工作流保存，重新打开工作流会恢复画面。
-- **首帧元数据**：每次保存同时写出一张带工作流信息的首帧 PNG；不需要时在工作流 `extra` 中设 `"Yuan_MetadataImage": false`。混入音频后默认保留无声与含音频两个文件，设 `"Yuan_KeepIntermediate": false` 可删除无声中间文件。
-- **自定义格式**：把格式 JSON 放进 ComfyUI 的 `custom_nodes/Yuan_video_formats/`（与包目录同级；目录不存在时请新建后重启），同名文件会覆盖内置格式；或直接扩展 `Media/video_formats/`。
-
-## 时间轴工作流（LTX）
-
-时间轴节点（「Yuan CLIP 时间轴」+「Yuan 引导注入」）面向 **LTX 系列模型**（128 通道 latent、LTX patchifier 与音频 VAE），用于编排各分镜的提示词、运动引导与音频；它不适用于 MiniMax H3，H3 请使用「MiniMax-H3 视频生成」与「H3 运动上下文/裁剪」。
-
-```text
-文本处理 → 时间轴 → 引导注入 → LTX 采样
-            ↑ 主体图 / 运动图像 / 音频
-```
-
-- **输入**：模型/CLIP/音频VAE（可选）；全局提示词（支持 `@图X=描述`，@ 弹出已上传图像选择菜单）；文本输入（自动解析进时间轴，纯文本按时间轴长度均分）；最大帧数与宽/高/帧率；段落/运动图像与音频（自动生成对应轨段）；潜空间可选。
-
-- **编辑器**：主轨（提示词段）、IC-LoRA 轨（运动引导，支持图/视频上传）、音频轨（支持从视频提取音频）；工具栏「锁定」开启后全部只读仅可预览；右键/快捷键复制粘贴删除段，框选与属性面板联动。
-
-- **输出**：模型、正向条件、视频/音频潜空间、引导数据、运动引导数据、帧率、音频；其中引导数据接「Yuan 引导注入」，帧率/音频接 H3 视频生成。
-
 ## 更新记录
-
-- **2026-10-21**：「Yuan 视频保存」审查修正：PNG 序列的「文件列表」改为实际帧路径并按帧号排序；音频统一转 float32 写入；补充帧率/循环次数/保存位置/采样率校验；编码、混流或序列写入失败时清理本次半成品；自定义格式目录支持同名覆盖，目录不存在时不再产生告警；前端避免同一次执行重复加载预览。
 
 - **2026-10-21**：新增「Yuan 视频保存」节点（Yuan Tool/视频）：图像序列编码为 MP4/WebM/GIF/WebP/PNG 序列/ProRes/FFV1 等格式，支持音频混流、循环/往返播放与首帧元数据 PNG；高级参数按所选输出格式显隐，默认折叠；节点内置播放预览窗口，沿用「加载视频」的播放方式，声音跟随鼠标（指针在节点内播放、移出静音），右键可打开/下载，不可播放格式回退首帧；输出「文件列表」。
 
@@ -176,8 +150,6 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 - [LBH-123-AI/Comfyui\_Minimax\_h3\_latent\_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
 
 - [facok/comfyui-SelfLift](https://github.com/facok/comfyui-SelfLift)
-
-- [Kosinkadink/ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite)：`Yuan 视频保存` 节点与 `Media/video_formats` 格式配置派生自该项目的 Video Combine，按 **GPL-3.0** 发布（完整文本见 `Media/Yuan_VideoSave.LICENSE`）；仓库其余部分仍为 MIT。
 
 - [comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI)
 
