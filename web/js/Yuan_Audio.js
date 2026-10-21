@@ -23,14 +23,14 @@ import { getApi, isAudioFileName } from "./Yuan_Common.js";
     ];
 
     // --- 工具函数 ---
-    /** 构造 /api/view 播放地址，支持 "子目录/文件名" 形式 */
+    /** 构造音频播放地址，兼容 ComfyUI 子路径部署 */
     function audioUrl(path) {
         const idx = path.lastIndexOf("/");
         let subfolder = "", filename = path;
         if (idx >= 0) { subfolder = path.slice(0, idx); filename = path.slice(idx + 1); }
-        let url = "/api/view?filename=" + encodeURIComponent(filename) + "&type=input";
-        if (subfolder) url += "&subfolder=" + encodeURIComponent(subfolder);
-        return url;
+        let rel = "/view?filename=" + encodeURIComponent(filename) + "&type=input";
+        if (subfolder) rel += "&subfolder=" + encodeURIComponent(subfolder);
+        return (api && typeof api.apiURL === "function") ? api.apiURL(rel) : rel;
     }
 
     function fmtDuration(sec) {

@@ -8,6 +8,19 @@ import { getApi } from "./Yuan_Common.js";
 
     const api = getApi();
 
+    /** 构造图像预览地址，兼容 ComfyUI 子路径部署。 */
+    function viewUrl(path) {
+        const idx = path.lastIndexOf("/");
+        let subfolder = "", filename = path;
+        if (idx >= 0) {
+            subfolder = path.slice(0, idx);
+            filename = path.slice(idx + 1);
+        }
+        let rel = "/view?filename=" + encodeURIComponent(filename) + "&type=input";
+        if (subfolder) rel += "&subfolder=" + encodeURIComponent(subfolder);
+        return (api && typeof api.apiURL === "function") ? api.apiURL(rel) : rel;
+    }
+
     // --- 尺寸常量 ---
     const MAX_TRACKS = 20;
     const THUMB_SIZE = 80;
@@ -373,7 +386,7 @@ import { getApi } from "./Yuan_Common.js";
 
                 const img = document.createElement("img");
                 img.className = "yuan-mi-preview-img";
-                img.src = "/api/view?filename=" + encodeURIComponent(path) + "&type=input";
+                img.src = viewUrl(path);
                 img.alt = path;
 
                 const hint = document.createElement("div");
@@ -697,7 +710,7 @@ import { getApi } from "./Yuan_Common.js";
                     `;
 
                     const img = document.createElement("img");
-                    img.src = "/api/view?filename=" + encodeURIComponent(path) + "&type=input";
+                    img.src = viewUrl(path);
                     img.style.cssText = "max-width:100%;max-height:100%;object-fit:contain;pointer-events:auto;display:block;";
                     img.draggable = false;
 
