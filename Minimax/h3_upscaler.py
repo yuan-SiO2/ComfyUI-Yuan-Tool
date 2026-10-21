@@ -16,6 +16,7 @@ from .h3_upscale_net import (
     LATENTS_MEAN,
     LATENTS_STD,
     LatentResizer3D,
+    detect_arch,
 )
 
 _FOLDER = LATENT_UPSCALE_FOLDER
@@ -36,38 +37,6 @@ def list_upscaler_models():
                 if os.path.splitext(f)[1].lower() in (".pth", ".safetensors"):
                     names.append(os.path.relpath(os.path.join(root, f), p))
     return sorted(names)
-
-
-def _detect_arch(sd):
-    """从 state_dict 的键名和张量形状推断网络结构参数。"""
-    import re
-    cfg = {"in_channels": 24, "in_blocks": 12, "out_blocks": 12, "channels": 512,
-           "dropout": 0.1, "attn": False, "temporal_every": 2, "temporal_kernel": 5}
-    if 'conv_in.weight' in sd:
-        cfg["in_channels"] = sd['conv_in.weight'].shape[1]
-        cfg["channels"] = sd['conv_in.weight'].shape[0]
-    in_ids, out_ids, tin, tout = set(), set(), set(), set()
-    for k in sd:
-        m = re.match(r'in_blocks\.(\d+)\.in_layers\.', k)
-        if m: in_ids.add(int(m.group(1)))
-        m = re.match(r'out_blocks\.(\d+)\.in_layers\.', k)
-        if m: out_ids.add(int(m.group(1)))
-        m = re.match(r'in_blocks\.(\d+)\.dwconv\.weight', k)
-        if m: tin.add(int(m.group(1)))
-        m = re.match(r'out_blocks\.(\d+)\.dwconv\.weight', k)
-        if m: tout.add(int(m.group(1)))
-    if in_ids: cfg["in_blocks"] = len(in_ids)
-    if out_ids: cfg["out_blocks"] = len(out_ids)
-    if tin or tout:
-        cfg["temporal_every"] = 2
-        for k in sd:
-            if k.endswith('dwconv.weight'):
-                cfg["temporal_kernel"] = sd[k].shape[2]
-                break
-    else:
-        cfg["temporal_every"] = 0
-    cfg["attn"] = False
-    return cfg
 
 
 def _normalize_checkpoint_dtype(state_dict):
@@ -107,7 +76,7 @@ def _load_model(model_name, device):
         sd = {k[len("upscaler."):]: v for k, v in sd.items() if k.startswith("upscaler.")}
     sd = _normalize_checkpoint_dtype(sd)
 
-    cfg = _detect_arch(sd)
+    cfg = detect_arch(sd)
     with torch.device("meta"):
         model = LatentResizer3D(
             in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"], out_blocks=cfg["out_blocks"],

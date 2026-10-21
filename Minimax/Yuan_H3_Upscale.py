@@ -1,7 +1,6 @@
 """H3 放大 (3D) 节点：纯 3D 卷积在 latent 空间放大 Minimax H3 视频（联合 AV latent 只放大视频流）。"""
 
 import os
-import re
 import glob
 
 import torch
@@ -13,6 +12,7 @@ from .h3_upscale_net import (
     LATENTS_MEAN,
     LATENTS_STD,
     LatentResizer3D,
+    detect_arch,
 )
 
 # 缩放方式选项
@@ -39,7 +39,11 @@ def scan_models():
     model_dir = get_models_dir()
     for ext in ("*.pth", "*.safetensors"):
         files.extend(glob.glob(os.path.join(model_dir, ext)))
-    names = sorted(os.path.basename(f) for f in files)
+    # H3/MiniMax 权重排在前面，避免默认选中同目录下的 LTX 放大模型
+    names = sorted(
+        (os.path.basename(f) for f in files),
+        key=lambda n: (0 if ("h3" in n.lower() or "minimax" in n.lower()) else 1, n),
+    )
     return names if names else [f"(请将模型放入: {model_dir})"]
 
 
@@ -63,66 +67,6 @@ def _extract_upscaler_sd(sd):
     return sd
 
 
-def _detect_arch(sd):
-    """从 state_dict 推断模型结构参数。"""
-    cfg = {
-        "in_channels": 24,
-        "in_blocks": 12,
-        "out_blocks": 12,
-        "channels": 512,
-        "dropout": 0.1,
-        "attn": False,
-        "temporal_every": 2,
-        "temporal_kernel": 5,
-    }
-
-    # 检测通道数
-    conv_key = 'conv_in.weight'
-    if conv_key in sd:
-        cfg["in_channels"] = sd[conv_key].shape[1]
-        cfg["channels"] = sd[conv_key].shape[0]
-
-    # 检测 in_blocks 和 out_blocks 数量
-    in_ids = set()
-    out_ids = set()
-    temporal_in_indices = set()
-    temporal_out_indices = set()
-    for k in sd.keys():
-        m = re.match(r'in_blocks\.(\d+)\.in_layers\.', k)
-        if m:
-            in_ids.add(int(m.group(1)))
-        m = re.match(r'out_blocks\.(\d+)\.in_layers\.', k)
-        if m:
-            out_ids.add(int(m.group(1)))
-        m = re.match(r'in_blocks\.(\d+)\.dwconv\.weight', k)
-        if m:
-            temporal_in_indices.add(int(m.group(1)))
-        m = re.match(r'out_blocks\.(\d+)\.dwconv\.weight', k)
-        if m:
-            temporal_out_indices.add(int(m.group(1)))
-
-    if in_ids:
-        cfg["in_blocks"] = len(in_ids)
-    if out_ids:
-        cfg["out_blocks"] = len(out_ids)
-
-    # 检测 temporal 配置
-    if temporal_in_indices or temporal_out_indices:
-        cfg["temporal_every"] = 2  # 训练默认
-        for k in sd.keys():
-            if k.endswith('dwconv.weight'):
-                kernel_t = sd[k].shape[2]
-                cfg["temporal_kernel"] = kernel_t
-                break
-    else:
-        cfg["temporal_every"] = 0  # 无 temporal
-
-    # 推理时为了性能和稳定性，强制 attn=False
-    cfg["attn"] = False
-
-    return cfg
-
-
 def _detect_dtype(sd):
     """从 state_dict 自动检测模型精度（跳过整数/布尔等非浮点张量）。"""
     for v in sd.values():
@@ -132,9 +76,8 @@ def _detect_dtype(sd):
 
 
 def load_model(name, device):
-    cache_key = f"{name}"
-    if cache_key in MODEL_CACHE:
-        return MODEL_CACHE[cache_key]
+    if name in MODEL_CACHE:
+        return MODEL_CACHE[name]
 
     path = os.path.join(get_models_dir(), name)
     if not os.path.exists(path):
@@ -142,8 +85,13 @@ def load_model(name, device):
 
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
+    if "conv_in.weight" not in up_sd:
+        raise ValueError(
+            f"{name} 不是 H3 LatentResizer3D 权重（缺少 conv_in.weight）。"
+            "请选择 H3/MiniMax 的 latent upscaler，而不是 LTX 等其他模型的 upscaler。"
+        )
 
-    cfg = _detect_arch(up_sd)
+    cfg = detect_arch(up_sd)
 
     model = LatentResizer3D(
         in_channels=cfg["in_channels"],
@@ -160,7 +108,7 @@ def load_model(name, device):
     dtype = _detect_dtype(up_sd)
     model = model.to(device=device, dtype=dtype).eval()
 
-    MODEL_CACHE[cache_key] = model
+    MODEL_CACHE[name] = model
 
     return model
 

@@ -241,10 +241,8 @@ def progressive_sample(low_res_model, positive, vae, latent_image, sampler, sigm
     total_steps = sigmas.shape[-1] - 1
     callback = latent_preview.prepare_callback(model, total_steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-    if video:  # H3 关键帧条件 latent 与生成网格同尺寸，需同步缩放
-        positive_low = _resize_keyframes(positive, h, w)
-    else:
-        positive_low = positive
+    # 关键帧条件 latent 与生成网格同尺寸，低分辨率阶段需同步缩放（4D/5D 均支持）
+    positive_low = _resize_keyframes(positive, h, w)
 
     transition = {}
     low_evaluations = 0

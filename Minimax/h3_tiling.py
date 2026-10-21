@@ -5,6 +5,7 @@
 
 from functools import partial
 import inspect
+import logging
 import math
 
 import torch
@@ -14,6 +15,8 @@ from comfy.ldm.minimax.model import PackedLayout
 import comfy.model_base
 import comfy.patcher_extension
 import comfy.sampler_helpers
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _regions(length, tile_count=2):
@@ -46,7 +49,8 @@ def _tile_payload(payload, context, video, audio, axis, start, end):
     padded_height, padded_width = (height + 1) // 2 * 2, (width + 1) // 2 * 2
     full_layout = payload.get("layout")
     signature = (context.shape[1], video.shape[2], padded_height, padded_width, audio.shape[-1])
-    if full_layout is None or full_layout.signature != signature:
+    # 布局对象不保证暴露 signature 属性；缺失时按形状重建，避免静默退回整帧前向
+    if full_layout is None or getattr(full_layout, "signature", None) != signature:
         full_layout = _packed_layout(signature, payload)
     tiled = payload.copy()
     if payload.get("keyframes"):
@@ -122,7 +126,8 @@ def _tiled_forward(executor, streams, timestep, context, transformer_options, mi
         try:
             payload = _tile_payload(minimax_payload or {}, context, video, audio, axis, start, end)
         except Exception:
-            # 构造失败时退回整帧前向，避免整次采样中断
+            # 构造失败时退回整帧前向，避免整次采样中断；记录一次便于定位分块为何没生效
+            _LOGGER.warning("H3 高分辨率分块构造失败，已退回整帧前向", exc_info=True)
             return executor(streams, timestep, context, transformer_options,
                             minimax_payload=minimax_payload, **kwargs)
         tile = video.narrow(axis, start, end - start).contiguous()

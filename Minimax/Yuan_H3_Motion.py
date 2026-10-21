@@ -1,16 +1,7 @@
-"""H3 运动上下文/裁剪节点：支持「视频图像」与「潜空间」两种衔接模式。
+"""H3 运动上下文/裁剪：把上一片段尾部的画面与音频固定为本片段开头的引导。
 
-视频图像模式（默认，对齐官方 Add Guide for MiniMax H3 数据路径）：
-「上下文」把上一片段尾部媒体编码为关键帧（minimax_keyframes）固定到本片段开头；
-「裁剪」把 AV 潜空间解码后从头部裁掉被固定窗口覆盖的帧并保存尾段供下一片段衔接。
-像素域裁切无潜空间 VRF 相位约束，任意帧数均可干净裁掉。
-
-潜空间模式：上下文与裁剪都直接在 H3 的 AV 潜空间上切片，跳过「解码→重编码」往返，
-不损失质量；代价是分辨率必须一致、窗口须为整 VRF 组（17 的倍数）。潜空间模式需要
-布局/载荷两补丁（解除仅首末帧锚点限制、让关键帧与引用共存），两补丁带 ABI 标记
-门控、先自测再安装，失败则拒绝运行。
-
-两条数据路径由「衔接模式」开关切换，端口/参数/输出槽随模式显隐（见 web/js）。
+「视频图像」模式经视频/音频 VAE 编码为关键帧；「潜空间」模式直接切片上一段 AV 潜空间；
+「解码模式」只解码不裁切。端口、参数与输出槽随模式显隐（见 web/js）。
 """
 
 import hashlib
@@ -44,41 +35,40 @@ except ImportError:  # ComfyUI 总是自带 safetensors，此处仅是双保险
 # H3 常量与潜空间工具函数
 # ============================================================================
 
-FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
-FPS = 24  # H3 原生帧率；音频潜空间按 40Hz 采样，故 FRAME_RESCALE 为 5/3
-FRAME_RESCALE = 5.0 / 3.0
+# 与 H3 核心保持一致（FRAME_PER_TOKEN / FRAME_RESCALE 由 comfy.ldm.minimax.model 定义）
+FRAME_PER_TOKEN = tuple(mm.FRAME_PER_TOKEN)
+FPS = 24
+FRAME_RESCALE = float(mm.FRAME_RESCALE)
 AUDIO_HZ = 40.0
 
-# 潜空间模式可干净裁剪的整组窗口长度。一个 VRF 组 = 5 个潜空间步覆盖 17 个像素帧
-# (1+4+4+4+4)，整组窗口即 17m 帧 = 5m 步。非整组窗口虽可切片，但裁剪会整步移除：
-# 剩余步数若非 5 的倍数，潜空间起点落在周期中间，VAE 解码器按错误帧数读第一个
-# token，画面闪烁。故可选项均为 17 的倍数，其他值（如过期的已存值）向下吸附到
-# 最近的整组，保证固定段与裁剪一致；5 作为退化子组片段的下限。
+# 可干净裁剪的整组窗口长度：一个 VRF 组 = 5 个潜空间步 = 17 个像素帧；
+# 非整组裁剪会让剩余潜空间的起点落在周期中间，导致画面闪烁。
 VIDEO_RUN_GRID = (68, 51, 34, 17, 5)
 
-#   ANCHOR_MODE "head" 把固定段放在片段开头（由裁剪节点移除）；"before"
-#               放在负时间轴上无需裁剪，但坐标与文本行碰撞，会削弱锚点
-#               并使输出变暗。
-#   AUDIO_MODE  "timeline" 把固定音频放在本片段时间轴上让模型续写；"ref"
-#               是 stock 放置方式，模型只会模仿：相似音乐而非同录音，
-#               且衔接处有滴答声。
+# ANCHOR_MODE="head" 把固定段放在片段开头（由裁剪节点移除）；
+# AUDIO_MODE="timeline" 把固定音频放在本片段时间轴上，让模型续写而非模仿。
 ANCHOR_MODE = "head"
 AUDIO_MODE = "timeline"
 
 
 def _pixel_frames(latent_t):
     """latent_t 个潜空间步覆盖的像素帧数。"""
-    return sum(FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
+    period = len(FRAME_PER_TOKEN)
+    return sum(FRAME_PER_TOKEN[k % period] for k in range(latent_t))
 
 
 def _streams_from_latent(latent):
-    """解包 H3 AV 潜空间为所含各流；NestedTensor 须用 unbind()——samples[0]
-    会把索引广播进两流并剥掉批维，得不到单条流。"""
+    """解包 H3 AV 潜空间为所含各流。
+
+    NestedTensor 用 unbind() 取流；普通张量视为单流，不能对它 unbind（那会按批维拆开）。
+    """
     samples = latent["samples"]
-    if hasattr(samples, "unbind"):
+    if getattr(samples, "is_nested", False):
         parts = list(samples.unbind())
     elif isinstance(samples, (tuple, list)):
         parts = list(samples)
+    elif isinstance(samples, torch.Tensor):
+        parts = [samples]
     else:
         raise ValueError(
             "h3_motion_context: expected a MiniMax H3 AV latent (a nested "
@@ -138,8 +128,8 @@ def _target_origin(layout):
 def _expected_ref_segments(blk):
     """一个参考块按发射顺序应产生的段类型。
 
-    镜像 stock 构造器的分支：image→ref_img；audio→窗口为空时无段；
-    video_audio→音频行紧邻视频行之前，故为 ref_audio 再 ref_img。
+    image→ref_img；audio→窗口为空时无段；video_audio→音频行紧邻视频行之前，
+    故为 ref_audio 再 ref_img。
     """
     kind = blk.get("kind")
     if kind == "image":
@@ -158,8 +148,7 @@ def _expected_ref_segments(blk):
 def _ref_segment_map(layout, refs):
     """返回 {块序号: {段类型: (起, 止)}}，即每个参考块实际产出的行。
 
-    布局已发布段表，参考块按列表顺序发射段，因此直接按序配对即可，
-    无需重算 stock 的游标算术，也无需排除落在范围内的关键帧行。
+    布局已发布段表，参考块按列表顺序发射段，因此直接按序配对即可。
     """
     ref_segs = [(a, b, k) for a, b, k in layout.segments
                 if k in REF_SEGMENT_KINDS]
@@ -183,22 +172,18 @@ def _ref_segment_map(layout, refs):
     return out
 
 
-def _cond_t(text_len, latent_t, frame_count, p):
+def _cond_t(text_len, p):
     """锚定在像素帧 p 的关键帧时间坐标。"""
     if p == 0:
         return float(text_len)
     return float(text_len) + mm.FRAME_RESCALE * float(p)
 
 
-def _fixup(layout, text_len, latent_t, frame_count, keyframes, refs=None):
-    """把条件行时间坐标重写为通用位置公式。
-
-    参考块对锚点的补偿取自目标实际落点（_target_origin）。
-    """
+def _fixup(layout, text_len, keyframes, refs=None):
+    """把条件行时间坐标重写为通用位置公式；参考块补偿取自目标实际落点。"""
     offset = _target_origin(layout) - float(text_len)
     if offset and any(kf.get(MC_KEY) is None for kf in keyframes):
-        # 无 MC_KEY 的关键帧保持 stock 原样（不获参考补偿），与 MC 关键帧
-        # 混用会相对滑动；当前无路径产生此情况，先拒绝以免出错。
+        # 无 MC_KEY 的关键帧会与 MC 关键帧相对滑动，直接拒绝
         raise RuntimeError(
             "h3_motion_context: stock and motion-context keyframes mixed in "
             "one graph alongside a ref; their coordinates would disagree. "
@@ -213,19 +198,14 @@ def _fixup(layout, text_len, latent_t, frame_count, keyframes, refs=None):
         p = kf.get(MC_KEY)
         if p is None:
             continue
-        layout.position_ids[a:b, 0] = _cond_t(text_len, latent_t, frame_count, p) + offset
+        layout.position_ids[a:b, 0] = _cond_t(text_len, p) + offset
 
 
 def _fixup_audio(layout, text_len, refs):
-    """把被标记的音频引用行平移到目标时间轴上。
+    """把被标记的音频引用行整体平移到目标时间轴。
 
-    引用与关键帧的行机制相同：模型把坐标落在目标之前某区间的引用读作
-    "另一段待模仿的剪辑"而非"本片段的延续"。因此音频引用仍按 stock
-    原样构建（行、潜空间、payload 全不动），只平移其时间坐标使窗口尾端
-    落在 MC_AUDIO_KEY（与固定视频尾端同一时刻）。平移而非逐行赋值：
-    新 = 旧 + 偏移保持 stock 构建的块内结构（声道主序）不变。窗口长于
-    视频时向空区溢出而不占用文本行，不会产生 before 模式的碰撞；其他
-    参考块不受影响（Ref2VA 图可同时携带图自身的图像/视频/音频引用）。
+    只平移时间坐标，保留引用行原有的行结构与声道顺序，使窗口尾端落在
+    MC_AUDIO_KEY 指定的时刻；其他参考块不受影响。
     """
     marked = [i for i, r in enumerate(refs or [])
               if r.get(MC_AUDIO_KEY) is not None]
@@ -254,8 +234,7 @@ def _fixup_audio(layout, text_len, refs):
             "rows.")
     a, b = seg
     if b - a != 2 * rt:
-        # stock 每立体声声道恰好产出 rt 行。用精确计数而非容差：
-        # 一旦改变，平移所保持的块内结构也随之改变。
+        # 每个立体声声道恰好产出 rt 行；数量不符说明布局结构已变，拒绝平移
         raise RuntimeError(
             "h3_motion_context: the marked audio reference has %d rows for "
             "%d latent steps, expected %d (stereo, channel-major). Upstream "
@@ -279,29 +258,23 @@ def _patched_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
     has_mc_audio = bool(refs) and any(
         r.get(MC_AUDIO_KEY) is not None for r in refs)
     if has_mc_kf:
-        _fixup(self, text_len, latent_t, frame_count, keyframes, refs)
+        _fixup(self, text_len, keyframes, refs)
     if has_mc_audio:
         _fixup_audio(self, text_len, refs)
-    # 两者皆未标记：stock 图，保持原样
+    # 两者皆未标记：保持原始布局
 
 
 def _layout_self_test():
-    """提交前自测：重写必须逐位复现 stock 位置。
-
-    用 stock 与本文机制各构建一次 stock 已支持的两端锚点，位置张量须
-    完全相等；再覆盖 stock 无对应物的部分：内部锚点、参考补偿、音频
-    平移、以及多参考 Ref2VA 布局中的同一次平移。ComfyUI 若改动位置
-    数学或段表则失败，补丁不予安装。
-    """
+    """校验重写后的关键帧位置与原始布局逐位一致；不一致则拒绝安装补丁。"""
     text_len, latent_t, lh, lw, audio_t = 7, 7, 22, 38, 16
-    frame_count = sum(mm.FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
+    frame_count = sum(mm.FRAME_PER_TOKEN[k % len(mm.FRAME_PER_TOKEN)] for k in range(latent_t))
 
     def build(keyframes=None, refs=None, fix=False, move=False):
         lay = mm.PackedLayout.__new__(mm.PackedLayout)
         _layout_orig_init(lay, text_len, latent_t, lh, lw, audio_t,
                           keyframes=keyframes, refs=refs)
         if fix:
-            _fixup(lay, text_len, latent_t, frame_count, keyframes, refs)
+            _fixup(lay, text_len, keyframes, refs)
         if move:
             _fixup_audio(lay, text_len, refs)
         return lay
@@ -310,13 +283,13 @@ def _layout_self_test():
         return [float(lay.position_ids[a, 0])
                 for a, _, k in lay.segments if k == "cond"]
 
-    # 1. stock 支持的两端锚点必须逐位一致
+    # 1. 未标记的关键帧必须与原始布局逐位一致
     dummy_lat = torch.zeros(1, 24, 1, lh // 2, lw // 2)
-    stock_kf = [{"resolved_frame_index": 0, "latent": dummy_lat},
+    plain_kf = [{"resolved_frame_index": 0, "latent": dummy_lat},
                 {"resolved_frame_index": frame_count - 1, "latent": dummy_lat}]
     ours_kf = [{"resolved_frame_index": 0, MC_KEY: 0, "latent": dummy_lat},
                {"resolved_frame_index": 0, MC_KEY: frame_count - 1, "latent": dummy_lat}]
-    a = build(keyframes=stock_kf)
+    a = build(keyframes=plain_kf)
     b = build(keyframes=ours_kf, fix=True)
     if a.position_ids.shape != b.position_ids.shape:
         raise RuntimeError("position_ids shape mismatch in self-test")
@@ -426,9 +399,7 @@ def _check_move(before, after, refs, idx, label):
     if any(abs(dd - deltas[0]) > 1e-9 for dd in deltas):
         raise RuntimeError("%s: audio rows shifted non-uniformly: %s"
                            % (label, deltas[:4]))
-    # 平移量本身故意不断言：它取决于参考游标前进多少，属 stock 行为，
-    # 在此固定等于把那份算术复制回来。必须成立的是窗口尾端位置：
-    # 在目标时间轴上为 FRAME_RESCALE * end_frame 相对目标原点处。
+    # 平移量本身不断言（取决于参考游标前进多少），只校验窗口尾端位置
     blk = refs[idx]
     rt = int(blk["ref_audio_t"])
     want_end = (_target_origin(after)
@@ -444,15 +415,11 @@ setattr(_patched_init, PATCH_MARKER_LAYOUT, True)
 
 
 def _layout_already_patched():
-    """构造函数当前由谁接管？返回 None/"same"/"other"/"backport"/"foreign"。
+    """判断 PackedLayout.__init__ 当前由谁接管。
 
-    多个包会内置本补丁，后加载者若把先加载者的包装器当作原始实现去包装
-    就会套上多层（各拷贝用已装好的版本自测，新旧行为互相校验会误拒绝）。
-    按可信度递减做四项检查：带标记的拷贝（匹配版本，静默退出）；同插件
-    反向移植包装器（MiniMax_H3.py 在旧核心上的 v0.34.0 布局，布局补丁在
-    其上叠加）；仅同名的包装器是旧拷贝或分支（先加载者决定支持范围，退出
-    并说明）；其余占着构造函数位置的是别的包在补同一处（按 __module__
-    归属判断，无法同时持有；被 __wrapped__ 隐藏的无法识别）。
+    返回 None（未接管）/"same"（本补丁）/"other"（同名旧拷贝）/
+    "backport"（本插件旧核心适配层）/"foreign"（其他包的包装器）。
+    已接管时不再叠加包装，避免多层包装与自测互相冲突。
     """
     cls = getattr(mm, "PackedLayout", None)
     init = getattr(cls, "__init__", None)
@@ -536,11 +503,10 @@ def _patched_extra_conds(self, **kwargs):
     keyframes = kwargs.get("minimax_keyframes", None)
     refs = kwargs.get("minimax_refs", None)
     if not keyframes or not refs:
-        return out  # 只有一种机制在起作用，stock 行为即正确
+        return out  # 只有一种机制在起作用，原始行为即正确
     if not (any(MC_KEY in kf for kf in keyframes)
             or any(MC_AUDIO_KEY in r for r in refs)):
-        # 与本包无关：布局补丁同款门控，不动 payload 可保持两补丁一致，
-        # 无关图与 stock 逐位一致
+        # 与本包无关：不动 payload，保持与原始行为一致
         return out
 
     cond = out.get("minimax_payload", None)
@@ -566,13 +532,7 @@ setattr(_patched_extra_conds, PATCH_MARKER_PAYLOAD, True)
 
 
 def _payload_already_patched(cls):
-    """extra_conds 当前由谁接管？返回 None/"same"/"backport"/"other"/"foreign"。
-
-    检测逻辑与 _layout_already_patched 相同：标记只识别新到能设置它的
-    拷贝，同插件反向移植 extra_conds（旧核心）已实现关键帧/引用共存合并
-    视为已应用，仅同名的包装器视为旧拷贝或分支（后加载者退出），其他
-    包装者是别的包在补同一处则拒绝叠包。
-    """
+    """判断 MiniMaxH3.extra_conds 当前由谁接管，返回值含义同 _layout_already_patched。"""
     fn = getattr(cls, "extra_conds", None)
     if fn is None:
         return None
@@ -662,7 +622,7 @@ def _ensure_payload_patch():
 
 
 def _snap_guide_frames(n):
-    """向下吸附到合法引导长度（17k+5：5/22/39/56…，同官方 Add Guide 多帧批处理）；小于 5 帧返回 0 由调用方报错。"""
+    """向下吸附到合法引导长度（17k+5：5/22/39/56…）；小于 5 帧返回 0 由调用方报错。"""
     n = int(n)
     if n < 5:
         return 0
@@ -672,8 +632,7 @@ def _snap_guide_frames(n):
 
 
 def _resize_guide(image, width, height):
-    """把引导帧缩放到目标分辨率（与官方 Add Guide _resize(..., "center") 逐位一致：
-    取前 3 通道、lanczos、保宽高比的居中裁剪）。"""
+    """把引导帧缩放为目标分辨率：取前 3 通道、lanczos、保宽高比的居中裁剪。"""
     samples = image[..., :3].movedim(-1, 1)
     samples = comfy.utils.common_upscale(samples, width, height, "lanczos",
                                          "center")
@@ -681,20 +640,10 @@ def _resize_guide(image, width, height):
 
 
 def _encode_guide_color_neutral(vae, guide, width, height, frames):
-    """把引导帧编码为关键帧 latent，并做「往返偏色闭环补偿」。
+    """把引导帧编码为关键帧 latent，并按一次编码→解码往返测得的逐通道均值偏移做补偿。
 
-    H3 视频 VAE 的 编码→解码 不是恒等映射：实测每过一遍往返各通道整体偏移
-    约 2~3/255，且逐段线性累积（锚定行被采样器当作 σ=0 真值，整段画面跟着
-    偏移），链条越长越发黄。这里先把引导帧过一遍往返量出偏移 b 再用 x − b 生成
-    关键帧——模型渲染出的锚定画面即等于上一段尾部的真实色调，切断「每段一次
-    往返」的累积回路。
-
-    只补偿**逐通道均值**（DC）：往返偏差主体就是 DC，而按像素全量相减
-    （x − (往返 − x) = 2x − 往返）等价于对引导做强度 1.0 的 USM——实测把引导的
-    高频能量抬到 3.4 倍、过冲光晕 2.3 倍，模型照抄这份「脆」引导后就在衔接处
-    留下锐化质感台阶，故此处只取均值（均值不改变任何梯度，锐化副作用为零，
-    偏色补偿效果不变）。往返结果帧数/分辨率不符时（罕见）放弃补偿，退回 stock
-    行为。"""
+    只补偿均值（DC），避免全量相减引入锐化；往返结果尺寸不符时跳过补偿直接编码。
+    """
     latent = vae.encode(guide.contiguous())
     rendered = vae.decode(latent)
     if rendered.ndim == 5:
@@ -708,10 +657,9 @@ def _encode_guide_color_neutral(vae, guide, width, height, frames):
 
 
 def _tail_audio_latent(audio_vae, waveform, sample_rate, frames):
-    """取波形尾部 frames 帧对应样本，按官方 Add Guide _encode_ref_audio 同路径编码。
+    """取波形尾部 frames 帧对应样本并编码为音频 latent。
 
-    样本数向下对齐 hop（800 样本/步≈25ms@32kHz），使包装器的编码前裁剪恰好
-    无操作、窗口尾端不发生亚步偏移。"""
+    样本数向下对齐 hop，使编码前的长度裁剪不产生亚步偏移。"""
     vae_sr = int(getattr(audio_vae, "audio_sample_rate", 32000))
     if waveform.ndim == 2:
         waveform = waveform[None]
@@ -744,14 +692,41 @@ def _tail_audio_latent(audio_vae, waveform, sample_rate, frames):
 # ============================================================================
 
 def _video_from_latent(latent):
-    """从 H3 AV 潜空间中取出视频流。"""
-    video = _streams_from_latent(latent)[0]
-    if video.ndim == 4:  # 未批量化 [C,T,H,W]
-        video = video.unsqueeze(0)
-    if video.ndim != 5:
-        raise ValueError("h3_motion_context: expected video latent [B,C,T,H,W], "
-                         "got shape %s" % (tuple(video.shape),))
-    return video
+    """从 H3 潜空间中取出视频流（24 通道 5D），不依赖流的排列顺序。"""
+    parts = _streams_from_latent(latent)
+    for part in parts:
+        candidate = part if part.ndim != 4 else part.unsqueeze(0)
+        if candidate.ndim == 5 and candidate.shape[1] == 24:
+            return candidate
+    raise ValueError(
+        "h3_motion_context: 未找到 24 通道的 5D 视频流，流形状=%s。"
+        % ([tuple(p.shape) for p in parts],))
+
+
+def _split_av_streams(latent):
+    """把 H3 AV 潜空间拆成 (视频流, 音频流)，按通道数识别视频流而非假设顺序。"""
+    parts = _streams_from_latent(latent)
+    video = None
+    audio = None
+    for part in parts:
+        candidate = part if part.ndim != 4 else part.unsqueeze(0)
+        if video is None and candidate.ndim == 5 and candidate.shape[1] == 24:
+            video = candidate
+        elif audio is None:
+            audio = part
+    if video is None:
+        raise ValueError(
+            "h3_motion_context: 未找到 24 通道的 5D 视频流，流形状=%s。"
+            % ([tuple(p.shape) for p in parts],))
+    if audio is None:
+        raise ValueError(
+            "h3_motion_context: AV 潜空间缺少音频流，请连接 H3 采样器的输出。")
+    if audio.ndim == 3:  # 未批量化 [C,2,T]
+        audio = audio.unsqueeze(0)
+    if audio.ndim != 4:
+        raise ValueError("h3_motion_context: 期望音频潜空间为 [B,C,2,T]，实际为 %s。"
+                         % (tuple(audio.shape),))
+    return video, audio
 
 
 def _steps_for_frames(n):
@@ -762,8 +737,9 @@ def _steps_for_frames(n):
     恰好落在 5/10/15/20 步上。
     """
     k, covered = 0, 0
+    period = len(FRAME_PER_TOKEN)
     while covered < n:
-        covered += FRAME_PER_TOKEN[k % 5]
+        covered += FRAME_PER_TOKEN[k % period]
         k += 1
     return k if covered == n else None
 
@@ -804,51 +780,20 @@ def _video_tail_from_latent(latent, n):
 
 
 def _audio_tail_from_latent(latent, a_frames):
-    """直接从生成的 H3 潜空间切出末尾 a_frames 帧对应的音频步，
-    跳过解码→重编码往返。
-
-    返回 (tail [1,C,2,rt], rt, overhang)：rt 为 40Hz 潜空间步数，
-    overhang 是片段音频网格超出最后一个像素帧的分数步。H3 把音频网格
-    向上取整（124 帧要 206.67 步，布局分配 207），末步超出末帧约
-    overhang/40 s。调用方不用 overhang 平移放置：窗口尾端改与裁剪节点
-    的精确音频切点对齐，固定窗口始终落在被裁头部内（见 apply）。
-    """
-    parts = _streams_from_latent(latent)
-    if len(parts) < 2:
-        raise ValueError(
-            "h3_motion_context: context_latent has no audio stream. Wire the "
-            "sampler output of an H3 AV graph, not a video-only latent.")
-    video, audio = parts[0], parts[1]
-    if video.ndim == 4:
-        video = video.unsqueeze(0)
-    if audio.ndim == 3:  # 未批量化 [C,2,T]
-        audio = audio.unsqueeze(0)
-    if audio.ndim != 4:
-        raise ValueError("h3_motion_context: expected audio latent [B,C,2,T], "
-                         "got shape %s" % (tuple(audio.shape),))
+    """从 AV 潜空间尾部切出 a_frames 帧对应的音频步，返回 (尾段, 步数)。"""
+    _, audio = _split_av_streams(latent)
     total_t = int(audio.shape[-1])
-    frames = _pixel_frames(int(video.shape[2]))
-    overhang = total_t - FRAME_RESCALE * frames
-    if not (0.0 <= overhang < 1.0):
-        overhang = 0.0
     rt = int(round(a_frames / float(FPS) * AUDIO_HZ))
     if rt > total_t:
         rt = total_t
     if rt < 1:
-        raise ValueError("h3_motion_context: audio window is empty")
+        raise ValueError("h3_motion_context: 音频上下文窗口为空")
     tail = audio[:1, ..., total_t - rt:].clone()
-    return tail, rt, float(overhang)
+    return tail, rt
 
 
 def _silence_audio_latent(audio_vae, audio_t):
-    """把真实的数字静音（零波形）编码为恰好 audio_t 步的音频潜空间。
-
-    潜空间直接填零不是静音：音频 VAE 编码器带偏置，零潜空间解码出来是
-    非静音内容，必须把真正的零波形送进编码器。波形取 audio_t * hop 个
-    样本（32kHz、每步 800 样本），编码器无需补零，输出步数精确等于
-    audio_t。encode 走 VAE 包装器通道置后约定（与 VAEEncodeAudio 相同：
-    movedim(1,-1) 后由包装器转回 [B,2,L]）。
-    """
+    """把真实的零波形编码为恰好 audio_t 步的音频潜空间（潜空间直接填零不是静音）。"""
     hop = int(getattr(audio_vae, "downscale_ratio", 800))
     samples = int(audio_t) * hop
     waveform = torch.zeros(1, 2, samples)  # [B, 声道, 样本] 立体声数字静音
@@ -983,8 +928,8 @@ def _read_mp4(path, clip_index=None):
             sample_rate = int(audio_stream.codec_context.sample_rate or 48000)
             resampler = av.audio.resampler.AudioResampler(
                 format="fltp", layout="stereo", rate=sample_rate)
-        # 视频/音频须在同一次 decode 中交错取帧：先取完单流会把文件读到
-        # EOF，后续再 decode 另一流将拿不到任何帧（av 18 实测返回空）
+        # 视频/音频须在同一次 decode 中交错取帧：先取完单流会把文件读到 EOF，
+        # 后续再 decode 另一流将拿不到任何帧
         targets = [s for s in (video_stream, audio_stream) if s is not None]
         for frame in container.decode(*targets):
             if isinstance(frame, av.VideoFrame):
@@ -1146,13 +1091,9 @@ def _save_av_latent(latent, 存储位置, 片段序号):
     if _st_save is None:
         raise RuntimeError("h3_motion_context: safetensors is not "
                            "available; cannot save latents.")
-    parts = _streams_from_latent(latent)
-    if len(parts) < 2:
-        raise ValueError(
-            "h3_motion_context: latent has no audio stream; wire the "
-            "sampler output of an H3 AV graph.")
-    video = parts[0].cpu().contiguous()
-    audio = parts[1].cpu().contiguous()
+    video, audio = _split_av_streams(latent)
+    video = video.cpu().contiguous()
+    audio = audio.cpu().contiguous()
     # 文件前缀固定为 latent，用户只能设置存储目录
     full_prefix = os.path.join(存储位置, "latent")
     folder, filename, _, _, _ = folder_paths.get_save_image_path(
@@ -1166,19 +1107,11 @@ def _save_av_latent(latent, 存储位置, 片段序号):
 
 
 def _tail_portion_latent(delivered, tail_len):
-    """从交付潜空间（已裁头）的尾部切出至多 tail_len 帧的尾段潜空间。
+    """从已裁头的交付潜空间尾部切出至多 tail_len 帧，供下一片段衔接。
 
-    保存到本地的只取交付部分的「后段」而非整段：下一片段的运动上下文
-    只需要尾部窗口，文件更小、目录指纹更快。切点对齐整 VRF 组边界
-    （帧数 ≡ 0 mod 17），切出的尾段自身时序相位锚定在步 0，可被
-    「H3 运动上下文」正常取尾部窗口；交付帧数不足时退化为
-    保存整个交付潜空间。
+    切点对齐整 VRF 组（17 的倍数），使尾段相位从步 0 开始；交付帧数不足时原样返回。
     """
-    video, audio = _streams_from_latent(delivered)[:2]
-    if video.ndim == 4:
-        video = video.unsqueeze(0)
-    if audio.ndim == 3:
-        audio = audio.unsqueeze(0)
+    video, audio = _split_av_streams(delivered)
     total = _pixel_frames(int(video.shape[2]))
     m = max(0, int(tail_len))
     m -= m % 17
@@ -1303,18 +1236,10 @@ def _find_latent_in_output(idx):
 class Yuan_H3MotionContext:
     """把上一片段尾部画面/音频固定为本片段开头。
 
-    「衔接模式」决定数据路径：
-    - 视频图像（默认）：以 resolved_frame_index=0 锚定，与官方 Add Guide
-      同路径——画面经视频 VAE 编码、音频经音频 VAE 编码后追加进
-      minimax_keyframes（可与官方引导节点自由混用）。画面编码前做往返
-      偏色闭环补偿（按逐通道均值抵消视频 VAE 编码→解码的非恒等 DC 偏移，
-      防链条逐段累积发黄，且不引入锐化）。
-    - 潜空间：直接从上一片段的 H3 AV 潜空间尾部切片（跳过解码/重编码，
-      无质量损失），内部锚点由布局补丁经 MC_KEY 承载。要求两片段分辨率
-      一致、窗口为整 VRF 组（17 的倍数）。
-
-    上下文来源由「模式」决定：上传 / 端口 / 自动索引（视频图像模式读
-    .mp4，潜空间模式读 .safetensors）。"""
+    「视频图像」：画面/音频经 VAE 编码为关键帧，追加进 minimax_keyframes；
+    「潜空间」：直接切片上一段 AV 潜空间，要求分辨率一致、窗口为整 VRF 组。
+    上下文来源：上传 / 端口 / 自动索引。
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1509,36 +1434,25 @@ class Yuan_H3MotionContext:
             hint = "已关联片段 %s 文件" % media.get(
                 CONTEXT_CLIP_INDEX_KEY, "?")
 
-        # 仅读取本片段形状：按「通道数 24」从 AV 两流中识别视频流（不假设顺序），
-        # 兼容 NestedTensor 与普通 (video, audio) 元组
-        parts = _streams_from_latent(潜空间)
-        video = None
-        for pt in parts:
-            v = pt if pt.ndim != 4 else pt.unsqueeze(0)
-            if v.ndim == 5 and v.shape[1] == 24:
-                video = v
-                break
-        if video is None:
-            raise ValueError(
-                "h3_motion_context: 未在 AV 潜空间中找到 24 通道视频流，流形状="
-                "%s。请连接 MiniMax H3 采样器/空潜空间节点的输出。"
-                % ([tuple(t.shape) for t in parts],))
+        # 仅读取本片段形状：按通道数识别视频流，兼容 NestedTensor 与普通元组；
+        # 纯视频 latent（无音频流）也允许，此时不做音频轨长度裁剪
+        video = _video_from_latent(潜空间)
+        audio_stream = None
+        for part in _streams_from_latent(潜空间):
+            candidate = part if part.ndim != 4 else part.unsqueeze(0)
+            if candidate.ndim == 5 and candidate.shape[1] == 24:
+                continue
+            audio_stream = part
+            break
         latent_t = int(video.shape[2])
         width = int(video.shape[4]) * 16
         height = int(video.shape[3]) * 16
         frame_count = _pixel_frames(latent_t)
-        track_steps = None
-        for pt in parts:
-            if pt.ndim >= 1 and pt.shape[0] == 1 and pt.ndim >= 3 and pt is not video:
-                try:
-                    track_steps = int(pt.shape[-1])
-                except (TypeError, ValueError):
-                    pass
+        track_steps = int(audio_stream.shape[-1]) if audio_stream is not None else None
 
         pixels = media["pixels"]
-        # 媒体像素约定 [T,H,W,3]；仅去掉真实的批维（5D [B,T,H,W,3]）。
-        # 4D 就是帧序列本身，不能截断——早期把 4D 误当批维截成首帧，正是
-        # 「裁剪保存的尾段加载后只剩 1 帧/引导断裂」的根因之一。
+        # 媒体像素约定 [T,H,W,3]；只有 5D [B,T,H,W,3] 才去掉批维，
+        # 4D 本身就是帧序列，不能再截断
         if pixels.ndim == 5:
             pixels = pixels[0]
         elif pixels.ndim == 3:  # 单帧 [H,W,3] 补帧轴，交由下方帧数校验兜底
@@ -1639,12 +1553,10 @@ class Yuan_H3MotionContext:
     def _apply_latent(self, 条件化, 潜空间, 启用上下文, 模式, 存储位置, 片段序号,
                       上下文长度, 音频上下文长度, 衔接余量, audio_vae,
                       上下文潜空间, 手动上传):
-        """潜空间衔接：直接在上一片段的 AV 潜空间上切片。
+        """潜空间衔接：直接从上一片段的 AV 潜空间切片，不做解码/重编码。
 
-        与「视频图像」路径的关键差别：不经过「解码→重编码」，因此不损失质量，
-        代价是分辨率必须与本片段一致、窗口必须是整 VRF 组（17 的倍数）。把
-        锚点放在片段内部（而非仅首/末帧）需要布局补丁；让关键帧与引用共存需要
-        载荷补丁——两补丁都带 ABI 标记门控、先自测再安装，失败即拒绝运行。"""
+        要求分辨率一致、窗口为整 VRF 组；内部锚点与关键帧/引用共存由布局、载荷两补丁支持。
+        """
         if not 启用上下文:
             # 直通：尾段保存长度固定一个整组（17 帧）
             return {"result": (条件化, "0:17"), "ui": {
@@ -1698,18 +1610,22 @@ class Yuan_H3MotionContext:
 
         available = _pixel_frames(int(src_video.shape[2]))
         n = min(int(上下文长度), available)
-        if n < 1:
-            raise ValueError("h3_motion_context: 上下文潜空间没有可锚定的帧。")
+        if n < 5:
+            raise ValueError(
+                "h3_motion_context: 上下文潜空间仅有 %d 帧，不足最小引导窗 5 帧。"
+                % available)
         # 切片前对齐到整组网格，使切出的帧正好是整 VRF 组覆盖的帧
-        n = next(g for g in VIDEO_RUN_GRID if g <= n)
+        n = next((g for g in VIDEO_RUN_GRID if g <= n), 0)
 
-        # 衔接余量：在锚定窗之外、可见剪起点之前多留一段整组长度的沉降区，
-        # 让模型不被强制对齐上片段尾帧、平滑过渡到全新内容
+        # 衔接余量：在锚定窗之外、可见剪起点之前多留一段整组长度的沉降区
         margin = int(衔接余量 or 0)
-        # 裁剪量取画面窗、音频窗、画面窗+衔接余量 的较大值并吸附整组：
-        # 音频窗口可比画面窗口长，只裁画面窗会让固定音频泄漏进交付部分
-        trim_frames = next(g for g in VIDEO_RUN_GRID
-                           if g <= max(n, int(音频上下文长度), n + margin))
+        # 裁剪量取画面窗、音频窗、画面窗+衔接余量 的较大值并吸附整组
+        trim_frames = next((g for g in VIDEO_RUN_GRID
+                            if g <= max(n, int(音频上下文长度), n + margin)), 0)
+        if trim_frames < 5:
+            raise RuntimeError(
+                "h3_motion_context: 无法从 VIDEO_RUN_GRID 选出裁剪长度，"
+                "请检查节点实现是否与 H3 VAE 匹配。")
 
         if n >= frame_count:
             raise ValueError(
@@ -1730,21 +1646,21 @@ class Yuan_H3MotionContext:
         span = covered
         indices = ([o - span for o in offsets] if ANCHOR_MODE == "before"
                    else list(offsets))
-        keyframes = [{"resolved_frame_index": 0, MC_KEY: p, "latent": blk}
-                     for p, blk in zip(indices, blocks)]
+        # 追加到已有 keyframes（而非整表替换），可与其他关键帧节点混用
+        existing_keyframes = list(条件化[0][1].get("minimax_keyframes", []))
+        keyframes = existing_keyframes + [
+            {"resolved_frame_index": 0, MC_KEY: p, "latent": blk}
+            for p, blk in zip(indices, blocks)
+        ]
         values = {"minimax_keyframes": keyframes,
                   "minimax_frame_count": frame_count}
 
         # 音频上下文：大于 0 时切上下文潜空间尾部声音；为 0 且连接音频 VAE 时
-        # 固定真实编码的静音（潜空间填零不是静音）。H3 是联合音视频模型：
-        # 不装音频引用时，固定的上一片段画面会诱导模型为头部配出上一片段的
-        # 声音并延续进交付部分（污染）；静音窗口把音频上下文锚定为「上一片段
-        # 以无声结尾」，交付部分只跟随本片段提示词生成全新音频
-        _ensure_payload_patch()
+        # 固定真实编码的静音，避免固定画面诱导模型带出上一片段的声音
         audio_ref = None
         audio_silent = False
         if int(音频上下文长度) > 0:
-            audio_latent, ref_audio_t, _overhang = _audio_tail_from_latent(
+            audio_latent, ref_audio_t = _audio_tail_from_latent(
                 上下文潜空间, int(音频上下文长度))
             audio_ref = {"kind": "audio", "ref_audio_t": ref_audio_t,
                          "audio_latent": audio_latent}
@@ -1754,16 +1670,17 @@ class Yuan_H3MotionContext:
                          "audio_latent": _silence_audio_latent(
                              audio_vae, ref_audio_t)}
             audio_silent = True
+        # 只有关键帧与引用需要共存时才安装载荷补丁
+        if audio_ref is not None or (条件化 and 条件化[0][1].get("minimax_refs")):
+            _ensure_payload_patch()
         if audio_ref is not None:
             if AUDIO_MODE == "timeline":
                 # 音频窗口尾端与「运动裁剪」的音频裁剪量用同一表达式，
-                # 使固定窗口整体落在被裁头部内：既不泄漏（固定内容越过交付
-                # 边界）也不误删（新生成音频被当作固定段）
+                # 使固定窗口整体落在被裁头部内
                 end_frame = float(trim_frames if ANCHOR_MODE == "head" else 0)
                 end_coord = int(round(end_frame * FRAME_RESCALE))
                 audio_ref[MC_AUDIO_KEY] = end_coord / FRAME_RESCALE
-            # APPEND 而非赋值：Ref2VA 条件化可能已携带图自身的引用块，
-            # 赋值会替换全部；用第二次调用让关键帧值先落位
+            # APPEND 而非赋值：Ref2VA 条件化可能已携带图自身的引用块
             out = node_helpers.conditioning_set_values(条件化, values)
             out = node_helpers.conditioning_set_values(
                 out, {"minimax_refs": [audio_ref]}, append=True)
@@ -1798,26 +1715,14 @@ class Yuan_H3MotionContext:
 # ============================================================================
 
 class Yuan_H3MotionContextTrim:
-    """两种衔接模式下的 AV 潜空间两段式裁切，输出槽随模式切换。
+    """按「裁剪帧数」对 AV 潜空间做两段式裁切，输出槽随「衔接模式」切换。
 
-    两模式共用第一次裁切的语义：按「裁剪帧数」"状态:长度"从头裁掉被固定窗口
-    覆盖的部分，再按「保存到本地」开关把交付部分尾部的一段存盘，供下一片段
-    「H3 运动上下文」加载衔接（可端口直连，也可按 存储位置+片段序号 自动索引）。
+    - 视频图像：解码为图像+音频后按像素裁切，尾段存 clip_%05d.mp4，输出 IMAGE+AUDIO；
+    - 潜空间：直接在 AV 潜空间按整 VRF 组裁切，尾段存 latent_%05d_.safetensors，输出 LATENT；
+    - 解码模式：只解码，不裁切、不存盘。
 
-    「视频图像」模式：把 AV 潜空间解码为图像+音频后处理——像素域裁切无 VRF
-    相位约束，任意帧数均可干净裁掉，音频按 24fps→采样率同步换算；尾段以无损
-    mp4（clip_%05d.mp4）保存，输出 IMAGE+AUDIO。解码→重编码即官方 Add Guide
-    的条件来源路径，天然重置采样器原始潜空间逐链累积的亮度漂移。
-
-    「潜空间」模式：不解码，直接在 AV 潜空间上裁切——头部整组裁掉（帧数向下
-    吸附到 17 的倍数，避免打乱剩余潜空间的 VRF 相位导致闪烁），音频按
-    40Hz/24fps = 5/3 同步裁步，尾段以 safetensors（latent_%05d_.safetensors）
-    保存，输出 LATENT（直连下一片段「H3 运动上下文」的「上下文潜空间」）。
-    跳过解码/重编码无质量损失，但要求两片段分辨率一致。
-
-    「解码模式」：只走「视频图像」的解码段，输出整段 IMAGE+AUDIO，不裁头、
-    不存盘——纯解码器用法。前端在该模式下移除「裁剪帧数」输入端口并隐藏
-    「片段序号」「保存到本地」「存储位置」，后端对应参数一律不读。"""
+    尾段供下一片段「H3 运动上下文」加载衔接。
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1974,17 +1879,7 @@ class Yuan_H3MotionContextTrim:
         """AV 潜空间 → 像素帧与波形（「视频图像」与「解码模式」共用的解码段）。
 
         返回 (pixels [T,H,W,3], wave [B,2,L], sample_rate)。"""
-        parts = _streams_from_latent(潜空间)
-        if len(parts) < 2:
-            raise ValueError(
-                "h3_motion_context: 需要含视频和音频两流的 AV 潜空间，"
-                "得到 %d 个流。请连接 H3 采样器的输出。"
-                % len(parts))
-        video, audio = parts[0], parts[1]
-        if video.ndim == 4:
-            video = video.unsqueeze(0)
-        if audio.ndim == 3:
-            audio = audio.unsqueeze(0)
+        video, audio = _split_av_streams(潜空间)
         # 解码：视频流 → [T,H,W,3] 像素帧；音频流 → [1,2,L] 波形
         # （VAE 包装器 decode 返回 [B,L,2]，movedim 回 ComfyUI AUDIO
         # 约定的 [B,声道,样本]）
@@ -2026,7 +1921,7 @@ class Yuan_H3MotionContextTrim:
             if state:
                 n, tail = maxlen, maxlen
             else:
-                n, tail = 0, 17
+                n, tail = 0, maxlen
         else:
             try:
                 n = int(float(s or 0))
@@ -2039,17 +1934,7 @@ class Yuan_H3MotionContextTrim:
         n -= n % 17
         tail = max(0, tail)
         tail -= tail % 17
-        parts = _streams_from_latent(潜空间)
-        if len(parts) < 2:
-            raise ValueError(
-                "h3_motion_context: 裁剪需要含视频和音频两流的 AV 潜空间，"
-                "得到 %d 个流。请连接 H3 采样器的输出。"
-                % len(parts))
-        video, audio = parts[0], parts[1]
-        if video.ndim == 4:
-            video = video.unsqueeze(0)
-        if audio.ndim == 3:
-            audio = audio.unsqueeze(0)
+        video, audio = _split_av_streams(潜空间)
         total = _pixel_frames(int(video.shape[2]))
         if n >= total:
             raise ValueError(
@@ -2057,8 +1942,9 @@ class Yuan_H3MotionContextTrim:
                 % (n, total))
         # 前 n 帧覆盖的视频 latent 步数（每步覆盖 1/4/4/4/4 帧交替）
         k, removed = 0, 0
+        period = len(FRAME_PER_TOKEN)
         while removed < n:
-            removed += FRAME_PER_TOKEN[k % 5]
+            removed += FRAME_PER_TOKEN[k % period]
             k += 1
         video = video[:, :, k:].clone()
         # 音频流按 40Hz/24fps = 5/3 同步裁掉头部步数
@@ -2092,10 +1978,7 @@ class Yuan_H3MotionContextTrim:
 def _save_av_media(pixels, waveform, sample_rate, 存储位置, 片段序号):
     """把尾段媒体（像素帧+音频波形）混流存为 {输出}/{存储位置}/clip_%05d.mp4。
 
-    视频用 libx264 无损模式（yuv444p + crf 0）作为引导中间格式：画面是下一片段
-    VAE 重编码的引导源，任何有损伪影都会随链条逐段累积（画面污染）；无损保存把
-    该累积归零。音频仍 aac。重生成同一片段覆盖自身、不堆叠；文件名与「H3 运动
-    上下文」自动索引加载约定一致（读取端对旧 yuv420 文件同样可解码）。
+    视频用 libx264 无损模式（yuv444p + crf 0），音频用 aac；同一片段重复生成会覆盖。
     """
     import av
     # pixels 约定 [T,H,W,3]；仅当仍带 [B,...] 批维（5D）时才塌缩首帧轴
@@ -2124,8 +2007,7 @@ def _save_av_media(pixels, waveform, sample_rate, 存储位置, 片段序号):
     # 必须显式指定 format="mp4"
     container = av.open(tmp_path, mode="w", format="mp4")
     try:
-        # 两个流须先于任何写包建好（av 18 在已有时间戳后再加流会报
-        # "Cannot rebase to zero time"）；先建后按序编码并无冲突
+        # 两个流须先于任何写包建好，避免已有时间戳后再加流导致封装器报错
         vstream = container.add_stream("libx264", rate=FPS)
         vstream.width = w
         vstream.height = h

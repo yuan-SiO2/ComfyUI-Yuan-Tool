@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 
 import torch
 import torch.nn as nn
@@ -23,6 +24,94 @@ if LATENT_UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
         LATENT_UPSCALE_FOLDER,
         os.path.join(folder_paths.models_dir, LATENT_UPSCALE_FOLDER),
     )
+
+
+def _block_sequence(sd, prefix, total):
+    """按 ModuleList 下标还原 in_blocks/out_blocks 的模块类型序列（R=残差块，T=时间卷积）。"""
+    sequence = []
+    for index in range(total):
+        if f"{prefix}.{index}.dwconv.weight" in sd:
+            sequence.append("T")
+        elif any(key.startswith(f"{prefix}.{index}.in_layers.") for key in sd):
+            sequence.append("R")
+        else:
+            sequence.append("?")
+    return sequence
+
+
+def _infer_temporal_every(sd, prefix, block_count):
+    """用模块类型序列匹配候选 temporal_every。
+
+    ModuleList 的下标不等于 block 下标（每个 block 后面可能插入 TemporalConv），
+    因此不能用 dwconv 下标的间隔取 gcd；这里按构造顺序重建序列后逐候选比对。
+    """
+    if block_count <= 0:
+        return 0
+    max_index = -1
+    for key in sd:
+        match = re.match(rf"{prefix}\.(\d+)\.", key)
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    if max_index < 0:
+        return 0
+    observed = _block_sequence(sd, prefix, max_index + 1)
+    if "T" not in observed:
+        return 0
+    for candidate in range(1, block_count + 1):
+        simulated = []
+        for block in range(block_count):
+            simulated.append("R")
+            if block % candidate == 0:
+                simulated.append("T")
+        if simulated == observed:
+            return candidate
+    # 含未知模块（如 checkpoint 带 attention）时退回训练默认值
+    return 2
+
+
+def detect_arch(sd):
+    """从 state_dict 的键名与张量形状推断网络结构参数。"""
+    cfg = {
+        "in_channels": 24,
+        "in_blocks": 12,
+        "out_blocks": 12,
+        "channels": 512,
+        "dropout": 0.1,
+        "attn": False,
+        "temporal_every": 2,
+        "temporal_kernel": 5,
+    }
+
+    if "conv_in.weight" in sd:
+        cfg["in_channels"] = sd["conv_in.weight"].shape[1]
+        cfg["channels"] = sd["conv_in.weight"].shape[0]
+
+    in_ids, out_ids = set(), set()
+    for key in sd:
+        match = re.match(r"in_blocks\.(\d+)\.in_layers\.", key)
+        if match:
+            in_ids.add(int(match.group(1)))
+        match = re.match(r"out_blocks\.(\d+)\.in_layers\.", key)
+        if match:
+            out_ids.add(int(match.group(1)))
+
+    if in_ids:
+        cfg["in_blocks"] = len(in_ids)
+    if out_ids:
+        cfg["out_blocks"] = len(out_ids)
+
+    cfg["temporal_every"] = _infer_temporal_every(sd, "in_blocks", cfg["in_blocks"])
+    if cfg["temporal_every"] == 0:
+        cfg["temporal_every"] = _infer_temporal_every(sd, "out_blocks", cfg["out_blocks"])
+    if cfg["temporal_every"] > 0:
+        for key in sd:
+            if key.endswith("dwconv.weight"):
+                cfg["temporal_kernel"] = sd[key].shape[2]
+                break
+
+    # 推理时强制关闭注意力，保证与推理实现一致
+    cfg["attn"] = False
+    return cfg
 
 
 def normalization(channels):

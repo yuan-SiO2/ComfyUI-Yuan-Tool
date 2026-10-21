@@ -131,20 +131,20 @@ class YuanMiniMaxH3Video:
     @classmethod
     def INPUT_TYPES(cls):
         def image_port(display, tip, extra=None):
-            cfg = {"optional": True, "display_name": display, "tooltip": tip}
+            cfg = {"display_name": display, "tooltip": tip}
             if extra:
                 cfg.update(extra)
             return ("IMAGE", cfg)
 
         def audio_port(display, tip):
-            return ("AUDIO", {"optional": True, "display_name": display, "tooltip": tip})
+            return ("AUDIO", {"display_name": display, "tooltip": tip})
 
         optional = {
             # ---- 图生视频模式 ----
             "first_frame": image_port("首帧图像", "视频首帧图像，作为几何锚点"),
             "last_frame": image_port("尾帧图像", "视频尾帧图像"),
             # ---- 参考图生视频模式 ----
-            "audio_vae": ("VAE", {"optional": True, "display_name": "音频VAE",
+            "audio_vae": ("VAE", {"display_name": "音频VAE",
                                   "tooltip": "用于编码参考音频的音频 VAE 模型"}),
             "ref_image_size": (["匹配", "最大"], {"default": "匹配", "display_name": "参考图尺寸",
                 "tooltip": "参考图缩放策略：'匹配'缩放至画面像素面积（仅缩小、保宽高比）；'最大'用参考管线的 2048px 短边，保真度更高但明显更慢。"}),
@@ -189,7 +189,7 @@ class YuanMiniMaxH3Video:
 
     def execute(self, mode, clip, vae, prompt, width, height, length,
                 first_frame=None, last_frame=None,
-                audio_vae=None, ref_image_size="match", ref_images=None,
+                audio_vae=None, ref_image_size="匹配", ref_images=None,
                 guide_frame_idx=0, guide_image=None, guide_audio=None,
                 **kwargs):
         if mode == MODE_REFERENCE:
@@ -229,7 +229,7 @@ class YuanMiniMaxH3Video:
         if keyframes:
             for kf in keyframes:
                 kf["latent"] = vae.encode(kf.pop("image"))
-            # minimax_frame_count 仅旧核心(<v0.34.0)消费（新版 PackedLayout 用 resolved_frame_index 支持末帧锚点），保留兜底
+            # 同时写入 frame_count，兼容仅识别该字段的旧核心
             cond = node_helpers.conditioning_set_values(cond, {"minimax_keyframes": keyframes,
                                                                "minimax_frame_count": frame_count})
         return (cond, latent)
@@ -248,7 +248,7 @@ class YuanMiniMaxH3Video:
         height = video.shape[3] * 16
         width = video.shape[4] * 16
         # 由视频潜空间反推总帧数：首 token 1 帧，其后每 token 4 帧，5 个一组循环
-        frame_count = sum(FRAME_PER_TOKEN[k % 5] for k in range(video.shape[2]))
+        frame_count = sum(FRAME_PER_TOKEN[k % len(FRAME_PER_TOKEN)] for k in range(video.shape[2]))
 
         # 引导图像：单帧直接锚定；多帧（>=5）作为短片，向下对齐到 17k+5 帧网格
         guide_frames = 1
@@ -287,7 +287,7 @@ class YuanMiniMaxH3Video:
         # 写入 minimax_keyframes（数字人模式下引导是唯一关键帧）
         keyframes = list(cond[0][1].get("minimax_keyframes", []))
         keyframes.append(keyframe)
-        # 同样补写 minimax_frame_count（v0.34.0 核心无消费者，仅为旧核心兜底保留）
+        # 同时补写 frame_count，兼容仅识别该字段的旧核心
         return node_helpers.conditioning_set_values(cond, {"minimax_keyframes": keyframes,
                                                            "minimax_frame_count": frame_count})
 
