@@ -30,9 +30,8 @@ ICLoRAParameters = "IC_LORA_PARAMETERS"
 
 
 # ==============================================================================
-# K/V 视觉特征注入：把参考帧视觉特征注入 @图X token 的 K/V
-# 注入点：transformer_blocks.{idx}.attn2.forward；公式：k[marker] = k[marker]*(1-alpha) + ref_k*alpha
-# 段外帧的注意力抑制由 Timeline 生成的 token 级 mask（promptrelay_mask_fn）负责
+# K/V 视觉特征注入：把参考帧视觉特征按 alpha 混入 @图X token 的 K/V
+# 段外帧的注意力抑制由 Timeline 下发的 token 级 mask 负责
 # ==============================================================================
 
 def _positive_batch_mask(transformer_options, batch_size, device):
@@ -139,7 +138,7 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
         ).flatten(2)
     del q, k, v
 
-    # gate（LTX2 零初始化门控，identity 初始化）
+    # gate（零初始化门控）
     if self.to_gate_logits is not None:
         gate_logits = self.to_gate_logits(x)
         b, t, _ = out.shape
@@ -314,41 +313,43 @@ def _load_motion_video_frames(video_file, trim_start_frames, length_frames, dire
     if not _HAS_AV:
         raise RuntimeError("运动引导视频解码需要 PyAV 库，请执行 `pip install av` 安装")
     container = av.open(path)
-    stream = container.streams.video[0]
-    stream.thread_type = "AUTO"
     try:
-        source_fps = float(stream.average_rate) if stream.average_rate else float(stream.base_rate)
-    except Exception:
-        source_fps = target_fps
-    if source_fps <= 0:
-        source_fps = target_fps
-
-    if start_s > 0:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
         try:
-            if stream.time_base:
-                seek_pts = int(max(0, start_s - 0.5) / float(stream.time_base))
-            else:
-                seek_pts = int(max(0, start_s - 0.5) * av.time_base)
-            container.seek(seek_pts, stream=stream, backward=True)
+            source_fps = float(stream.average_rate) if stream.average_rate else float(stream.base_rate)
         except Exception:
-            pass
+            source_fps = target_fps
+        if source_fps <= 0:
+            source_fps = target_fps
 
-    frames = []
-    decoded_count = 0
-    for frame in container.decode(stream):
-        if frame.time is not None:
-            t = float(frame.time)
-        elif frame.pts is not None and stream.time_base is not None:
-            t = float(frame.pts * stream.time_base)
-        else:
-            t = float(decoded_count / source_fps)
-        decoded_count += 1
-        if t < start_s - 0.01:
-            continue
-        if end_s is not None and t >= end_s:
-            break
-        frames.append(frame.to_ndarray(format="rgb24"))
-    container.close()
+        if start_s > 0:
+            try:
+                if stream.time_base:
+                    seek_pts = int(max(0, start_s - 0.5) / float(stream.time_base))
+                else:
+                    seek_pts = int(max(0, start_s - 0.5) * av.time_base)
+                container.seek(seek_pts, stream=stream, backward=True)
+            except Exception:
+                pass
+
+        frames = []
+        decoded_count = 0
+        for frame in container.decode(stream):
+            if frame.time is not None:
+                t = float(frame.time)
+            elif frame.pts is not None and stream.time_base is not None:
+                t = float(frame.pts * stream.time_base)
+            else:
+                t = float(decoded_count / source_fps)
+            decoded_count += 1
+            if t < start_s - 0.01:
+                continue
+            if end_s is not None and t >= end_s:
+                break
+            frames.append(frame.to_ndarray(format="rgb24"))
+    finally:
+        container.close()
     if not frames:
         raise ValueError(f"未能解码运动引导分段的视频帧：{video_file}")
 
@@ -583,10 +584,18 @@ class YuanClipGuide:
     @classmethod
     def append_keyframe(cls, positive, negative, frame_idx, latent_image, noise_mask,
                         guiding_latent, strength, scale_factors,
-                        guide_mask=None, in_channels=128, latent_downscale_factor=1, causal_fix=None):
+                        guide_mask=None, latent_downscale_factor=1, causal_fix=None):
         """核心方法：拼接引导 latent 到主 latent 末尾，更新 noise_mask 和 keyframe_idxs。"""
-        if latent_image.shape[1] != in_channels or guiding_latent.shape[1] != in_channels:
+        # 只支持在普通 5D 视频 latent 尾部追加；联合 AV latent 是嵌套结构，不能直接 cat
+        if getattr(latent_image, "is_nested", False) or getattr(guiding_latent, "is_nested", False):
             raise ValueError("Adding guide to a combined AV latent is not supported.")
+        if latent_image.ndim != 5 or guiding_latent.ndim != 5:
+            raise ValueError("引导注入仅支持 5D 视频 latent。")
+        if latent_image.shape[1] != guiding_latent.shape[1]:
+            raise ValueError(
+                f"引导 latent 通道数 {guiding_latent.shape[1]} 与主 latent "
+                f"{latent_image.shape[1]} 不一致，无法拼接。"
+            )
 
         positive = cls.add_keyframe_index(
             positive, frame_idx, guiding_latent, scale_factors, latent_downscale_factor, causal_fix=causal_fix
@@ -609,13 +618,6 @@ class YuanClipGuide:
                 max(0.0, 1.0 - strength),
                 dtype=noise_mask.dtype,
                 device=noise_mask.device,
-            )
-
-        # 音视频混合 latent 的通道对齐
-        if latent_image.shape[1] > guiding_latent.shape[1]:
-            pad_len = latent_image.shape[1] - guiding_latent.shape[1]
-            guiding_latent = torch.nn.functional.pad(
-                guiding_latent, pad=(0, 0, 0, 0, 0, 0, 0, pad_len), value=0
             )
 
         latent_image = torch.cat([latent_image, guiding_latent], dim=2)
@@ -818,11 +820,14 @@ class YuanClipGuide:
                 _msr_total_b = max(_valid_nums) if _valid_nums else len(_slot_nums)
 
             # 补帧对齐：合并段总帧数须满足 (N-1)%time_scale_factor==0，否则截断会丢帧
-            for seg in merged_segments:
+            # 复制后再改，避免修改上游 motionSegments 的字典
+            for i, seg in enumerate(merged_segments):
                 if seg.get("isStaticImage"):
                     total_len = seg.get("length", 0)
                     if total_len > 0 and (total_len - 1) % time_scale_factor != 0:
+                        seg = dict(seg)
                         seg["length"] = ((total_len - 1) // time_scale_factor + 1) * time_scale_factor + 1
+                        merged_segments[i] = seg
 
             for seg in merged_segments:
                 try:
@@ -1026,7 +1031,7 @@ class YuanClipGuide:
 
     @classmethod
     def _apply_ref_guidance_patch(cls, model, marker_token_indices, ref_alpha, subject_ref_features=None):
-        """把 K/V 注入参数绑定到 attn2 并替换其 forward（仅视频分支，与 PromptRelay 兼容）。"""
+        """把 K/V 注入参数绑定到 attn2 并替换其 forward。"""
         model_clone = model.clone()
         diffusion_model = model_clone.get_model_object("diffusion_model")
 

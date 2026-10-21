@@ -43,38 +43,18 @@ _TIMELINE_UPLOAD_SUBDIR = "yuan_clip"
 
 
 # ==============================================================================
-# Windows 连接重置异常抑制（避免 PyAV/上传时 ConnectionResetError 刷屏）
-# ==============================================================================
-try:
-    _loop = None
-    try:
-        _loop = asyncio.get_event_loop()
-    except RuntimeError:
-        try:
-            _loop = asyncio.get_event_loop_policy().get_event_loop()
-        except Exception:
-            pass
-    if _loop is not None:
-        _old_handler = _loop.get_exception_handler()
-
-        def _silence_connection_reset_handler(loop, context):
-            exception = context.get('exception')
-            if (isinstance(exception, (ConnectionResetError, ConnectionAbortedError)) or
-                    (isinstance(exception, OSError) and getattr(exception, 'winerror', None) in (10054, 10053))):
-                return
-            if _old_handler:
-                _old_handler(loop, context)
-            else:
-                loop.default_exception_handler(context)
-
-        _loop.set_exception_handler(_silence_connection_reset_handler)
-except Exception:
-    pass
-
-
-# ==============================================================================
 # 多媒体引导：HTTP endpoint（文件去重/上传/音频提取/打开目录）
 # ==============================================================================
+
+def _is_within(path, root):
+    """判断 path 是否位于 root 目录内（解析 .. 与符号链接后比较，Windows 下忽略大小写）。"""
+    try:
+        root_real = os.path.realpath(root)
+        common = os.path.commonpath([root_real, os.path.realpath(path)])
+        return os.path.normcase(common) == os.path.normcase(root_real)
+    except ValueError:
+        return False
+
 
 @PromptServer.instance.routes.get("/yuan_clip_timeline_check_file")
 async def _yuan_clip_timeline_check_file(request):
@@ -86,7 +66,8 @@ async def _yuan_clip_timeline_check_file(request):
     upload_dir = folder_paths.get_input_directory()
     temp_dir = os.path.join(upload_dir, _TIMELINE_UPLOAD_SUBDIR)
 
-    possible_paths = [os.path.join(temp_dir, filename), os.path.join(upload_dir, filename)]
+    possible_paths = [p for p in (os.path.join(temp_dir, filename), os.path.join(upload_dir, filename))
+                      if _is_within(p, upload_dir)]
     found_path = None
     for p in possible_paths:
         if os.path.exists(p) and os.path.isfile(p):
@@ -270,6 +251,8 @@ async def _yuan_clip_timeline_get_audio(request):
     upload_dir = folder_paths.get_input_directory()
     clean_filename = filename.replace('\\', '/')
     file_path = os.path.join(upload_dir, clean_filename)
+    if not _is_within(file_path, upload_dir):
+        return web.json_response({"error": "无效的文件名"}, status=400)
     if not os.path.exists(file_path):
         basename = os.path.basename(clean_filename)
         temp_path = os.path.join(upload_dir, _TIMELINE_UPLOAD_SUBDIR, basename)
@@ -431,6 +414,21 @@ def _load_video_tensor(seg: dict, frame_rate: float) -> torch.Tensor:
 def _snap_to_divisible(val, div):
     """将值对齐到 div 的整数倍，最小为 div。"""
     return max(div, (val // div) * div)
+
+
+def _timeline_upload_dir():
+    """返回时间轴媒体上传目录并确保其存在。"""
+    upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
+    os.makedirs(upload_dir, exist_ok=True)
+    return upload_dir
+
+
+def _save_timeline_png(image_tensor, filename):
+    """把单帧 [H,W,3] 的 0..1 张量保存到时间轴上传目录，返回相对 input 的路径。"""
+    upload_dir = _timeline_upload_dir()
+    array = (image_tensor.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+    Image.fromarray(array).save(os.path.join(upload_dir, filename), format="PNG")
+    return f"{_TIMELINE_UPLOAD_SUBDIR}/{filename}"
 
 
 def _resize_image(tensor: torch.Tensor, target_w: int, target_h: int, method: str, divisible_by: int) -> torch.Tensor:
@@ -643,20 +641,9 @@ def _build_guide_data(tdata: dict, start_frame: int, duration_frames: int, frame
                 tensor = _load_video_tensor(seg, float(frame_rate))
             else:
                 tensor = _load_image_tensor(seg)
-            src_h, src_w = tensor.shape[1], tensor.shape[2]
 
-            if custom_width > 0 and custom_height > 0:
-                tensor = _resize_image(tensor, custom_width, custom_height, resize_method, divisible_by)
-            elif custom_width > 0:
-                tgt_w = _snap_to_divisible(custom_width, divisible_by)
-                tgt_h = _snap_to_divisible(int(src_h * tgt_w / src_w), divisible_by)
-                tensor = _resize_image(tensor, tgt_w, tgt_h, "stretch to fit", divisible_by)
-            elif custom_height > 0:
-                tgt_h = _snap_to_divisible(custom_height, divisible_by)
-                tgt_w = _snap_to_divisible(int(src_w * tgt_h / src_h), divisible_by)
-                tensor = _resize_image(tensor, tgt_w, tgt_h, "stretch to fit", divisible_by)
-            else:
-                tensor = _resize_image(tensor, src_w, src_h, "maintain aspect ratio", divisible_by)
+            # custom_width/custom_height 在调用方已保证 > 0（0 会回退到 宽度/高度）
+            tensor = _resize_image(tensor, custom_width, custom_height, resize_method, divisible_by)
 
             if img_compression > 0:
                 tensor = _compress_image(tensor, img_compression)
@@ -1191,19 +1178,16 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
     raw_tokenizer = get_raw_tokenizer(clip)
     full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
 
-    # 在 full_prompt 中定位所有 @图X token（global + local）
+    # 在 full_prompt 中定位所有 @图X token（global + local），并按主体编号分组
     # local 段保留了 @图X 标记（keep_marker=True），K/V 注入能直接作用于 local 段中的 @图X token
     marker_token_indices = {}
     if marker_tags:
         try:
-            indices = _find_marker_phrase_token_indices(raw_tokenizer, full_prompt, marker_tags)
-            if indices:
-                # 按主体编号分组
-                for tag in marker_tags:
-                    num = int(tag[2:])
-                    tag_indices = _find_marker_phrase_token_indices(raw_tokenizer, full_prompt, [tag])
-                    if tag_indices:
-                        marker_token_indices[num] = tag_indices
+            for tag in marker_tags:
+                num = int(tag[2:])
+                tag_indices = _find_marker_phrase_token_indices(raw_tokenizer, full_prompt, [tag])
+                if tag_indices:
+                    marker_token_indices[num] = tag_indices
         except Exception:
             pass
 
@@ -1321,7 +1305,7 @@ class YuanCLIPTimeline:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "模型": ("MODEL", {"tooltip": "要补丁的扩散模型"}),
+                "模型": ("MODEL", {"tooltip": "要补丁的扩散模型（仅支持带 patchifier 的 LTX 系列模型）"}),
                 "CLIP模型": ("CLIP", {"tooltip": "用于编码提示词的 CLIP 模型"}),
                 "音频VAE": ("VAE", {"tooltip": "Audio VAE，用于生成音频潜空间，与视频潜空间帧数/帧率对齐。"}),
                 "全局提示词": ("STRING", {
@@ -1631,17 +1615,10 @@ class YuanCLIPTimeline:
                     batch_size = segment_images.shape[0]
                     # 段落数量与图像数量取最小值，多出的图像忽略
                     alloc_count = min(len(segments), batch_size)
-                    upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
-                    os.makedirs(upload_dir, exist_ok=True)
                     ts = int(time.time() * 1000)
                     for i in range(alloc_count):
-                        img_tensor = segment_images[i].clamp(0, 1).cpu()
-                        arr = (img_tensor.numpy() * 255.0).astype(np.uint8)
-                        pil_img = Image.fromarray(arr, mode="RGB")
                         fname = f"segimg_{ts}_{i}.png"
-                        fpath = os.path.join(upload_dir, fname)
-                        pil_img.save(fpath, format="PNG")
-                        segments[i]["imageFile"] = f"{_TIMELINE_UPLOAD_SUBDIR}/{fname}"
+                        segments[i]["imageFile"] = _save_timeline_png(segment_images[i], fname)
                         segments[i]["imageB64"] = ""  # 清空 base64，统一使用文件路径
                         segments[i]["type"] = "image"
                     # 重新序列化 timeline_data 以保持下游一致性
@@ -1666,20 +1643,13 @@ class YuanCLIPTimeline:
                 if motion_images.dim() == 3:
                     motion_images = motion_images.unsqueeze(0)
                 batch_size = motion_images.shape[0]
-                upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
-                os.makedirs(upload_dir, exist_ok=True)
                 ts = int(time.time() * 1000)
                 new_motion_segs = []
 
-                saved_refs = []
-                for i in range(batch_size):
-                    img_tensor = motion_images[i].clamp(0, 1).cpu()
-                    arr = (img_tensor.numpy() * 255.0).astype(np.uint8)
-                    pil_img = Image.fromarray(arr, mode="RGB")
-                    fname = f"motion_seg_{ts}_{i}.png"
-                    fpath = os.path.join(upload_dir, fname)
-                    pil_img.save(fpath, format="PNG")
-                    saved_refs.append(f"{_TIMELINE_UPLOAD_SUBDIR}/{fname}")
+                saved_refs = [
+                    _save_timeline_png(motion_images[i], f"motion_seg_{ts}_{i}.png")
+                    for i in range(batch_size)
+                ]
 
                 # 每张图像创建一个独立的运动段，连续排列
                 # 前端显示为一段段，后端 Guide 节点 B 分支会自动合并相邻静态图像段为合成视频序列处理
@@ -1749,8 +1719,7 @@ class YuanCLIPTimeline:
                         int16_np = np.clip(mono_np, -1.0, 1.0)
                         int16_np = (int16_np * 32767.0).astype(np.int16)
                         import wave
-                        upload_dir = os.path.join(folder_paths.get_input_directory(), _TIMELINE_UPLOAD_SUBDIR)
-                        os.makedirs(upload_dir, exist_ok=True)
+                        upload_dir = _timeline_upload_dir()
                         ts = int(time.time() * 1000)
                         fname = f"audio_in_{ts}.wav"
                         fpath = os.path.join(upload_dir, fname)

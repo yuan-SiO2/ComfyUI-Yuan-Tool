@@ -71,7 +71,9 @@ class YuanRTXVideoUpscaleH3:
 
     # 类级缓存：{cache_key: (upscaled, av_latent_output)}
     _cache = {}
-    _MAX_CACHE_ENTRIES = 8  # 防止内存无限增长
+    _cache_bytes = 0
+    _MAX_CACHE_ENTRIES = 2
+    _MAX_CACHE_BYTES = 512 * 1024 * 1024  # 缓存总字节上限，避免整段视频结果长期驻留
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -258,13 +260,33 @@ class YuanRTXVideoUpscaleH3:
         return (images_fp, av_latent_fp, vae_id, params_fp, quality)
 
     @classmethod
+    def _value_bytes(cls, value):
+        """估算缓存值占用的字节数（嵌套张量/张量/字典/元组递归）。"""
+        if hasattr(value, "tensors"):
+            return sum(cls._value_bytes(t) for t in value.tensors)
+        if isinstance(value, torch.Tensor):
+            return value.numel() * value.element_size()
+        if isinstance(value, dict):
+            return sum(cls._value_bytes(v) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(cls._value_bytes(v) for v in value)
+        return 0
+
+    @classmethod
     def _store_cache(cls, key, value):
-        """存入缓存，超出上限时按 FIFO 清理最旧条目。"""
-        if len(cls._cache) >= cls._MAX_CACHE_ENTRIES:
-            # 弹出最早插入的 key（dict 保持插入顺序）
+        """存入缓存，按条目数与总字节数淘汰最旧结果；单条超限则不缓存。"""
+        # 同一 key 覆盖时先扣掉旧值，避免字节计数虚高
+        if key in cls._cache:
+            cls._cache_bytes -= cls._value_bytes(cls._cache.pop(key))
+        size = cls._value_bytes(value)
+        if size > cls._MAX_CACHE_BYTES:
+            return
+        while cls._cache and (len(cls._cache) >= cls._MAX_CACHE_ENTRIES
+                              or cls._cache_bytes + size > cls._MAX_CACHE_BYTES):
             oldest = next(iter(cls._cache))
-            del cls._cache[oldest]
+            cls._cache_bytes -= cls._value_bytes(cls._cache.pop(oldest))
         cls._cache[key] = value
+        cls._cache_bytes += size
 
     @staticmethod
     def _run_super_resolution(images, resize_params, quality):

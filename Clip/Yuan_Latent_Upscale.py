@@ -85,8 +85,8 @@ class YuanLatentUpscaleBy:
         ratio = 16 if t.ndim == 5 else 8
 
         if resize_type == UPSCALE_BY:
-            new_h = round(cur_h * scale)
-            new_w = round(cur_w * scale)
+            new_h = max(1, round(cur_h * scale))
+            new_w = max(1, round(cur_w * scale))
         elif resize_type == UPSCALE_TARGET:
             # 目标尺寸（像素）对齐压缩比后换算为 latent 尺寸
             new_w = max(1, max(ratio, round(int(width) / ratio) * ratio) // ratio)
