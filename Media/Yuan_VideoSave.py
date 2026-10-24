@@ -866,7 +866,8 @@ class YuanVideoSave:
     DESCRIPTION = (
         "把图像序列保存为视频或动图，可把音频混入视频。\n"
         "支持 MP4、WebM、GIF、WebP、PNG 序列、ProRes、FFV1 等输出格式。\n"
-        "帧率、文件名前缀与保存位置常显，循环、格式与编码参数可通过「展开高级设置」查看。"
+        "帧率、文件名前缀与保存位置常显，循环、格式与编码参数可通过「展开高级设置」查看。\n"
+        "「图像」端口为可选：未接入时本节点直接跳过，不生成文件也不报错。"
     )
 
     @classmethod
@@ -876,10 +877,6 @@ class YuanVideoSave:
             (name for name in formats if "H.264" in name), formats[0] if formats else ""
         )
         required = {
-            "图像": (
-                "IMAGE",
-                {"tooltip": "要保存为视频或动图的图像序列。"},
-            ),
             "帧率": (
                 "FLOAT",
                 {
@@ -934,6 +931,12 @@ class YuanVideoSave:
         return {
             "required": required,
             "optional": {
+                "图像": (
+                    "IMAGE",
+                    {
+                        "tooltip": "可选。要保存为视频或动图的图像序列；未连接时不生成文件，也不会报错。"
+                    },
+                ),
                 "音频": (
                     "AUDIO",
                     {"tooltip": "可选。连接到视频时会把音频混入最终文件。"},
@@ -954,7 +957,7 @@ class YuanVideoSave:
 
     def save_video(
         self,
-        图像,
+        图像=None,
         帧率: float = 24,
         文件名前缀: str = "Yuan Video/ComfyUI",
         保存到输出目录: bool = True,
