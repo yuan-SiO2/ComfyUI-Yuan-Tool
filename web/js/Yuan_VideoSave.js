@@ -551,6 +551,34 @@ function applyWidgetDefinition(widget, definition) {
     }
 }
 
+// 「图像」声明在可选输入中后会排到控件之后；这里把它移回端口区首行，保持与旧版一致的接线位置。
+const IMAGE_INPUT_NAME = "图像";
+
+function hoistImageInput(node) {
+    const inputs = node?.inputs;
+    if (!Array.isArray(inputs)) {
+        return;
+    }
+    const index = inputs.findIndex((input) => input?.name === IMAGE_INPUT_NAME);
+    if (index <= 0) {
+        return;
+    }
+    const [imageInput] = inputs.splice(index, 1);
+    inputs.unshift(imageInput);
+    // 连线按槽位索引寻址，重排后把已保存连线的目标槽位同步到同一输入
+    for (let slot = 0; slot < inputs.length; slot++) {
+        const linkId = inputs[slot].link;
+        if (linkId === null || linkId === undefined) {
+            continue;
+        }
+        const link = node.graph?.links?.[linkId];
+        if (link) {
+            link.target_slot = slot;
+        }
+    }
+    node.setDirtyCanvas?.(true, true);
+}
+
 /** 把一个节点上的高级设置与格式参数联动、预览窗口、状态恢复全部装好。 */
 function addVideoSaveUI(node) {
     const widgets = {};
@@ -854,7 +882,16 @@ app.registerExtension({
 
         chainCallback(nodeType.prototype, "onNodeCreated", function () {
             addVideoSaveUI(this);
+            hoistImageInput(this);
         });
         addPreviewMenu(nodeType);
+    },
+    afterConfigureGraph() {
+        // 工作流反序列化后再排列一次：此时连线已就绪，可同步槽位
+        for (const node of app.graph?._nodes ?? []) {
+            if (node?.type === NODE_NAME) {
+                hoistImageInput(node);
+            }
+        }
     },
 });
