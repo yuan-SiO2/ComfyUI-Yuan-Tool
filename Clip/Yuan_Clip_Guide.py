@@ -68,7 +68,7 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
     k = self.k_norm(self.to_k(context))
     v = self.to_v(context)
 
-    # K/V 注入：仅对拥有独立参考特征的主体注入，绝不可从 x（去噪中的视频 token）取值，否则会把去噪噪声当作参考特征导致主体特征错乱
+    # K/V 注入只用独立参考特征，不从去噪中的 x 取值
     if marker_token_indices and ref_alpha > 0.0 and subject_ref_features:
         # 正向批次 mask：只对正向条件做 K/V 注入，负向条件保持原样
         positive_mask = _positive_batch_mask(transformer_options, x.shape[0], x.device)
@@ -93,7 +93,7 @@ def _ltxv_crossattn_forward_kv_injection(self, x, context, mask=None,
             if not usable:
                 continue
 
-            # 用预计算的 ref_summary 独立编码，解耦物理坐标系错位问题
+            # 由 ref_summary 编码出 ref_k/ref_v
             ref_summary = subject_ref_features[subject_num].to(device=x.device, dtype=x.dtype)
             num_pos = len(positive_rows) if positive_rows is not None else x.shape[0]
             ref_summary = ref_summary.expand(num_pos, -1)  # [num_pos, inner_dim]
@@ -741,7 +741,7 @@ class YuanClipGuide:
 
                 guide_orig_shape = list(guide_latent.shape[2:])
 
-                # IC-LoRA 空间扩张：保证 LTXVCropGuides 按 keyframe_idxs 裁剪的帧数等于实际追加的 latent 帧数，避免尾部残留参考帧
+                # IC-LoRA 空间扩张：裁剪帧数与追加的 latent 帧数保持一致
                 guide_mask = None
                 if latent_downscale_factor > 1:
                     B_g, _, F_g, H_g, W_g = guide_latent.shape
@@ -853,8 +853,7 @@ class YuanClipGuide:
                     num_frames_to_keep = ((video_frames.shape[0] - 1) // time_scale_factor) * time_scale_factor + 1
                     video_frames = video_frames[:num_frames_to_keep]
 
-                    # MSR 模式静态参考图段：按原生 MSR 约定 frame_offset=-(num_slots-slot_index) 负时间偏移追加到视频起点前，
-                    # 跳过正帧换算并 causal_fix=True，由 LTXVCropGuides 按 keyframe_idxs 裁剪
+                    # MSR 静态参考图段：按负时间偏移追加到视频起点前
                     if msr_mode and bool(seg.get("isStaticImage", False)):
                         # 槽位编号 = @图X 编号（subjectNum），缺失时回退为排列顺序
                         slot_id = int(seg.get("subjectNum", 0))

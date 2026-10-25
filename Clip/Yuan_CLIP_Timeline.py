@@ -1210,6 +1210,9 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
 
 _MSR_CHAR_PATTERN = re.compile(r'^@图(\d+)\s*[=：:]\s*(.+)')
 
+# 时间格式行：`0-3s 提示词` / `3-5秒 提示词`
+_TIME_RANGE_PATTERN = re.compile(r'^(\d+(?:\.\d+)?)\s*[-~至到]\s*(\d+(?:\.\d+)?)\s*(?:s|秒)?\s*[:：]?\s*')
+
 # @图X=描述 行保留在 global_prompt 中，作为角色定义 + token 标记。
 # K/V 视觉特征注入：@图X 在文本中的 token 位置被标记，注入对应主体参考帧的 K/V。
 
@@ -1825,7 +1828,7 @@ class YuanCLIPTimeline:
             gen_h = derived_h if derived_h > 0 else height
             latent = _auto_generate_latent(gen_w, gen_h, ltxv_length)
 
-        patched, conditioning, _effective_lengths, marker_token_indices = _encode_relay(
+        patched, conditioning, _, marker_token_indices = _encode_relay(
             model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
             marker_tags=marker_tags if marker_tags else None,
             marker_segment_refs=marker_segment_refs if marker_segment_refs else None,
