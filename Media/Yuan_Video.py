@@ -104,7 +104,7 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
         seg_start = actual_start_time + s0 / fps
         seg_end = actual_start_time + s1 / fps
         thumb = ""
-        # 首/末帧默认用网格时间兜底；解码后改用帧的精确 PTS（避免四舍五入落到相邻帧区间）
+        # 首/末帧时间默认按网格，解码后取精确 PTS
         first_frame_time = seg_start
         last_frame_time = seg_end
         if container is not None and vstream is not None:
@@ -462,7 +462,7 @@ class YuanVideoUI:
         # 确定正确的色彩空间和颜色范围，避免 PyAV 转换时产生色偏
         try:
             from av.video.reformatter import Colorspace, ColorRange
-            # 改进回退启发式：同时检查两个维度（例如 720x1280 竖屏视频也是高清）
+            # 未标注色彩空间时按最长边推断
             fallback_cs = Colorspace.ITU709 if max(orig_w, orig_h) >= 720 else Colorspace.ITU601
             fallback_cr = ColorRange.MPEG
             dst_range = ColorRange.JPEG # RGB 应始终为全范围

@@ -757,7 +757,7 @@ def ffmpeg_process(frame_data, args, video_format, video_metadata, file_path, en
 
     error_text = stderr.decode(*ENCODE_ARGS) if stderr else ""
     if return_code != 0 or write_error is not None:
-        # 只清理本次新建的半成品；-n 因文件已存在而失败时不能误删旧文件
+        # 仅清理本次新建的半成品文件
         if not existed and os.path.exists(file_path):
             try:
                 os.remove(file_path)
