@@ -80,7 +80,7 @@ def _load_model(model_name, device):
     with torch.device("meta"):
         model = LatentResizer3D(
             in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"], out_blocks=cfg["out_blocks"],
-            channels=cfg["channels"], dropout=cfg["dropout"], attn=cfg["attn"],
+            channels=cfg["channels"], dropout=cfg["dropout"],
             temporal_every=cfg["temporal_every"], temporal_kernel=cfg["temporal_kernel"],
         )
     model.load_state_dict(sd, strict=True, assign=True)

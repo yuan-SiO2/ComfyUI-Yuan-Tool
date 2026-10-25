@@ -15,7 +15,8 @@ import torch.nn.functional as F
 
 import folder_paths
 
-from comfy.ldm.minimax.vae import LATENTS_MEAN, LATENTS_STD
+# 供 h3_upscaler.py / Yuan_H3_Upscale.py 引用
+from comfy.ldm.minimax.vae import LATENTS_MEAN, LATENTS_STD  # noqa: F401
 
 LATENT_UPSCALE_FOLDER = "latent_upscale_models"
 
@@ -77,7 +78,6 @@ def detect_arch(sd):
         "out_blocks": 12,
         "channels": 512,
         "dropout": 0.1,
-        "attn": False,
         "temporal_every": 2,
         "temporal_kernel": 5,
     }
@@ -109,8 +109,6 @@ def detect_arch(sd):
                 cfg["temporal_kernel"] = sd[key].shape[2]
                 break
 
-    # 推理时强制关闭注意力，保证与推理实现一致
-    cfg["attn"] = False
     return cfg
 
 
@@ -128,27 +126,6 @@ def _temporal_windows(length, chunk, overlap):
     for start in range(0, length, chunk):
         end = min(length, start + chunk)
         yield start, end, max(0, start - overlap), min(length, end + overlap)
-
-
-class AttnBlock3D(nn.Module):
-    """3D 自注意力块（可选）。"""
-
-    def __init__(self, in_channels):
-        super().__init__()
-        self.norm = normalization(in_channels)
-        self.q = nn.Conv3d(in_channels, in_channels, 1)
-        self.k = nn.Conv3d(in_channels, in_channels, 1)
-        self.v = nn.Conv3d(in_channels, in_channels, 1)
-        self.proj_out = nn.Conv3d(in_channels, in_channels, 1)
-
-    def forward(self, x):
-        h = self.norm(x)
-        q = self.q(h).flatten(2).movedim(-1, 1).unsqueeze(1)
-        k = self.k(h).flatten(2).movedim(-1, 1).unsqueeze(1)
-        v = self.v(h).flatten(2).movedim(-1, 1).unsqueeze(1)
-        h = F.scaled_dot_product_attention(q, k, v)
-        h = h.squeeze(1).movedim(1, -1).reshape(x.shape)
-        return x + self.proj_out(h)
 
 
 class ResBlockEmb3D(nn.Module):
@@ -213,7 +190,7 @@ class LatentResizer3D(nn.Module):
     """3D 上采样主干，可选时间维分块。"""
 
     def __init__(self, in_channels=24, in_blocks=12, out_blocks=12,
-                 channels=512, dropout=0.1, attn=False,
+                 channels=512, dropout=0.1,
                  temporal_every=2, temporal_kernel=5):
         super().__init__()
         self.conv_in = nn.Conv3d(in_channels, channels, 3, padding=1)
@@ -223,16 +200,12 @@ class LatentResizer3D(nn.Module):
 
         self.in_blocks = nn.ModuleList()
         for b in range(in_blocks):
-            if (b == 1 or b == in_blocks - 1) and attn:
-                self.in_blocks.append(AttnBlock3D(channels))
             self.in_blocks.append(ResBlockEmb3D(channels, embed_dim, dropout))
             if temporal_every > 0 and b % temporal_every == 0:
                 self.in_blocks.append(TemporalConv(channels, temporal_kernel))
 
         self.out_blocks = nn.ModuleList()
         for b in range(out_blocks):
-            if (b == 1 or b == out_blocks - 1) and attn:
-                self.out_blocks.append(AttnBlock3D(channels))
             self.out_blocks.append(ResBlockEmb3D(channels, embed_dim, dropout))
             if temporal_every > 0 and b % temporal_every == 0:
                 self.out_blocks.append(TemporalConv(channels, temporal_kernel))

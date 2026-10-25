@@ -126,7 +126,7 @@ def _tiled_forward(executor, streams, timestep, context, transformer_options, mi
         try:
             payload = _tile_payload(minimax_payload or {}, context, video, audio, axis, start, end)
         except Exception:
-            # 构造失败时退回整帧前向，避免整次采样中断；记录一次便于定位分块为何没生效
+            # 构造失败时退回整帧前向并告警
             _LOGGER.warning("H3 高分辨率分块构造失败，已退回整帧前向", exc_info=True)
             return executor(streams, timestep, context, transformer_options,
                             minimax_payload=minimax_payload, **kwargs)

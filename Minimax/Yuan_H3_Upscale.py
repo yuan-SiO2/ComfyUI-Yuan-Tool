@@ -99,7 +99,6 @@ def load_model(name, device):
         out_blocks=cfg["out_blocks"],
         channels=cfg["channels"],
         dropout=cfg["dropout"],
-        attn=cfg["attn"],           # 强制 False
         temporal_every=cfg["temporal_every"],
         temporal_kernel=cfg["temporal_kernel"],
     )

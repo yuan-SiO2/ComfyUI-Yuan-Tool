@@ -27,7 +27,7 @@ from ..Yuan_common import handle_chunk_upload
 try:
     from safetensors.torch import load_file as _st_load, save_file as _st_save
     from safetensors import safe_open as _st_safe_open
-except ImportError:  # ComfyUI 总是自带 safetensors，此处仅是双保险
+except ImportError:  # safetensors 缺失时降级为报错
     _st_load = _st_save = _st_safe_open = None
 
 
@@ -44,12 +44,6 @@ AUDIO_HZ = 40.0
 # 可干净裁剪的整组窗口长度：一个 VRF 组 = 5 个潜空间步 = 17 个像素帧；
 # 非整组裁剪会让剩余潜空间的起点落在周期中间，导致画面闪烁。
 VIDEO_RUN_GRID = (68, 51, 34, 17, 5)
-
-# ANCHOR_MODE="head" 把固定段放在片段开头（由裁剪节点移除）；
-# AUDIO_MODE="timeline" 把固定音频放在本片段时间轴上，让模型续写而非模仿。
-ANCHOR_MODE = "head"
-AUDIO_MODE = "timeline"
-
 
 def _pixel_frames(latent_t):
     """latent_t 个潜空间步覆盖的像素帧数。"""
@@ -93,12 +87,10 @@ MC_AUDIO_KEY = "motion_context_audio_end_frame"
 # 解除 MiniMax H3 仅首/末帧关键帧锚点的限制
 # ============================================================================
 
-# 本包装器上的标记：另一份内置本补丁的拷贝可识别并退出而非再包装一层。
-# 与 MC_KEY/MC_AUDIO_KEY 同属共享 ABI，改名须所有拷贝同步。
+# 布局补丁标记（共享 ABI，勿改名）
 PATCH_MARKER_LAYOUT = "_h3_motion_context_layout_patch"
 
-# MiniMax_H3.py 反向移植包装器（旧核心）上的标记：布局补丁在其上叠加、
-# 载荷补丁视为已应用。与 PATCH_MARKER_* 同属共享 ABI，改名须两文件同步。
+# 旧核心适配层标记（共享 ABI，勿改名）
 BACKPORT_MARKER_LAYOUT = "_yuan_minimax_h3_v034_layout"
 BACKPORT_MARKER_PAYLOAD = "_yuan_minimax_h3_v034_extra_conds"
 
@@ -109,12 +101,9 @@ REF_SEGMENT_KINDS = ("ref_img", "ref_audio")
 
 
 def _target_origin(layout):
-    """目标片段起始坐标，直接从已构建的布局上读出。
+    """返回目标片段起始坐标（读自已构建的布局）。
 
-    参考块从 text_len 起的游标布局，目标行取游标终值作为原点；关键帧
-    坐标按 text_len 直接计算且从不补偿，因此必须加上该项，否则参考会
-    使锚点相对目标片段整体后移。从布局读回而非重算游标，上游改动时
-    无需同步。
+    关键帧坐标按 text_len 计算、不含参考块补偿，需叠加该项才能对准目标片段。
     """
     a, b, kind = layout.segments[-1]
     if kind != "video" or b <= a:
@@ -454,9 +443,7 @@ def _apply_layout_patch():
             "from another module; refusing to stack a second wrapper.")
         return False
     if who == "backport":
-        # 同插件反向移植（MiniMax_H3.py 在旧核心上已替换构造函数）：以它为
-        # 基础叠加本文锚点修复。自测对反向移植基础同样有效（复现两端锚点），
-        # 继续走到下方公共安装流程。
+        # 旧核心适配层：在其上叠加布局补丁，再走公共安装流程
         pass
     elif who:
         # 补丁已生效（非本份），调用方节点运行前会检查 is_applied()
@@ -489,8 +476,7 @@ def _layout_patch_applied():
 # 让关键帧和引用可以共存
 # ============================================================================
 
-# 本包装器上的标记：另一份内置本补丁的拷贝可识别并退出而非再包装一层。
-# 是每个内置此补丁的包共享的 ABI。
+# 载荷补丁标记（共享 ABI，勿改名）
 PATCH_MARKER_PAYLOAD = "_h3_motion_context_payload_patch"
 
 _payload_orig_extra_conds = None
@@ -519,9 +505,7 @@ def _patched_extra_conds(self, **kwargs):
     payload["cond_video_latents"] = kf_video + ref_video
     payload["cond_audio_latents"] = [r["audio_latent"] for r in refs
                                      if r.get("audio_latent") is not None]
-    # 仅在确实拿到 frame_count 时才写入：本包装器对所有同时含关键帧和
-    # 引用的图生效，缺 minimax_frame_count 时原值可能已有效，覆盖为
-    # None 会破坏下游末帧锚点分支
+    # 仅在拿到 frame_count 时写入，避免覆盖下游末帧锚点已用的值
     fc = kwargs.get("minimax_frame_count", None)
     if fc is not None:
         payload["frame_count"] = fc
@@ -571,8 +555,7 @@ def _apply_payload_patch():
             "from another module; refusing to stack a second wrapper.")
         return False
     if who == "backport":
-        # 同插件反向移植 extra_conds（旧核心）已实现关键帧/引用共存合并，
-        # 视为已应用；反向移植布局不消费 payload 的 frame_count，无需补写。
+        # 旧核心适配层已合并关键帧与引用，视为已应用
         _payload_applied = True
         return True
     if who:
@@ -594,11 +577,7 @@ def _payload_patch_applied():
 # ============================================================================
 
 def _ensure_layout_patch():
-    """首次运行节点时安装布局补丁（仅一次）。
-
-    导入时打补丁会让本包装器进入本机每个 H3 图的路径；首次使用时安装
-    则安装本包不改动任何东西，直到真正衔接片段。代价是自测失败在首次
-    渲染而非启动日志中出现，但信息相同，且仍是拒绝而非渲染错误结果。
+    """首次执行时安装布局补丁（仅一次），安装失败直接报错。
     """
     if _layout_patch_applied():
         return
@@ -825,15 +804,13 @@ CONTEXT_CLIP_INDEX_KEY = "_h3_motion_context_clip_index"
 # 尾段媒体文件名约定：存储位置目录下 clip_%05d.mp4（片段序号 2 → clip_00002.mp4）
 CLIP_FILE_PREFIX = "clip"
 CLIP_FILE_EXT = ".mp4"
-# 加载上下文媒体时解码帧的最长边上限：超过该值先等比缩到最长边=1536 再参与
-# 引导，降低解码量与后续 VAE 编码开销；未超限原样返回（字节不变），不破坏
-# 链条内小分辨率尾段的逐字节精确。固定默认，不暴露参数。
+# 上下文媒体解码后的最长边上限，超出则等比缩小；未超出原样保留
 CONTEXT_LOAD_MAX_SIDE = 1536
 
 
 def _load_media_file(path, clip_index=None):
-    """加载「H3 运动裁剪」保存的尾段媒体：.mp4 经 av 解码为像素帧+波形；
-    旧版 .safetensors（uint8 帧+波形）仍兼容读取。
+    """加载「H3 运动裁剪」保存的尾段媒体：.mp4 经 av 解码为像素帧+波形，
+    .safetensors（uint8 帧+波形）同样支持。
 
     返回 {"pixels": [t,H,W,3] float[0,1], "waveform": [1,2,L]（无音轨为 None）,
     "sample_rate": int}。
@@ -866,7 +843,7 @@ def _cap_longest_side(frames_u8):
 
 
 def _read_st_media(path, clip_index=None):
-    """读取旧版 .safetensors 格式的尾段媒体（uint8 帧 + 音频波形）。"""
+    """读取 .safetensors 尾段媒体（uint8 帧 + 音频波形）。"""
     if _st_load is None:
         raise RuntimeError("h3_motion_context: safetensors is not "
                            "available; cannot load context media.")
@@ -984,7 +961,7 @@ def _load_context_media(存储位置, 片段序号=1):
     try:
         path = _clip_file_path(存储位置, idx)
     except FileNotFoundError:
-        # 兜底：主「存储位置」目录缺失（参数错位）时，扫描 output 目录实际保存位置
+        # 目录缺失时改扫 output 子目录
         path = _find_clip_in_output(idx)
         if path is None:
             return {CONTEXT_EMPTY_MARKER: True,
@@ -1015,8 +992,7 @@ def _context_latent_fingerprint(存储位置, 片段序号, 手动上传, 潜空
                               if 潜空间模式 else _build_load_path(存储位置))
     except Exception:
         return float("NaN")
-    # 与加载时的兜底扫描保持一致：主存储位置目录不存在（参数错位）时，
-    # 改扫 output 目录下实际保存的文件做指纹，避免缓存漏跑/误缓存
+    # 目录缺失时改扫 output 目录下的实际文件取指纹
     if fp.startswith("missing"):
         alt = (_find_latent_in_output(片段序号) if 潜空间模式
                else _find_clip_in_output(片段序号))
@@ -1065,9 +1041,7 @@ def _load_context_latent(存储位置, 片段序号=1, 手动上传=""):
     try:
         path = _resolve_latent_path(_build_latent_load_path(存储位置), idx)
     except FileNotFoundError:
-        # 主「存储位置」解析失败：兜底扫描 output 目录。可能「存储位置」
-        # 参数因工作流错位而错误（如被保存为 1 而非 H3-Mubu），但文件
-        # 实际由「H3 运动裁剪」保存在输出目录的某个子目录中，扫描即可命中。
+        # 解析失败时改扫 output 子目录
         path = _find_latent_in_output(idx)
         if path is None:
             return {"samples": [], CONTEXT_EMPTY_MARKER: True,
@@ -1194,14 +1168,8 @@ def _resolve_prefix(dir_part, prefix, idx):
 
 
 def _find_latent_in_output(idx):
-    """兜底搜索：主「存储位置」解析失败时，扫描 ComfyUI 输出目录下所有
-    子目录，查找文件名匹配 latent_%05d_.safetensors 的文件。
-
-    用于「H3 运动上下文」自动索引模式——该模式依赖「存储位置」参数，
-    而工作流中该参数可能因节点合并/参数错位而错误（例如被保存为数字
-    1 而非 H3-Mubu）。只要文件实际存在于输出目录任意子目录（即「H3
-    运动裁剪」保存的位置），就能找到，消除"未找到片段 N 文件"。
-    命中多个时取修改时间最新的一个。
+    """在输出目录各子目录中查找 latent_%05d_.safetensors，
+    供「存储位置」解析失败时使用；命中多个取最新修改的一个。
     """
     try:
         idx_i = int(idx)
@@ -1644,8 +1612,7 @@ class Yuan_H3MotionContext:
 
         blocks, offsets, covered = _video_tail_from_latent(上下文潜空间, n)
         span = covered
-        indices = ([o - span for o in offsets] if ANCHOR_MODE == "before"
-                   else list(offsets))
+        indices = list(offsets)
         # 追加到已有 keyframes（而非整表替换），可与其他关键帧节点混用
         existing_keyframes = list(条件化[0][1].get("minimax_keyframes", []))
         keyframes = existing_keyframes + [
@@ -1674,12 +1641,10 @@ class Yuan_H3MotionContext:
         if audio_ref is not None or (条件化 and 条件化[0][1].get("minimax_refs")):
             _ensure_payload_patch()
         if audio_ref is not None:
-            if AUDIO_MODE == "timeline":
-                # 音频窗口尾端与「运动裁剪」的音频裁剪量用同一表达式，
-                # 使固定窗口整体落在被裁头部内
-                end_frame = float(trim_frames if ANCHOR_MODE == "head" else 0)
-                end_coord = int(round(end_frame * FRAME_RESCALE))
-                audio_ref[MC_AUDIO_KEY] = end_coord / FRAME_RESCALE
+            # 音频窗口尾端与「运动裁剪」的音频裁剪量一致，固定窗口整体落在被裁头部内
+            end_frame = float(trim_frames)
+            end_coord = int(round(end_frame * FRAME_RESCALE))
+            audio_ref[MC_AUDIO_KEY] = end_coord / FRAME_RESCALE
             # APPEND 而非赋值：Ref2VA 条件化可能已携带图自身的引用块
             out = node_helpers.conditioning_set_values(条件化, values)
             out = node_helpers.conditioning_set_values(
@@ -1688,7 +1653,7 @@ class Yuan_H3MotionContext:
             # 音频上下文为 0 且未连接音频 VAE：不安装音频引用，模型自由生成
             out = node_helpers.conditioning_set_values(条件化, values)
 
-        trim = trim_frames if ANCHOR_MODE == "head" else 0
+        trim = trim_frames
         trim_str = ("1:%d" % trim) if trim > 0 else "0:17"
         clip_idx = (上下文潜空间.get(CONTEXT_CLIP_INDEX_KEY)
                     if isinstance(上下文潜空间, dict) else None)
@@ -1766,11 +1731,8 @@ class Yuan_H3MotionContextTrim:
                                "即可对应加载。"}),
             },
             "optional": {
-                # forceInput 输入在前端不会生成同名 widget（只建数据端口），端口未接入时
-                # 该字段根本不会出现在执行提示里——声明为 required 会被判定「缺必填输入」
-                # 直接报错。故放 optional：未接入时后端拿到 None，按「未接入」处理（不裁
-                # 头、不保存尾段、不报错）。放在 optional 首位，使数据端口序号保持为
-                # 潜空间(0)/裁剪帧数(1)/VAE(2)/audio_vae(3)，旧工作流的连线不错位。
+                # 未连线时取 None（按「未接入」处理）；放在 optional 首位，
+                # 使数据端口顺序为 潜空间/裁剪帧数/VAE/audio_vae。
                 "裁剪帧数": ("STRING", {
                     "forceInput": True,
                     "tooltip": "强制输入端口（不可改），连接「H3 运动上下文」"
@@ -1822,11 +1784,8 @@ class Yuan_H3MotionContextTrim:
         # 不读这些参数，原样输出整段图像+音频。
         if 衔接模式 == "解码模式":
             return self._decode_only(潜空间, VAE, audio_vae)
-        # 解析裁剪帧数字符串"状态:长度"："1:22"→裁头22帧且尾段存22帧；"0:22"→不裁头、
-        # 尾段仍存22帧供衔接；兼容纯数字手填输入（按启用语义：n=tail=该值）。
-        # 端口未接入：forceInput 输入由前端直接建数据端口、没有同名 widget，未连线时
-        # 该字段不会出现在执行提示里，后端收到 None → 归一化为空串，落到下面的纯数字
-        # 分支得 n=tail=0：不裁头、不保存尾段（等于不保存本地），也不会报错。
+        # 解析"状态:长度"："1:22"=裁头 22 帧、尾段存 22 帧；"0:22"=不裁头、尾段存 22 帧；
+        # 纯数字 n 视为 n=tail=n；未接入（None）按 0 处理。
         s = "" if 裁剪帧数 is None else str(裁剪帧数).strip()
         if ":" in s:
             state_str, _, len_str = s.partition(":")
@@ -1901,12 +1860,8 @@ class Yuan_H3MotionContextTrim:
 
     def _trim_latent(self, 潜空间, 裁剪帧数=None, 片段序号=1,
                      保存到本地=True, 存储位置="H3-Mubu"):
-        # 「潜空间」模式：不解码，直接在 AV 潜空间上裁切。解析裁剪帧数字符串
-        # "状态:长度"："1:34"=启用上下文 → 头部裁 34 帧、尾段保存 34 帧；
-        # "0:17"=未启用/无上下文 → 不裁头、尾段仍保存 17 帧供衔接。
-        # 兼容纯数字输入（手填）→ 按启用语义：n=tail=该值
-        # 端口未接入（后端收到 None）→ 归一化为空串：n=tail=0，不裁头、不保存尾段，
-        # 也不会报错。
+        # 「潜空间」模式：直接在 AV 潜空间上裁切。裁剪帧数格式同上，
+        # 未接入（None）按 0 处理。
         s = "" if 裁剪帧数 is None else str(裁剪帧数).strip()
         if ":" in s:
             state_str, _, len_str = s.partition(":")
@@ -1964,11 +1919,8 @@ class Yuan_H3MotionContextTrim:
                        else [video, audio])
         out = dict(潜空间)
         out["samples"] = new_samples
-        # 第二次裁切（保存与否仅由「保存到本地」开关控制）：在第一次裁头
-        # 结果的尾部按解析出的长度再切一段（保留后段）保存到本地，供下一
-        # 片段「H3 运动上下文」取尾部窗口（连线传入或本地自动加载）。未启用
-        # 上下文（"0:17"）时裁 0 帧但尾段仍保存 17 帧，保证链条任何配置下
-        # 下一片段都有可衔接的上下文文件
+        # 在裁头结果的尾部再取一段保存到本地，供下一片段的「H3 运动上下文」使用；
+        # tail 为 0 时仍按 17 帧保存
         if 保存到本地 and tail > 0:
             _save_av_latent(_tail_portion_latent(out, tail),
                             存储位置, 片段序号)
@@ -1997,7 +1949,7 @@ def _save_av_media(pixels, waveform, sample_rate, 存储位置, 片段序号):
     # 读取方永远不会读到半截文件；失败时旧文件保留
     tmp_path = "%s.tmp%d" % (path, os.getpid())
     try:
-        os.remove(tmp_path)  # 清理上一次异常遗留的临时文件
+        os.remove(tmp_path)  # 删除遗留临时文件
     except OSError:
         pass
     h, w = int(pixels.shape[1]), int(pixels.shape[2])
@@ -2074,8 +2026,7 @@ def _clip_file_path(存储位置, idx):
 
 
 def _find_clip_in_output(idx):
-    """兜底搜索：主「存储位置」解析失败时（工作流参数可能错位），扫描 output 目录
-    全部子目录找 clip_%05d.mp4，命中多个取 mtime 最新的。"""
+    """在输出目录全部子目录中查找 clip_%05d.mp4，命中多个取最新修改的一个。"""
     try:
         idx_i = int(idx)
     except (TypeError, ValueError):
@@ -2109,12 +2060,8 @@ def _build_load_path(存储位置):
 
 
 def _dir_fingerprint(prefix_path):
-    """目录级综合指纹：对 prefix_path 所在目录下所有 clip_*.mp4/.safetensors 按
-    「文件名+mtime+size」哈希（仅读元数据），任一文件增/删/改都改变指纹。
-    IS_CHANGED 专用：链接输入拿不到真实片段序号、无法定位单文件，故对整目录做指纹
-    未重新保存时指纹不变 → 命中缓存。
-    ——保存节点每次覆盖写同一路径（mtime 必变）→ 指纹变 → 下游重跑；同内容重试→命中。
-    目录不存在返回确定性 "missing"（可缓存），首次保存出现文件后自然触发重跑。
+    """对目录下所有 clip_*.mp4/.safetensors 按「文件名+mtime+size」做哈希，
+    供 IS_CHANGED 判断是否需要重跑；目录不存在返回 "missing"。
     """
     p = (prefix_path or "").strip().strip('"').strip("'")
     if not p:
