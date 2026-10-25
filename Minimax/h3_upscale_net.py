@@ -263,7 +263,7 @@ class LatentResizer3D(nn.Module):
         if size == x.shape[-3:]:
             return x
 
-        B, C, T, H, W = x.shape
+        B, C, T, _, _ = x.shape
 
         chunk, overlap = self.temporal_chunk_settings()
 
