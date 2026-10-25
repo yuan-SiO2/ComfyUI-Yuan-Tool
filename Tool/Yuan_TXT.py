@@ -114,8 +114,9 @@ def _build_dialogue_protect_mask(text):
 # ==== JSON提取：按端口名提取对应字段（内置分镜角色替换，分镜序列输出替换后的文本） ====
 
 class YUAN_TXTJsonExtractor:
-    # 输出端口名（分镜序列已替换 <Picture N>/<Audio M>；音色索引位于角色与道具索引之间）
-    OUTPUT_NAMES = ("整体风格", "档案", "档案编码", "分镜序列", "角色索引", "音色索引", "道具索引", "场景索引", "索引时长", "场景上下文")
+    # 输出端口（分镜模式顺序）：类型校验按端口下标查 RETURN_TYPES，两种模式同一下标的类型须相同：
+    #   分镜模式 [0..7] 见下；档案模式 [0..3] = 档案编码(INT) / 作品名 / 整体风格 / 档案
+    OUTPUT_NAMES = ("分镜类型", "分镜序列", "角色索引", "音色索引", "道具索引", "场景索引", "索引时长", "场景衔接")
 
     # 台词归属边界标点：说话者前必须是句首/句末标点/逗号/空白，或紧跟 </d> 之后
     # （「甲对乙说」的乙被"对"字挡住；「甲看向乙，乙说道」的乙由逗号放行，归属竞争离冒号最近者胜）
@@ -131,13 +132,19 @@ class YUAN_TXTJsonExtractor:
                 }),
                 "索引": ("INT", {
                     "default": 1,
-                    "min": 1,
+                    "min": 0,
                     "step": 1,
-                    "tooltip": "选择「编号」分镜。分镜序列输出：定义块 + 首段时间段 + [Shot N]后续时间段 + 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>，情节开时输出情节纯文本）；定义块 <Picture N> 行只输出「补充：」之前的内容（中英文冒号与大小写兼容）；索引输出各档案 0 基序号，索引时长取「类型」时长。"
+                    "tooltip": "分镜模式：选择「编号」分镜（1 起）。档案模式：选择「档案选择」里的第几条（0 起，0=第一条），「档案」端口只输出该条的全名与描述。"
+                               "分镜序列输出：定义块 + 首段时间段 + [Shot N]后续时间段 + 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>，情节开时输出情节纯文本）；定义块 <Picture N> 行只输出「补充：」之前的内容（中英文冒号与大小写兼容）；索引输出各档案 0 基序号，索引时长取「类型」时长，分镜类型取该分镜「类型」编码（文戏 0 / 武戏 1 / MV 2 / 其他 3）。"
                 }),
                 "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
                     "default": "角色档案",
                     "tooltip": "选择「档案」输出端口输出的档案类型：角色档案、音色档案、道具档案或场景档案。"
+                }),
+                "模式": (["分镜模式", "档案模式"], {
+                    "default": "分镜模式",
+                    "tooltip": "档案模式：输入只剩 JSON，输出只保留「作品名 / 整体风格 / 档案 / 档案编码」；"
+                               "分镜模式：隐藏这四项，改显示「开关配置」「情节衔接文本」输入与其余输出端口。",
                 }),
             },
             "optional": {
@@ -152,7 +159,7 @@ class YUAN_TXTJsonExtractor:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING", "STRING", "STRING", "STRING", "FLOAT", "BOOLEAN")
+    RETURN_TYPES = ("INT", "STRING", "STRING", "STRING", "STRING", "STRING", "FLOAT", "BOOLEAN")
     RETURN_NAMES = OUTPUT_NAMES
     FUNCTION = "extract_json"
     CATEGORY = "Yuan Tool/文本"
@@ -173,6 +180,8 @@ class YUAN_TXTJsonExtractor:
                 if s:
                     lines.append(s)
             return "\n".join(lines)
+        if val is None:
+            return ""
         try:
             return str(val)
         except Exception:
@@ -228,6 +237,27 @@ class YUAN_TXTJsonExtractor:
         """从档案条目中提取名称（第一个中/英文逗号前的部分）。"""
         return YUAN_TXTJsonExtractor._before_first_comma(entry)
 
+    @classmethod
+    def _format_archive_entry(cls, entries, index):
+        """档案模式：取该档案第 index 条（0 基），输出「全名称 + 描述」两行。
+
+        条目约定为「全名，描述」；描述前的分隔标点去掉，描述内的「；补充：」原样保留。
+        越界或空档案返回空串。
+        """
+        if not isinstance(entries, (list, tuple)) or not entries:
+            return ""
+        try:
+            i = int(index)
+        except (TypeError, ValueError):
+            i = 0
+        if not 0 <= i < len(entries):
+            return ""
+        text = entries[i] if isinstance(entries[i], str) else str(entries[i])
+        text = text.strip()
+        name = cls._before_first_comma(text)
+        desc = text[len(name):].lstrip(" \t，,：:；;、。")
+        return "\n".join(part for part in (name, desc.strip()) if part)
+
     # 「补充」截断标记：中文「补充」/英文 supplement 均可，冒号兼容中英文（：/:），忽略大小写
     SUPPLEMENT_RE = re.compile(r'(?:补充|supplement)\s*[：:]', re.IGNORECASE)
 
@@ -250,17 +280,17 @@ class YUAN_TXTJsonExtractor:
         mask = _build_dialogue_protect_mask(text)
         n = len(text)
 
-        # 收集所有名称：(name, type, index, length)
+        # 收集所有名称：(name, type, index, length)；带括号/方括号后缀的条目额外登记「括号前」的别名，
+        # 例如档案「油纸伞（黑）」，正文只写「油纸伞」也能匹配（最长优先，全名仍优先命中）
         all_names = []
-        for i, name in enumerate(char_names):
-            if name:
-                all_names.append((name, 'char', i, len(name)))
-        for i, name in enumerate(prop_names):
-            if name:
-                all_names.append((name, 'prop', i, len(name)))
-
-        # 按长度降序排序（最长优先匹配，避免子串冲突）
-        all_names.sort(key=lambda x: -x[3])
+        for names, ntype in ((char_names, 'char'), (prop_names, 'prop')):
+            for i, name in enumerate(names):
+                if not name:
+                    continue
+                all_names.append((name, ntype, i, len(name)))
+                alias = re.split(r'[（(【\[:：]', name, maxsplit=1)[0].strip()
+                if len(alias) >= 2 and alias != name:
+                    all_names.append((alias, ntype, i, len(alias)))
 
         consumed = [False] * n
         char_found = {}   # index -> first_pos
@@ -317,6 +347,19 @@ class YUAN_TXTJsonExtractor:
         if not m:
             return None
         return float(m.group(1))
+
+
+    @staticmethod
+    def _shot_type_code(type_str):
+        """分镜类型编码：文戏 0、武戏 1、MV 2、其他（含未命中）3。"""
+        text = str(type_str or "")
+        if "武戏" in text:
+            return 1
+        if "文戏" in text:
+            return 0
+        if "MV" in text.upper():
+            return 2
+        return 3
 
     @staticmethod
     def _build_detailed_description(时间段, 环境音, BGM, 类型="", bgm_enabled=True):
@@ -531,7 +574,7 @@ class YUAN_TXTJsonExtractor:
                     values[k] = v
         return tuple(values[k] for k in cls.SWITCH_KEYS)
 
-    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 开关配置=None, 情节衔接文本=None):
+    def extract_json(self, json=None, 索引=1, 档案选择="角色档案", 开关配置=None, 情节衔接文本=None, 模式="分镜模式"):
         # 形参名与输入端口名一致；八个选项开关来自「开关配置」（未接入时取默认值）
         角色开关, 音色开关, 道具开关, 场景开关, BGM开关, 情节开关, 台词开关, 情节衔接开关 = self._parse_switch_config(开关配置)
         # 情节衔接文本：未接入时不新增行（空文本同样不新增）
@@ -560,7 +603,11 @@ class YUAN_TXTJsonExtractor:
             "道具档案": 道具档案数据,
             "场景档案": 场景档案数据,
         }
-        档案 = self._list_to_lines(档案表.get(档案选择, 角色档案数据))
+        档案条目 = 档案表.get(档案选择, 角色档案数据)
+        # 档案模式：索引改指该档案里的第几条（0 基），只输出这一条（全名 + 描述两行）；
+        # 分镜模式：索引是分镜编号，档案端口输出整份档案（该端口在分镜模式下本就隐藏）
+        档案 = (self._format_archive_entry(档案条目, 索引) if 模式 == "档案模式"
+                else self._list_to_lines(档案条目))
 
         # 档案编码：按「档案选择」输出对应编码（角色档案=0、音色档案=1、道具档案=2、场景档案=3）
         档案编码 = {
@@ -616,6 +663,7 @@ class YUAN_TXTJsonExtractor:
             道具索引 = ""
             场景索引 = ""
             索引时长 = 0.0
+            分镜类型 = 3
         else:
             # 角色、道具：优先取「分镜情节」条目的 出现角色/出现道具 显式列表；未提供时在分镜时间段文本中智能匹配
             char_names = [self._extract_name(e) for e in (角色档案数据 if isinstance(角色档案数据, list) else [])]
@@ -625,7 +673,10 @@ class YUAN_TXTJsonExtractor:
             char_indices = self._archive_indices_by_names(出现角色, char_names)
             prop_indices = self._archive_indices_by_names(出现道具, prop_names)
             if char_indices is None or prop_indices is None:
-                text_char, text_prop = self._find_appearing_indices(分镜序列文本, char_names, prop_names)
+                # 匹配范围：标题 + 时间段 + 情节文本 + 环境音（只拿时间段会漏掉「情节/标题里提到的道具」）
+                情节文本 = str(情节条目.get("情节") or "") if 情节条目 is not None else ""
+                查找文本 = "\n".join(x for x in (matched_title, 分镜序列文本, 情节文本, 环境音) if x)
+                text_char, text_prop = self._find_appearing_indices(查找文本, char_names, prop_names)
                 if char_indices is None:
                     char_indices = text_char
                 if prop_indices is None:
@@ -687,7 +738,10 @@ class YUAN_TXTJsonExtractor:
             if 索引时长 is None:
                 索引时长 = self._max_duration_seconds(分镜序列文本)
 
-        # 场景上下文：当前分镜（编号=索引）与上一个分镜（编号-1）的场景关键词是否相同（取「-」前部分比较）；索引为1（无前参考）或找不到上一编号则输出 False
+            # 分镜类型：取当前分镜（编号=索引）「类型」字段的编码（文戏 0 / 武戏 1 / MV 2 / 其他 3）
+            分镜类型 = self._shot_type_code(matched_type)
+
+        # 场景衔接：当前分镜（编号=索引）与上一个分镜（编号-1）的场景关键词是否相同（取「-」前部分比较）；索引为1（无前参考）或找不到上一编号则输出 False
         场景判断 = False
         if found_shot and isinstance(分镜序列数据, list):
             prev_title = ""
@@ -751,10 +805,16 @@ class YUAN_TXTJsonExtractor:
         if 角色道具场景:
             分镜序列输出 = 角色道具场景.rstrip("\n") + "\n\n" + 分镜序列输出
 
-        return {
-            "result": [整体风格, 档案, 档案编码, 分镜序列输出, 角色索引, 音色索引, 道具索引, 场景索引, 索引时长, 场景判断]
-        }
-
+        # 两种模式都返回 8 项（= 定义端口数），顺序与定义一致：
+        # 两种模式都返回 8 项（= 定义端口数），顺序与定义一致：
+        #   分镜模式 = 分镜类型/分镜序列/角色索引/音色索引/道具索引/场景索引/索引时长/场景衔接
+        #   档案模式 = 档案编码/作品名/整体风格/档案/空/空/0.0/False（前端把前四个端口改名为档案名）
+        # 音色档案只用于配音、与画面风格无关，此时整体风格输出空文本。
+        作品名输出 = self._list_to_lines(data.get("作品名", ""))
+        if 模式 == "档案模式":
+            return {"result": [档案编码, 作品名输出, "" if 档案选择 == "音色档案" else 整体风格, 档案,
+                               "", "", 0.0, False]}
+        return {"result": [分镜类型, 分镜序列输出, 角色索引, 音色索引, 道具索引, 场景索引, 索引时长, 场景判断]}
 
 # ==== JSON提取开关（JSON提取 的子节点）：八个选项开关聚合为单个「开关配置」端口输出 ====
 
@@ -1250,19 +1310,23 @@ class YUAN_TXTParagraphSplitter:
             return (0, [""],) + ("",) * self.MAX_OUTPUTS
 
         if 分段方式 == "端口":
+            # 段落优化开启：端口文本去掉空行（只保留有内容的行）；关闭：连空行一起原样保留，
+            # 与输入一一对应（某端口里的空行留在该段自己的输出里，不与其他段合并）
+            def port_text(val):
+                s = self._convert_to_str(val)
+                if not 段落优化:
+                    return s
+                return "\n".join(line.strip() for line in s.splitlines() if line.strip())
+
             if collected_texts:
                 # 端口模式下每个 any_x 端口对应一个段落位置：即使端口为空也保留占位，
                 # 保证选取段落索引与端口序号一一对应（如 any2 未接入时索引1应输出空文本）
                 paras = []
                 for i in range(1, input_count + 1):
                     val = kwargs.get(f"any_{i}", None)
-                    if val is None:
-                        paras.append("")
-                    else:
-                        s = self._convert_to_str(val)
-                        paras.append(s.strip() if 段落优化 else s)
+                    paras.append("" if val is None else port_text(val))
             else:
-                paras = [text.strip() if 段落优化 else text] if text else []
+                paras = [port_text(text)] if text else []
         elif 分段方式 == "空行":
             lines, paras, curr_para = text.split('\n'), [], []
             for line in lines:
@@ -1292,11 +1356,8 @@ class YUAN_TXTParagraphSplitter:
                     if current_para or processed_line.strip(): current_para.append(processed_line)
             if current_para: paras.append(' '.join(current_para) if 段落优化 else '\n'.join(current_para))
         elif 分段方式 == "段落":
-            lines = text.split('\n')
-            paras = []
-            for line in lines:
-                pl = line.strip() if 段落优化 else line
-                if pl: paras.append(pl)
+            # 每行一段：关闭优化时连空行一起保留（与输入逐行对应），开启时由下方统一去空行
+            paras = [line.strip() if 段落优化 else line for line in text.split('\n')]
         elif 分段方式 == "标题":
             lines = text.split('\n')
             paras = []
@@ -1348,7 +1409,7 @@ class YUAN_TXTParagraphSplitter:
                     paras.append(pl)
         elif 分段方式 == "地址":
             pro_text = text.replace('\\\\', '\\')
-            pattern = r'([a-zA-Z]:[\\/][^"\'<>,;\[\]\n\r]+)'
+            pattern = r'([a-zA-Z]:[\\/][^\"\'<>,;\[\]\n\r]+)'
             matches = re.findall(pattern, pro_text)
             paras = []
             for m in matches:
@@ -1387,6 +1448,11 @@ class YUAN_TXTParagraphSplitter:
                         selected_indices.append(idx)
                 except (TypeError, ValueError):
                     continue
+
+        # 段落优化是后处理：先按端口/行序号完成选取，再把空段落从结果里去掉。
+        # 这样开启与关闭优化的选取顺序与内容一致（空段落/空端口只影响是否输出，不改变索引）
+        if 段落优化:
+            to = [p for p in to if p and p.strip()]
 
         if not 输出模式:
             to = ["\n".join(to)] if to else [""]
