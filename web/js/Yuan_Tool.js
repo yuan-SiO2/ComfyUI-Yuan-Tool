@@ -61,9 +61,18 @@ function registerYuanTool(nodeType, portMeta) {
             return true;
         };
 
+        // 端口同步包一层 try/finally：异常时不能把 _syncing 永久留在 true（否则端口递进/连线恢复会失效）
         const syncPortsReal = (mode) => {
             if (self._syncing) return;
             self._syncing = true;
+            try {
+                syncPortsImpl(mode);
+            } finally {
+                self._syncing = false;
+            }
+        };
+
+        const syncPortsImpl = (mode) => {
             // 期望端口集合（有序）：列表模式=listNames 递进组，单帧模式=singleNames 递进组
             const desiredNames = [];
             if (mode) {
@@ -158,8 +167,6 @@ function registerYuanTool(nodeType, portMeta) {
                     }
                 }
             }
-
-            self._syncing = false;
 
             // 保持当前宽度不变，只更新高度
             const currentWidth = self.size ? self.size[0] : self.computeSize()[0];

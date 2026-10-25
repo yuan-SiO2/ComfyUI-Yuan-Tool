@@ -701,7 +701,7 @@ app.registerExtension({
                         cur = Math.min(cur + d, e);
                         bounds.push(cur);
                     }
-                    if (!bounds.length) bounds = [e];
+                    if (!bounds.length) bounds.push(e);
                     return bounds;
                 };
 

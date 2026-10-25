@@ -6,7 +6,7 @@ export function getApi() {
         const c = window.comfyAPI;
         if (c && c.api) {
             if (c.api.api && typeof c.api.api.apiURL === "function") return c.api.api;
-            if (typeof c.api.apiURL === "function") return c.api.api;
+            if (typeof c.api.apiURL === "function") return c.api;
         }
     } catch (_) {}
     return null;

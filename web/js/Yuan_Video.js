@@ -2060,18 +2060,23 @@ app.registerExtension({
                     }
                     return false;
                 };
+                // 移除节点时停掉轮询与 rVFC 续订，否则闭包和 video 元素不会被释放
+                let _segWatchOff = false;
                 const _rvfcSegLoop = (now, meta) => {
-                    if (!videoPreview.requestVideoFrameCallback) return;
-                    if (!videoPreview.paused) {
-                        _checkSegEndByFrame(meta.mediaTime);
-                    }
+                    if (_segWatchOff || !videoPreview.requestVideoFrameCallback) return;
+                    if (!videoPreview.paused) _checkSegEndByFrame(meta.mediaTime);
                     // 暂停时 rVFC 不再回调；恢复播放后自动续上，因此始终续订
                     videoPreview.requestVideoFrameCallback(_rvfcSegLoop);
                 };
-                if (videoPreview.requestVideoFrameCallback) {
-                    videoPreview.requestVideoFrameCallback(_rvfcSegLoop);
-                }
+                if (videoPreview.requestVideoFrameCallback) videoPreview.requestVideoFrameCallback(_rvfcSegLoop);
                 const _segEndPollTimer = setInterval(_checkSegEndByTime, 8);
+                const _prevOnRemovedWatch = node.onRemoved;
+                node.onRemoved = function () {
+                    _segWatchOff = true;
+                    clearInterval(_segEndPollTimer);
+                    videoPreview.pause();
+                    if (_prevOnRemovedWatch) _prevOnRemovedWatch.apply(this, arguments);
+                };
 
                 // --- 时间轴拖动逻辑（主状态以秒运行，播放定位原生锁定） ---
                 sliderBox.onpointerdown = (e) => {

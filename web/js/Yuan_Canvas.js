@@ -437,10 +437,12 @@ app.registerExtension({
         if (!isYuan_Canvas(node)) return;
 
         node.imageNameWidget = getCompositorWidget(node, "imageName");
+        // 原回调可能是 undefined（新节点上没人注册过），必须判空；且要用 function 才能把
+        // 本次 widget 回调的实参原样透传（箭头函数里的 arguments 属于 nodeCreated）
         const originalCallback = node.imageNameWidget.callback;
-        node.imageNameWidget.callback = () => {
-            originalCallback(arguments);
-        }
+        node.imageNameWidget.callback = function (...args) {
+            if (typeof originalCallback === "function") originalCallback.apply(this, args);
+        };
         node.imageNameWidget.computeSize = () => [0, 0];
         hideWidgetForGood(node, node.imageNameWidget);
 
