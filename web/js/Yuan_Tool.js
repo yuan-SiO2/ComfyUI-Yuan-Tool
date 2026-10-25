@@ -357,11 +357,12 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
                     currentOptional.every((inp, i) => inp === optional[i]);
                 if (!orderOk) {
                     self.inputs = [...required, ...optional];
-                    optional.forEach((inp, idx) => {
-                        if (inp.link != null) {
-                            const l = app.graph.links[inp.link];
-                            if (l) l.target_slot = required.length + idx;
-                        }
+                    // 重排后所有端口的 target_slot 都要按新下标回写：required 段也会位移，
+                    // 只修可选端口会让它们的连线挂到错误端口上
+                    self.inputs.forEach((inp, idx) => {
+                        if (inp.link == null) return;
+                        const l = app.graph.links[inp.link];
+                        if (l) l.target_slot = idx;
                     });
                 }
 
@@ -623,7 +624,7 @@ function registerYuanH3MotionContext(nodeType, portMeta) {
     const LINK_LATENT_WIDGETS = ["潜空间上下文长度", "潜空间音频长度", "衔接余量"];
     const LINK_VIDEO_WIDGETS = ["上下文长度", "音频上下文长度"];
 
-    // combo 自愈：历史错位曾致误删「片段序号」端口、GetNode 连线永久丢失；无效值一律重置为 fallback 并返回归一化结果
+    // 校验 combo 值：无效值重置为 fallback，返回归一化后的值
     const normalizeCombo = (widget, values, fallback) => {
         if (!widget) return fallback;
         const v = String(widget.value == null ? "" : widget.value).trim();
@@ -685,8 +686,7 @@ function registerYuanH3MotionContext(nodeType, portMeta) {
     nodeType.prototype.onConfigure = function (info) {
         const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
         this._h3Hint = null;
-        // combo 自愈：历史错位工作流（widget 值前移）会把别的参数值塞进 combo（如模式="H3-Mubu"），
-        // 重置默认值防止模式误判与序列化固化错位
+        // 校正 combo 值，非法值回退默认
         const w = (name) => this.widgets && this.widgets.find((x) => x.name === name);
         normalizeCombo(w("模式"), MODE_VALUES, "自动索引");
         normalizeCombo(w("衔接模式"), LINK_VALUES, LINK_VIDEO);
@@ -826,13 +826,13 @@ function registerYuanH3MotionContext(nodeType, portMeta) {
             if (self._syncing) return;
             self._syncing = true;
             try {
-                // 模式值自愈：无效值（历史错位遗留，如模式="H3-Mubu"）兜底为自动索引，防误判触发端口移除
+                // 校正模式值，非法值回退「自动索引」
                 const mode = normalizeCombo(modeWidget, MODE_VALUES, "自动索引");
                 self._lastModeValue = mode;
                 const isUpload = mode === "上传";
                 const isPort = mode === "端口";
                 const isAuto = mode === "自动索引";
-                // 衔接模式值自愈：旧工作流新增 widget 无值（或历史错位残留媒体文件名）时兜底
+                // 校正衔接模式值，非法值回退「视频图像」
                 const link = normalizeCombo(linkWidget, LINK_VALUES, LINK_VIDEO);
                 self._lastLinkValue = link;
                 const isLatentLink = link === LINK_LATENT;
@@ -881,9 +881,8 @@ function registerYuanH3MotionContext(nodeType, portMeta) {
                 for (const nm of LINK_VIDEO_WIDGETS) setWidgetHidden(nm, isLatentLink);
                 for (const nm of LINK_LATENT_WIDGETS) setWidgetHidden(nm, !isLatentLink);
 
-                // 2) 片段序号仅自动索引显示；端口常驻、只隐藏 widget——动态移除绑 widget 的端口
-                // 曾致保存丢值错位、删掉接好的 GetNode 连线（实例级连接不随序列化，切换即永久丢失）。
-                // 后端非自动索引模式下忽略此参数，常驻无副作用
+                // 2) 片段序号仅在自动索引模式显示：端口常驻、只隐藏 widget
+                //（删端口会导致保存丢值并断开已连的线）；后端其他模式忽略该参数
                 if (isAuto) {
                     if (seqWidget) seqWidget.hidden = false;
                 } else {

@@ -465,8 +465,7 @@ app.registerExtension({
             }
 
             // V3：在 comfy-node 元素上同步最小尺寸。
-            // 缓存上次写入值：尺寸为常量，只在首次（或元素更换后）写一次样式，
-            // 避免每帧 removeProperty/setProperty 与 V3 布局系统争抢引发闪动
+            // 记住已写入的尺寸：仅在首次或元素更换后写样式，避免每帧改动引发闪动
             let _v3MinApplied = null;
             function applyV3MinSize() {
                 if (!checkIsV3()) return;

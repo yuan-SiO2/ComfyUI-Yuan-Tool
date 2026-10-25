@@ -94,7 +94,7 @@ app.registerExtension({
                 node._initializing = true;
                 node._should_reset_trim = false;
 
-                // --- V2 关键修复：屏蔽 ComfyUI 写入 imgs 预览图 ---
+                // 屏蔽 ComfyUI 写入 imgs 预览图
                 Object.defineProperty(node, 'imgs', {
                     get: function() { return undefined; },
                     set: function(val) { /* 忽略 ComfyUI 设置的预览图 */ },

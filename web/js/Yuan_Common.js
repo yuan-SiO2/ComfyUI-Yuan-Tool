@@ -126,6 +126,50 @@ export function chainCallback(object, property, callback) {
     }
 }
 
+/** 加载工作流后按存档里的「端口名」把连线重新指到同名端口。
+/** 按存档里的端口名把连线重新指到当前节点的同名端口；alias 为旧端口名映射。
+ *  info 为存档原文（configure 入参），含 outputs/inputs 的端口名。 */
+export function remapSavedPorts(node, info, alias = {}) {
+    const graph = node?.graph;
+    const links = graph?.links;
+    if (!info || !links) return;
+    // 按「存档槽位下标 → 端口名 → 现在同名端口的槽位」迁移该槽位上的所有连线。
+    // 不依赖存档里的 links 字段（可能是 null），以链接仓库里的 origin_slot / target_slot 为准。
+    const moves = [];
+    for (const [i, o] of (info.outputs ?? []).entries()) {
+        const to = node.outputs?.findIndex((slot) => slot?.name === (alias[o?.name] ?? o?.name)) ?? -1;
+        if (to < 0 || to === i) continue;
+        for (const link of links.values()) {
+            if (link?.origin_id === node.id && link.origin_slot === i) {
+                moves.push({ out: true, from: i, to, otherId: link.target_id, otherSlot: link.target_slot });
+            }
+        }
+    }
+    for (const [i, input] of (info.inputs ?? []).entries()) {
+        const to = node.inputs?.findIndex((slot) => slot?.name === (alias[input?.name] ?? input?.name)) ?? -1;
+        if (to < 0 || to === i) continue;
+        for (const link of links.values()) {
+            if (link?.target_id === node.id && link.target_slot === i) {
+                moves.push({ out: false, from: i, to, otherId: link.origin_id, otherSlot: link.origin_slot });
+            }
+        }
+    }
+    if (!moves.length) return;
+    // 先断开涉及的槽位（出线与进线分开处理，避免混用同一批槽位号）
+    for (const m of moves) {
+        if (m.out) node.disconnectOutput?.(m.from);
+    }
+    for (const m of moves) {
+        if (!m.out) node.disconnectInput?.(m.from);
+    }
+    for (const m of moves) {
+        const other = graph.getNodeById?.(m.otherId);
+        if (!other) continue;
+        if (m.out) node.connect(m.to, other, m.otherSlot);
+        else other.connect(m.otherSlot, node, m.to);
+    }
+}
+
 /** 隐藏 ComfyUI widget（兼容 V2 原生绘制与 V3 Vue 模式）。 */
 export function hideWidget(w) {
     if (!w) return;

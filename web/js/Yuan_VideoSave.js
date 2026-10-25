@@ -867,8 +867,6 @@ function addPreviewMenu(nodeType) {
     });
 }
 
-console.info("[Yuan 视频保存] 前端扩展已加载");
-
 app.registerExtension({
     name: "Yuan.VideoSave",
     async beforeRegisterNodeDef(nodeType, nodeData) {
