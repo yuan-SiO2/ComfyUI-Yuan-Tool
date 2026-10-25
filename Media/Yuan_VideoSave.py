@@ -588,7 +588,7 @@ def _format_preview_data():
 
 
 @PromptServer.instance.routes.get("/yuan_tool/video_save_formats")
-async def yuan_video_save_formats(request):
+async def yuan_video_save_formats(_request):
     """前端按当前输出格式显隐高级参数时读取的格式定义。"""
     return web.json_response(_format_preview_data())
 
@@ -1138,7 +1138,6 @@ class YuanVideoSave:
             )
             output_files.append(file_path)
             media_files.append(file_path)
-            preview_format = record["id"]
 
         else:
             ffmpeg = _ffmpeg_path()
@@ -1184,11 +1183,22 @@ class YuanVideoSave:
                     num_frames += num_frames - 2
                     pbar.total = num_frames
 
-            loop_args = (
-                ["-vf", f"loop=loop={循环次数}:size={num_frames}"]
-                if 循环次数 > 0
-                else []
-            )
+            # 循环次数靠 FFmpeg 的 loop 滤镜；-filter_complex 与 -vf 互斥，
+            # 复杂滤镜格式（如调色板 GIF）只能把 loop 插到首条链的输入标签之后
+            loop_args = ["-vf", f"loop=loop={循环次数}:size={num_frames}"] if 循环次数 > 0 else []
+            main_pass = video_format.get("main_pass") or []
+            at = next((i for i, a in enumerate(main_pass) if a == "-filter_complex"), -1)
+            if loop_args and at >= 0 and isinstance(main_pass[at + 1], str):
+                graph = main_pass[at + 1]
+                head = re.match(r"\s*\[[^\]]*\]", graph)
+                if not head:
+                    raise RuntimeError(
+                        f"输出格式「{record['label']}」的滤镜链不以 [0:v] 之类标签开头，"
+                        "无法套用「循环次数」；请把「循环次数」设为 0。"
+                    )
+                chain = f"loop=loop={循环次数}:size={num_frames}"
+                main_pass[at + 1] = f"{graph[:head.end()]} {chain},{graph[head.end():]}"
+                loop_args = []
 
             if video_format.get("input_color_depth", "8bit") == "16bit":
                 frames = map(tensor_to_shorts, frames)

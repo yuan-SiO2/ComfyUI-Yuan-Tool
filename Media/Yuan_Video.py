@@ -1,5 +1,6 @@
 """Yuan 加载视频节点：内置预览、时间轴裁剪、镜头智能分段与裁剪框交互。"""
 
+import logging
 import os
 import gc
 import asyncio
@@ -23,6 +24,7 @@ from ..Yuan_common import (
     video_duration,
 )
 
+LOGGER = logging.getLogger("Yuan.Video")
 
 # 自定义 API 路由：从系统任意路径读取视频/音频/图片，供前端预览
 _VIEW_ALLOWED_EXTS = (
@@ -127,7 +129,7 @@ def _detect_segments_sync(video_path, fps, start_time, end_time):
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=70)
                     thumb = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-                # --- 末帧：输出序列的最后一帧（首个 PTS >= 倒数第二个网格点的帧） ---
+                # --- 末帧：本段最后一个网格点处的帧（首个 PTS >= (s1-1)/fps 的帧） ---
                 last_grid_time = actual_start_time + (s1 - 1) / fps
                 if vstream.time_base:
                     seek_pts2 = int(last_grid_time / float(vstream.time_base))
@@ -733,10 +735,12 @@ class YuanVideoUI:
                     start_sample = int(offset_sec * sample_rate)
 
                     duration_sec_audio = decode_end_time - decode_start_time
-                    end_sample = start_sample + int(duration_sec_audio * sample_rate)
+                    # 源时长未知时 decode_end_time 为 inf（int(inf) 会抛错）：保留到音频末尾
+                    end_sample = (start_sample + int(duration_sec_audio * sample_rate)
+                                  if math.isfinite(duration_sec_audio) else None)
 
                     # 正确裁剪数组边界
-                    if end_sample > start_sample:
+                    if end_sample is not None and end_sample > start_sample:
                         waveform = waveform[:, start_sample:end_sample]
                     else:
                         waveform = waveform[:, start_sample:]
@@ -745,11 +749,11 @@ class YuanVideoUI:
                     waveform = waveform.unsqueeze(0)
                     audio_dict = {"waveform": waveform, "sample_rate": sample_rate}
 
-            except Exception:
-                # 音频流提取失败时优雅跳过，不影响主流程
-                pass
+            except Exception as exc:
+                # 音频流提取失败时不影响主流程，但要留下痕迹，否则用户只会看到静音输出
+                LOGGER.warning("视频音频流提取失败，节点将输出静音：%s", exc)
 
-        # 始终关闭容器以释放系统内存锁
+        # 正常路径显式关闭容器；异常路径由 PyAV 容器对象的析构（refcount 归零）释放
         container.close()
 
         # 释放解码/缩放临时缓冲后再回收内存
@@ -760,7 +764,6 @@ class YuanVideoUI:
         output_seg_count = seg_count
 
         if 输出模式 == "智能分段输出":
-            final_duration_sec = float(max(0.0, decode_end_time - decode_start_time))
             frame_count = int(image_tensor.shape[0])
         else:
             # 自定义裁剪输出：保持原有行为

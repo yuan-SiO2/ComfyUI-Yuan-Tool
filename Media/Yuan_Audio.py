@@ -1,6 +1,7 @@
 """Yuan 音频列表/分流/加载（播放器裁剪分段）节点。"""
 
 import json
+import logging
 import os
 import re
 
@@ -11,6 +12,7 @@ import folder_paths
 
 from ..Yuan_common import list_input_files
 
+LOGGER = logging.getLogger("Yuan.Audio")
 _CATEGORY = "Yuan Tool/音频"
 
 # 支持的音频/视频扩展名（视频提取音轨），与前端过滤一致
@@ -126,7 +128,7 @@ class YuanAudioList:
                 pass
         files = files[:MAX_AUDIOS]
 
-        # 先在文件级筛选（索引 = 方块序号 - 1，不受解码失败影响），再解码
+        # 先在文件级筛选（索引 = 方块序号 - 1），再逐个解码
         indexes = _parse_filter_indexes(筛选索引, len(files))
         if indexes is not None:
             files = [files[i] for i in indexes]
@@ -137,8 +139,11 @@ class YuanAudioList:
                 filepath = folder_paths.get_annotated_filepath(name)
                 waveform, sample_rate = _load_audio_file(filepath)
                 audios.append({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate})
-            except Exception:
-                continue
+            except Exception as exc:
+                # 解码失败也要占住位置：直接跳过会让后面的文件整体前移，
+                # 下游「音频分流」的端口序号就会和列表里的方块对不上
+                LOGGER.warning("音频解码失败，已用静音占位：%s（%s）", name, exc)
+                audios.append(_silence_audio())
 
         return (audios if audios else [_silence_audio()],)
 
