@@ -1385,7 +1385,7 @@ class YUAN_TXTParagraphSplitter:
                     if 0 <= idx < len(paras):
                         to.append(paras[idx])
                         selected_indices.append(idx)
-                except:
+                except (TypeError, ValueError):
                     continue
 
         if not 输出模式:

@@ -77,7 +77,7 @@ def _entry_from_path(path: Path, media_type: str) -> dict:
     target = Path(path).resolve()
     try:
         rel = target.relative_to(root)
-        subfolder = str(rel.parent).replace("\\", "/")
+        subfolder = "" if str(rel.parent) == "." else str(rel.parent).replace("\\", "/")
     except Exception:
         subfolder = ""
     return {
