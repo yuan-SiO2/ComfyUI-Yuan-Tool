@@ -69,7 +69,7 @@ def _decode_av_latent(av_latent, video_vae):
 class YuanRTXVideoUpscaleH3:
     """RTX 视频放大 (H3) 节点：合并 RTX 视频超分辨率 + AV Decode Split + PT H3 Concat AV Latent 三者为一体。"""
 
-    # 类级缓存：{cache_key: (upscaled, av_latent_output)}
+    # 类级缓存：{cache_key: (输入引用…, 结果)}；key 只是粗筛，命中还要求是同一份输入
     _cache = {}
     _cache_bytes = 0
     _MAX_CACHE_ENTRIES = 2
@@ -170,11 +170,12 @@ class YuanRTXVideoUpscaleH3:
             "height": height,
         }
 
-        # 计算缓存 key，命中则直接返回上次的两个输出
+        # key 只是粗筛（shape+地址，推理张量无 version），命中还要求是同一份输入
         cache_key = self._build_cache_key(images, av_latent, video_vae, resize_params, quality)
+        cache_inputs = (images, av_latent["samples"] if av_latent else None)
         cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
+        if cached and cached[0] is cache_inputs[0] and cached[1] is cache_inputs[1]:
+            return cached[2]
 
         # av_latent 模式：先解码得到 frames + 分离后的 audio_latent
         audio_latent = None
@@ -213,12 +214,16 @@ class YuanRTXVideoUpscaleH3:
         merged_av_latent = {"samples": nested_latent}
 
         result = (upscaled, merged_av_latent)
-        self._store_cache(cache_key, result)
+        self._store_cache(cache_key, cache_inputs + (result,))
         return result
 
     @staticmethod
     def _tensor_fingerprint(t):
-        """张量指纹：shape + dtype + device + version + data_ptr；version 检测原地修改，data_ptr 检测内存地址变化（推理张量无 version 时以 None 占位）。"""
+        """张量指纹：shape + dtype + device + version + data_ptr。
+
+        只做粗筛、不代表内容（推理张量 _version 为 None，显存地址会被复用），
+        命中前必须再比较输入引用是否为同一对象。
+        """
         try:
             version = t._version
         except RuntimeError:
@@ -233,7 +238,7 @@ class YuanRTXVideoUpscaleH3:
 
     @classmethod
     def _build_cache_key(cls, images, av_latent, video_vae, resize_params, quality):
-        """根据所有输入构建可哈希的缓存 key。"""
+        """构建缓存 key（粗筛用；命中还要比对输入引用，见调用处）。"""
         images_fp = cls._tensor_fingerprint(images) if images is not None else None
 
         # av_latent 指纹（区分 NestedTensor 与普通 Tensor）

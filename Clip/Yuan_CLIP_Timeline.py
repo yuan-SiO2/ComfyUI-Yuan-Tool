@@ -35,9 +35,6 @@ from ..Yuan_common import handle_chunk_upload
 GuideData = "YUAN_CLIP_GUIDE_DATA"
 MotionGuideData = "YUAN_CLIP_MOTION_GUIDE_DATA"
 
-# text_input 时间格式解析：匹配行首的 "0-3s", "3-5秒", "5-7s" 等
-_TIME_RANGE_PATTERN = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*[s秒]\s*[：:]?\s*')
-
 # 多媒体引导上传子目录（独立于 LTX 导演，避免冲突）
 _TIMELINE_UPLOAD_SUBDIR = "yuan_clip"
 
@@ -478,7 +475,7 @@ def _compress_image(tensor: torch.Tensor, crf: int) -> torch.Tensor:
     """对 [N,H,W,3] 张量施加 H.264 压缩伪影。crf=0 不压缩。"""
     if crf == 0:
         return tensor
-    N, H, W, C = tensor.shape
+    N, H, W, _ = tensor.shape
     h = (H // 2) * 2
     w = (W // 2) * 2
     tensor_bytes = (tensor[:, :h, :w, :] * 255.0).byte().cpu().numpy()
@@ -1316,7 +1313,7 @@ class YuanCLIPTimeline:
                 }),
                 "最大帧数": ("INT", {
                     "default": 129, "min": 1, "max": 10000, "step": 1,
-                    "tooltip": "像素空间总帧数。仅用于编辑器的视觉缩放比例，实际帧数仍从潜空间读取。"
+                    "tooltip": "时间轴的总帧数（像素空间）：编辑器缩放、自动生成潜空间的帧数、音频时长与引导分段都按它计算。"
                 }),
                 "时间轴数据": ("STRING", {
                     "default": "",
@@ -1336,7 +1333,7 @@ class YuanCLIPTimeline:
                 }),
                 "帧率": ("FLOAT", {
                     "default": 24.0, "min": 0.1, "max": 240.0, "step": 0.1,
-                    "tooltip": "每秒帧数 — 仅在 时间单位 设为'seconds'时影响时间轴编辑器的显示。"
+                    "tooltip": "每秒帧数：秒↔帧换算、音频段时长与自动音频潜空间都按它计算；编辑器的显示单位由「时间单位」决定。"
                 }),
                 "时间单位": (["frames", "seconds"], {
                     "default": "frames",
@@ -1604,7 +1601,7 @@ class YuanCLIPTimeline:
         if not global_prompt:
             global_prompt = tdata.get("global_prompt", "")
 
-        # --- 处理 segment_images 端口：图像 batch 按段序分配（第1张→第1段……），锁定状态下拒绝上游数据 ---
+        # --- 处理 segment_images 端口：图像 batch 按段序分配（第1张→第1段……），仅在锁定状态下接受上游数据 ---
         if segment_images is not None and prompt_lock:
             try:
                 segments = tdata.get("segments", [])
@@ -1634,7 +1631,7 @@ class YuanCLIPTimeline:
             except Exception:
                 pass
 
-        # --- 处理 motion_images 端口：图像/视频合并为 IC-LoRA 轨道段，锁定状态下拒绝上游数据 ---
+        # --- 处理 motion_images 端口：图像/视频合并为 IC-LoRA 轨道段，仅在锁定状态下接受上游数据 ---
         if motion_images is not None and prompt_lock:
             try:
                 # 每张运动图像的帧数由 运动图像帧数 参数控制（8/16/24/32）
@@ -1695,7 +1692,7 @@ class YuanCLIPTimeline:
             except Exception:
                 pass
 
-        # --- 处理 音频输入 端口：上游 AUDIO 数据保存为音频文件并添加到音频轨道，锁定状态下拒绝上游数据 ---
+        # --- 处理 音频输入 端口：上游 AUDIO 数据保存为音频文件并添加到音频轨道，仅在锁定状态下接受上游数据 ---
         if audio_input is not None and prompt_lock:
             try:
                 waveform = audio_input.get("waveform") if isinstance(audio_input, dict) else None
@@ -1828,7 +1825,7 @@ class YuanCLIPTimeline:
             gen_h = derived_h if derived_h > 0 else height
             latent = _auto_generate_latent(gen_w, gen_h, ltxv_length)
 
-        patched, conditioning, effective_lengths, marker_token_indices = _encode_relay(
+        patched, conditioning, _effective_lengths, marker_token_indices = _encode_relay(
             model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
             marker_tags=marker_tags if marker_tags else None,
             marker_segment_refs=marker_segment_refs if marker_segment_refs else None,
