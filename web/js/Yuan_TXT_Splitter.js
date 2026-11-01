@@ -175,21 +175,18 @@ app.registerExtension({
             onConfigure?.apply(this, arguments);
             setupPreview(this);
         };
-
-        // 执行后：预览模式把结果写入「文本」框
+        // 执行后：预览模式把结果写入「文本」框（上游为空文本时也要清空，否则会一直显示上一次的内容）
         const onExecuted = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (message) {
             onExecuted?.apply(this, arguments);
             setupPreview(this);
             const mode = this.widgets?.find((w) => w.name === PREVIEW_MODE_WIDGET);
             const txt = this.widgets?.find((w) => w.name === PREVIEW_TEXT_WIDGET);
-            if (mode?.value && message?.text && txt) {
-                let v = [...message.text];
-                if (!v[0]) v.shift();
-                if (v[0]) {
-                    txt.value = v[0];
-                    app.graph.setDirtyCanvas(true, false);
-                }
+            if (!mode?.value || !txt) return;
+            const value = Array.isArray(message?.text) ? String(message.text[0] ?? "") : "";
+            if (txt.value !== value) {
+                txt.value = value;
+                app.graph.setDirtyCanvas(true, false);
             }
         };
     },

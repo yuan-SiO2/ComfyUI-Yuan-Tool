@@ -3,7 +3,14 @@ const { app } = window.comfyAPI.app;
 
 const YUAN_PRIMITIVE_TYPE = "YuanPrimitive";
 const YUAN_PRIMITIVE_TITLE = "选项";
+const YUAN_PRIMITIVE_CATEGORY = "Yuan Tool/选项";
 const YUAN_PRIMITIVE_OUTPUT_NAME = "连接到选项输入";
+// 节点来源归属：前端给纯前端节点生成的 def 写死 python_module="custom_nodes.frontend_only"，
+// 节点库的来源徽标/按模块分组就会显示 frontend_only。这里取本扩展自身 URL 里的包名
+// （/extensions/<包名>/...），与后端节点的 "custom_nodes.<包名>" 保持一致。
+const YUAN_PRIMITIVE_MODULE = "custom_nodes." + (
+    (import.meta.url.match(/\/extensions\/([^/]+)\//) || [])[1] || "ComfyUI-Yuan-Tool"
+);
 const YUAN_PRIMITIVE_DESCRIPTION =
     "把输出端口连接到任意下拉选项输入端口（如「MiniMax-H3 视频生成」的「模式」），" +
     "即自动读回该输入的全部选项并展开为一组互斥开关（Yes/No），点选开关即可切换取值并写回目标节点。" +
@@ -190,17 +197,18 @@ app.registerExtension({
                 description: YUAN_PRIMITIVE_DESCRIPTION,
             })
         );
-        YuanPrimitive.category = "Yuan Tool/选项";
+        YuanPrimitive.category = YUAN_PRIMITIVE_CATEGORY;
     },
 
-    // 汉化 V3 节点库/搜索：前端为纯前端注册节点生成的定义默认
-    // display_name=类型名（"YuanPrimitive"），注册进 Vue 应用前改写为中文
+    // 纯前端节点的定义由前端补全：display_name/description/python_module 都是默认值，
+    // 注册进 Vue 应用前统一改成本插件的中文名与归属，避免节点库把它算成 frontend_only。
     beforeRegisterVueAppNodeDefs(defs) {
         if (!Array.isArray(defs)) return;
         const def = defs.find((d) => d && d.name === YUAN_PRIMITIVE_TYPE);
-        if (def) {
-            def.display_name = YUAN_PRIMITIVE_TITLE;
-            def.description = YUAN_PRIMITIVE_DESCRIPTION;
-        }
+        if (!def) return;
+        def.display_name = YUAN_PRIMITIVE_TITLE;
+        def.description = YUAN_PRIMITIVE_DESCRIPTION;
+        def.category = YUAN_PRIMITIVE_CATEGORY;
+        def.python_module = YUAN_PRIMITIVE_MODULE;
     },
 });
