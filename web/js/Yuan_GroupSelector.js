@@ -1,4 +1,4 @@
-// 「组节点选择」节点（YuanGroupSelector）：复刻 rgthree 的 Fast Groups Bypasser（纯前端节点、无后端）。
+// 「组节点选项」节点（YuanGroupSelector）：复刻 rgthree 的 Fast Groups Bypasser（纯前端节点、无后端）。
 // 自动收集当前工作流（含子图）里的全部组，为每个组画一行开关：
 //   · 点击行内任意位置（行尾箭头以外）＝ 把该组内所有节点切到「旁路」或「启用」；
 //   · 点击行尾箭头 ＝ 定位并缩放到该组。
@@ -10,8 +10,11 @@
 /* ------------------------------ 常量 ------------------------------ */
 
 const YUAN_GROUP_SELECTOR_TYPE = "YuanGroupSelector";
-const YUAN_GROUP_SELECTOR_TITLE = "组节点选择";
+const YUAN_GROUP_SELECTOR_TITLE = "组节点选项";
 const YUAN_GROUP_SELECTOR_CATEGORY = "Yuan Tool/选项";
+// 旧版本的默认标题，载入老工作流时自动换成新名（用户自定义过的标题不动）
+const YUAN_GROUP_SELECTOR_LEGACY_TITLE = "组节点选择";
+
 // 节点来源归属：纯前端节点的 def 由前端补全，默认 python_module 是 custom_nodes.frontend_only，
 // 这里取本扩展 URL 里的包名（/extensions/<包名>/...），与后端节点保持一致。
 const YUAN_GROUP_SELECTOR_MODULE = "custom_nodes." + (
@@ -206,7 +209,7 @@ function collectGroups() {
 /**
  * 组内节点（会先重算组的成员）。
  * group._children 里同时含节点、连线点（reroute）和嵌套的子组，这里只保留真正的节点；
- * 同时排除本节点自身，避免把「组节点选择」一起旁路掉。
+ * 同时排除本节点自身，避免把「组节点选项」一起旁路掉。
  */
 function groupInsideNodes(group) {
     if (!group) return [];
@@ -326,7 +329,7 @@ function focusGroup(group) {
         canvas.setZoom?.(Math.min(zoomCurrent, zoomX, zoomY), [canvasWidth / 2, canvasHeight / 2]);
         canvas.setDirty?.(true, true);
     } catch (err) {
-        console.error("[Yuan Tool] 组节点选择：定位分组失败", err);
+        console.error("[Yuan Tool] 组节点选项：定位分组失败", err);
     }
 }
 
@@ -345,6 +348,11 @@ function rowsOf(node) {
 /** 「最多一个」或「始终一个」——都要求同一时刻只能有一行开启。 */
 function isOnlyOneRestriction(restriction) {
     return restriction === RESTRICTION_MAX_ONE || restriction === RESTRICTION_ALWAYS_ONE || `${restriction}`.includes("one");
+}
+
+/** 旧默认标题「组节点选择」→ 新默认标题「组节点选项」（只替换完全相同的默认名）。 */
+function migrateLegacyTitle(node) {
+    if (node && node.title === YUAN_GROUP_SELECTOR_LEGACY_TITLE) node.title = YUAN_GROUP_SELECTOR_TITLE;
 }
 
 /** 把旧版英文属性的键名/取值迁移成中文（只做一次，已保存的工作流不会丢设置）。 */
@@ -536,6 +544,7 @@ function drawEmptyHint(ctx, node) {
 /** 同步本节点的行列表、尺寸与绘制。 */
 function refresh(node) {
     if (!node || node.removed || !node.graph) return;
+    migrateLegacyTitle(node);
     migrateLegacyProperties(node);
     const groups = visibleGroups(node);
     node.__yuanRows = groups.map((group) => ({
@@ -567,7 +576,7 @@ function tickRefresh() {
         try {
             refresh(node);
         } catch (err) {
-            console.error("[Yuan Tool] 组节点选择：刷新失败", err);
+            console.error("[Yuan Tool] 组节点选项：刷新失败", err);
         }
     }
     if (!attachedNodes.size) stopService();
@@ -726,7 +735,7 @@ app?.registerExtension({
         const LiteGraph = window.LiteGraph;
         const Base = window.LGraphNode;
         if (!LiteGraph || !Base) {
-            console.warn("[Yuan Tool] 组节点选择：LiteGraph 尚未就绪，跳过注册");
+            console.warn("[Yuan Tool] 组节点选项：LiteGraph 尚未就绪，跳过注册");
             return;
         }
         const YuanGroupSelector = createGroupSelectorClass(Base);
