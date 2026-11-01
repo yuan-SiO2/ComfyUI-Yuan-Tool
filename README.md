@@ -70,7 +70,7 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 | ------ | ---------------------------------------------------------------------- |
 | **选项** | 前端虚拟节点，复刻原生 Primitive：连接任意输入后自动读回其 COMBO 类型与选项，并把选项展开为互斥开关按钮，点击即写回目标输入 |
 | **自定义选项** | 编辑模式填写各选项名称；选项模式显示互斥开关，输出当前选项的文本与位置索引 |
-| **组节点选择** | 前端虚拟节点，复刻 rgthree 的 Fast Groups Bypasser：自动收集当前工作流（含子图）中的全部组，为每组生成一行开关——点击行内任意位置即把组内节点切到旁路 / 启用，点击行尾箭头定位并缩放到该组；右键菜单可切排序（位置 / 名称 / 自定义字母）、按颜色或标题过滤、设置「最多一个」「始终一个」互斥限制 |
+| **组节点选项** | 前端虚拟节点，复刻 rgthree 的 Fast Groups Bypasser：自动收集当前工作流（含子图）中的全部组，为每组生成一行开关——点击行内任意位置即把组内节点切到旁路 / 启用，点击行尾箭头定位并缩放到该组；排序（位置 / 名称 / 自定义字母）、按颜色或标题过滤、「最多一个」「始终一个」互斥限制均在「属性面板」中设置 |
 
 ### 放大（Yuan Tool/放大）
 
@@ -111,4 +111,4 @@ git clone https://github.com/yuan-SiO2/ComfyUI-Yuan-Tool.git
 - [facok/comfyui-SelfLift](https://github.com/facok/comfyui-SelfLift)
 
 
-- [rgthree/ComfyUI-rgthree](https://github.com/rgthree/rgthree-comfy)（「组节点选择」复刻其 Fast Groups Bypasser 的交互与外观，代码完全独立实现）
+- [rgthree/ComfyUI-rgthree](https://github.com/rgthree/rgthree-comfy)（「组节点选项」复刻其 Fast Groups Bypasser 的交互与外观，代码完全独立实现）
