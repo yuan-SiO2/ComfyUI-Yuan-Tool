@@ -228,20 +228,214 @@ function createPlayer(node, scheduleFit) {
         overflow: "hidden",
     });
 
-    const video = document.createElement("video");
-    Object.assign(video.style, {
-        width: "100%",
-        height: "100%",
-        objectFit: "contain",
-        outline: "none",
-        display: "none",
-    });
-    video.controls = true;
-    video.controlsList = "nodownload nofullscreen noremoteplayback";
-    video.preload = "metadata";
-    video.playsInline = true;
-    video.loop = true;
-    video.muted = true;
+    // 幽灵播放器：节点被删或工作流重载时若没走 onRemoved，旧 <video> 会继续出声，
+    // 和当前预览叠在一起就是“回音”。这里给每个播放器打标记并记录所属节点，便于清理。
+    const PLAYER_MARK = "data-yuan-player";
+    const LOOP_TAIL = 0.08;   // 提前 80ms 回到开头，避免走到 ended 触发浏览器内部的循环重启
+
+    let video = null;
+    let tailFrame = 0;
+    let orphanTicks = 0;
+
+    function nodeInGraph(target) {
+        const graph = target?.graph;
+        const nodes = graph?._nodes || graph?.nodes;
+        if (!Array.isArray(nodes)) {
+            return true;   // 拿不到图信息时保守处理，不当作残留
+        }
+        return nodes.includes(target);
+    }
+
+    /** 停掉所属节点已不在图里的播放器（同图的其它「视频保存」节点保留）。 */
+    function releaseStalePlayers() {
+        document.querySelectorAll(`video[${PLAYER_MARK}]`).forEach((element) => {
+            if (element === video) {
+                return;
+            }
+            const owner = element.__yuanNode;
+            if (owner && nodeInGraph(owner)) {
+                return;
+            }
+            element.__yuanReleased = true;
+            try {
+                element.pause();
+                element.removeAttribute("src");
+                element.load();
+            } catch (error) {
+                // 元素已卸载时忽略
+            }
+            element.remove();
+        });
+    }
+
+    function wireVideo(element) {
+        const live = (handler) => (event) => {
+            if (element.__yuanReleased) {
+                return;
+            }
+            handler(event);
+        };
+
+        element.addEventListener("loadedmetadata", live(() => {
+            if (element.videoWidth > 0 && element.videoHeight > 0) {
+                const aspect = element.videoWidth / element.videoHeight;
+                if (Math.abs(aspect - state.aspect) > 0.01) {
+                    state.aspect = aspect;
+                    scheduleFit();
+                }
+            }
+        }));
+
+        element.addEventListener("play", live(() => {
+            if (!state.suppress) {
+                state.paused = false;
+            }
+        }));
+
+        element.addEventListener("pause", live(() => {
+            // 自然播完时浏览器会先派发 pause 再派发 ended；这种暂停不算“用户暂停”，
+            // 否则 ended 里会误判成用户暂停而不自动循环。
+            if (state.suppress || element.ended) {
+                return;
+            }
+            state.paused = true;
+        }));
+
+        element.addEventListener("volumechange", live(() => {
+            // 鼠标不在节点内时保持静音（即使通过原生音量控件取消静音）
+            if (state.params && !state.inside && !element.muted) {
+                element.muted = true;
+            }
+        }));
+
+        // 循环：优先在播到结尾前 80ms 就把播放位置拉回 0（不重建元素、不重设 src，
+        // 全程只有一条音频输出）；窗口不可见导致帧回调停摆时，用 ended 兜底。
+        element.addEventListener("ended", live(() => {
+            if (state.paused || !element.getAttribute("src")) {
+                return;
+            }
+            replay();
+        }));
+
+        element.addEventListener("error", live(() => {
+            if (element.style.display === "none" || !element.getAttribute("src")) {
+                return;
+            }
+            const params = state.params;
+            if (params?.workflow) {
+                element.style.display = "none";
+                image.style.display = "block";
+                image.src = buildViewUrl(params, params.workflow);
+                showCaption("该格式无法在浏览器内播放，已显示首帧预览");
+            } else {
+                showCaption("浏览器无法播放此格式，请右键打开或下载。");
+            }
+        }));
+
+        return element;
+    }
+
+    function createVideo() {
+        const element = document.createElement("video");
+        Object.assign(element.style, {
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            outline: "none",
+            display: "none",
+        });
+        element.controls = true;
+        element.controlsList = "nodownload nofullscreen noremoteplayback";
+        element.preload = "metadata";
+        element.playsInline = true;
+        element.loop = false;
+        element.muted = true;
+        return wireVideo(element);
+    }
+
+    /** 卸掉当前播放器：暂停、清空资源并移出文档，确保不会留下还在出声的媒体元素。 */
+    function releaseVideo() {
+        const element = video;
+        video = null;
+        stopTailWatch();
+        if (!element) {
+            return;
+        }
+        element.__yuanReleased = true;
+        try {
+            element.pause();
+            element.removeAttribute("src");
+            element.load();
+        } catch (error) {
+            // 元素已卸载时忽略
+        }
+        element.remove();
+    }
+
+    /** 到结尾前把播放位置拉回开头；rAF 在窗口不可见时会停摆，此时由 ended 兜底。 */
+    function startTailWatch() {
+        if (tailFrame) {
+            return;
+        }
+        const step = () => {
+            tailFrame = 0;
+            const element = video;
+            if (!element) {
+                return;
+            }
+            if (!state.paused && state.params) {
+                const duration = element.duration;
+                const remaining = Number.isFinite(duration) ? duration - element.currentTime : Infinity;
+                if (remaining > 0 && remaining <= LOOP_TAIL) {
+                    replay();
+                }
+            }
+            tailFrame = requestAnimationFrame(step);
+        };
+        tailFrame = requestAnimationFrame(step);
+    }
+
+    function stopTailWatch() {
+        if (tailFrame) {
+            cancelAnimationFrame(tailFrame);
+            tailFrame = 0;
+        }
+    }
+
+    function mountVideo() {
+        if (!video) {
+            releaseStalePlayers();
+            video = createVideo();
+            video.setAttribute(PLAYER_MARK, "1");
+            video.__yuanNode = node;
+            stage.insertBefore(video, stage.firstChild);
+            startTailWatch();
+        }
+        return video;
+    }
+
+    /** 循环回到开头：复用同一个 <video>，只改播放位置，不新增音频输出。 */
+    function replay() {
+        const element = video;
+        if (!element || element.__yuanReleased) {
+            return;
+        }
+        state.suppress = true;
+        try {
+            element.currentTime = 0;
+        } catch (error) {
+            // 元数据还没就绪：交给 ended 兜底
+        }
+        if (element.paused) {
+            const attempt = element.play();
+            if (attempt && typeof attempt.catch === "function") {
+                attempt.catch(() => {});
+            }
+        }
+        setTimeout(() => {
+            state.suppress = false;
+        }, 0);
+    }
 
     const image = document.createElement("img");
     Object.assign(image.style, {
@@ -282,7 +476,7 @@ function createPlayer(node, scheduleFit) {
         pointerEvents: "none",
     });
 
-    stage.append(video, image, empty, caption);
+    stage.append(image, empty, caption);
     container.append(topBar, stage);
 
     function infoText() {
@@ -313,7 +507,7 @@ function createPlayer(node, scheduleFit) {
 
     // 声音跟随鼠标：指针在节点内时取消静音，移出节点或窗口时静音
     function updateAudibility() {
-        if (!state.params) {
+        if (!state.params || !video) {
             return;
         }
         const muted = !state.inside;
@@ -380,22 +574,21 @@ function createPlayer(node, scheduleFit) {
 
         state.url = buildViewUrl(params);
         state.suppress = true;
-        video.pause();
-        video.removeAttribute("src");
-        video.load();
+        // 彻底卸掉上一遍的播放器再建新的，避免旧音轨残留在新的播放里
+        releaseVideo();
         image.removeAttribute("src");
-        video.style.display = "none";
         image.style.display = "none";
         empty.style.display = "none";
         caption.style.display = "none";
 
         if (VIDEO_EXTENSIONS.has(extensionOf(params.filename))) {
-            video.style.display = "block";
-            video.src = state.url;
-            video.muted = true;
-            video.load();
+            const element = mountVideo();
+            element.style.display = "block";
+            element.src = state.url;
+            element.muted = true;
+            element.load();
             if (!state.paused) {
-                const attempt = video.play();
+                const attempt = element.play();
                 if (attempt && typeof attempt.catch === "function") {
                     attempt.catch(() => {});
                 }
@@ -411,50 +604,6 @@ function createPlayer(node, scheduleFit) {
         updateAudibility();
         scheduleFit();
     }
-
-    video.addEventListener("loadedmetadata", () => {
-        if (video.videoWidth > 0 && video.videoHeight > 0) {
-            const aspect = video.videoWidth / video.videoHeight;
-            if (Math.abs(aspect - state.aspect) > 0.01) {
-                state.aspect = aspect;
-                scheduleFit();
-            }
-        }
-    });
-
-    video.addEventListener("play", () => {
-        if (!state.suppress) {
-            state.paused = false;
-        }
-    });
-
-    video.addEventListener("pause", () => {
-        if (!state.suppress) {
-            state.paused = true;
-        }
-    });
-
-    video.addEventListener("volumechange", () => {
-        // 鼠标不在节点内时保持静音（即使通过原生音量控件取消静音）
-        if (state.params && !state.inside && !video.muted) {
-            video.muted = true;
-        }
-    });
-
-    video.addEventListener("error", () => {
-        if (video.style.display === "none" || !video.getAttribute("src")) {
-            return;
-        }
-        const params = state.params;
-        if (params?.workflow) {
-            video.style.display = "none";
-            image.style.display = "block";
-            image.src = buildViewUrl(params, params.workflow);
-            showCaption("该格式无法在浏览器内播放，已显示首帧预览");
-        } else {
-            showCaption("浏览器无法播放此格式，请右键打开或下载。");
-        }
-    });
 
     image.addEventListener("load", () => {
         if (image.naturalWidth > 0 && image.naturalHeight > 0) {
@@ -499,10 +648,32 @@ function createPlayer(node, scheduleFit) {
     document.addEventListener("pointermove", onPointerMove, true);
     document.addEventListener("mouseout", onPointerOut);
     window.addEventListener("blur", muteOutside);
+
+    // 看门狗：清理幽灵播放器；节点已被移出图或 DOM 控件长时间脱离文档时停掉自己的播放，
+    // 避免旧音轨和新预览叠成回音。
+    const watchdog = setInterval(() => {
+        releaseStalePlayers();
+        const element = video;
+        if (!element) {
+            orphanTicks = 0;
+            return;
+        }
+        // 节点已不在图里（工作流重载/被删）最可靠；DOM 控件长时间脱离文档作为兜底
+        const dropped = !nodeInGraph(node);
+        orphanTicks = dropped ? orphanTicks + 1 : (container.isConnected ? 0 : orphanTicks + 1);
+        if (orphanTicks >= 4) {
+            orphanTicks = 0;
+            releaseVideo();
+        }
+    }, 1200);
+
     chainCallback(node, "onRemoved", function () {
         document.removeEventListener("pointermove", onPointerMove, true);
         document.removeEventListener("mouseout", onPointerOut);
         window.removeEventListener("blur", muteOutside);
+        clearInterval(watchdog);
+        // 节点删除后媒体元素仍会继续出声，必须显式停掉，否则会和后续预览叠成回音
+        releaseVideo();
     });
 
     const widget = node.addDOMWidget("播放预览", "div", container, { serialize: false });
@@ -581,6 +752,10 @@ function hoistImageInput(node) {
 
 /** 把一个节点上的高级设置与格式参数联动、预览窗口、状态恢复全部装好。 */
 function addVideoSaveUI(node) {
+    // onNodeCreated 若被重复触发，二次装配会多出一个播放器，两路音频同时出声就是回音
+    if (node.yuanPlayer) {
+        return;
+    }
     const widgets = {};
     for (const widget of node.widgets || []) {
         widgets[widget.name] = widget;

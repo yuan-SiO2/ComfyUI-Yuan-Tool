@@ -3,13 +3,18 @@
 import math
 
 import torch
-import torchaudio
 
 import nodes
 import comfy.model_management
 import comfy.nested_tensor
 import comfy.utils
 import node_helpers
+
+try:  # 原生节点同样改用核心重采样（torchaudio 已被上游移除）；旧核心回退 torchaudio
+    import comfy.audio
+    _CORE_AUDIO_RESAMPLE = comfy.audio.resample
+except Exception:  # pragma: no cover - 仅极旧核心会走到
+    _CORE_AUDIO_RESAMPLE = None
 
 from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
 
@@ -77,12 +82,21 @@ def _empty_av_latent(width, height, length, batch_size=1):
     return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}, frame_count
 
 
+def _resample(waveform, sr, target_sr):
+    """音频重采样：优先使用核心的 comfy.audio（与原生节点一致），旧核心回退 torchaudio。"""
+    if _CORE_AUDIO_RESAMPLE is not None:
+        return _CORE_AUDIO_RESAMPLE(waveform, sr, target_sr)
+    import torchaudio
+
+    return torchaudio.functional.resample(waveform, sr, target_sr)
+
+
 def _encode_ref_audio(audio_vae, audio):
     waveform = audio["waveform"]  # [B, C, L]
     sr = audio["sample_rate"]
     vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
     if sr != vae_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
+        waveform = _resample(waveform, sr, vae_sr)
     z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
     return z, z.shape[-1]
 
@@ -145,7 +159,7 @@ class YuanMiniMaxH3Video:
             "last_frame": image_port("尾帧图像", "视频尾帧图像"),
             # ---- 参考图生视频模式 ----
             "audio_vae": ("VAE", {"display_name": "音频VAE",
-                                  "tooltip": "用于编码参考音频的音频 VAE 模型"}),
+                                  "tooltip": "用于编码参考音频的音频 VAE 模型；不连接时参考音频只进入文本编码器（与原节点一致）"}),
             "ref_image_size": (["匹配", "最大"], {"default": "匹配", "display_name": "参考图尺寸",
                 "tooltip": "参考图缩放策略：'匹配'缩放至画面像素面积（仅缩小、保宽高比）；'最大'用参考管线的 2048px 短边，保真度更高但明显更慢。"}),
             "guide_frame_idx": ("INT", {"default": 0, "min": -9999, "max": 9999, "display_name": "锚定帧",
@@ -253,6 +267,8 @@ class YuanMiniMaxH3Video:
         # 引导图像：单帧直接锚定；多帧（>=5）作为短片，向下对齐到 17k+5 帧网格
         guide_frames = 1
         if image is not None:
+            if vae is None:
+                raise ValueError("锚定引导图像需要连接 VAE（vae）端口")
             guide_frames = image.shape[0]
             if guide_frames < 5:
                 guide_frames = 1
@@ -294,9 +310,6 @@ class YuanMiniMaxH3Video:
     # ---- 参考图生视频（ref2va）----
     def _execute_reference(self, clip, vae, audio_vae, prompt, width, height, length,
                            ref_image_size, ref_images, kwargs):
-        if audio_vae is None:
-            raise ValueError("参考图生视频模式需要连接音频 VAE（audio_vae）端口")
-
         latent, frame_count = _empty_av_latent(width, height, length)
 
         ref_items = []   # 供分词器按请求顺序呈现
@@ -317,8 +330,11 @@ class YuanMiniMaxH3Video:
                 tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
                 th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
                 resized = _resize(img, tw, th, "disabled")
-                z = vae.encode(resized)
                 ref_items.append({"type": "image", "data": resized})
+                if vae is None:
+                    # 与原生节点一致：没有视频 VAE 时参考图只进入文本编码器
+                    continue
+                z = vae.encode(resized)
                 ref_blocks.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": z})
 
         # 2. 参考视频：ref_video_1..N，配对的音轨 ref_video_audio_N 属于 ref_video_N
@@ -341,18 +357,22 @@ class YuanMiniMaxH3Video:
             while n % 17 != 5:
                 n -= 1
             frames = frames[:n]
-            z = vae.encode(frames)
-            audio_latent, ref_audio_t = (None, 0)
-            # 空音频（静音占位等）不参与传递，等同未连接该端口，视频按无音轨处理
-            if not _is_empty_audio(soundtrack, audio_vae):
-                audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
-                # 音轨获得独立的 <Audio j> 标记，在 <Video k> 之前输出
+            has_soundtrack = not _is_empty_audio(soundtrack, audio_vae)
+            # 音轨获得独立的 <Audio j> 标记，在 <Video k> 之前输出
+            if has_soundtrack:
                 ref_items.append({"type": "audio"})
             # Qwen 以 2fps 带时间戳观看视频
             sample_idx = list(range(0, frames.shape[0], FPS // 2))
             qwen_frames = frames[sample_idx]
             ref_items.append({"type": "video", "data": qwen_frames,
-                              "timestamps": [i / 2.0 for i in range(len(sample_idx))]})
+                              "timestamps": [step / 2.0 for step in range(len(sample_idx))]})
+            if vae is None:
+                # 与原生节点一致：没有视频 VAE 时参考视频只进入文本编码器
+                continue
+            z = vae.encode(frames)
+            audio_latent, ref_audio_t = (None, 0)
+            if has_soundtrack and audio_vae is not None:
+                audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
             ref_blocks.append({"kind": "video_audio" if ref_audio_t else "video",
                                "latent_t": z.shape[2], "latent_h": ch // 16, "latent_w": cw // 16,
                                "ref_audio_t": ref_audio_t, "latent": z, "audio_latent": audio_latent})
@@ -363,8 +383,11 @@ class YuanMiniMaxH3Video:
             # 空音频（静音占位等）不参与传递，等同未连接该端口
             if _is_empty_audio(audio, audio_vae):
                 continue
-            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)
+            # 与原生节点一致：即使没有音频 VAE，参考音频也会进入文本编码器并占一个 <Audio j> 标记
             ref_items.append({"type": "audio"})
+            if audio_vae is None:
+                continue
+            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)
             ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
 
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
