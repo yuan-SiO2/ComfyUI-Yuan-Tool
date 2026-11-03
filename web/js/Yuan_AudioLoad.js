@@ -448,7 +448,8 @@ app.registerExtension({
             // V2：DOM widget 固定包围盒（宽度跟随节点，高度固定常量）
             node.domWidget.computeSize = function (width) {
                 const nodeWidth = node.size?.[0] || width || NODE_MIN_W;
-                return [Math.max(10, nodeWidth - 30), DOM_H];
+                // +14：LiteGraph 的 computeSize 不含底部边距，不留会被内容顶穿
+                return [Math.max(10, nodeWidth - 30), DOM_H + 14];
             };
 
             // V3：DOM 行最小尺寸（必须返回 widget 自身尺寸，不能返回整节点尺寸）
@@ -478,6 +479,24 @@ app.registerExtension({
                 } catch (_) {}
             }
 
+            /** 节点高度交给 LiteGraph 的 computeSize（与 Yuan_VideoSave 一致） */
+            let fitTimer = null;
+            function scheduleFit() {
+                if (fitTimer) return;
+                fitTimer = setTimeout(() => {
+                    fitTimer = null;
+                    const width = node.size?.[0];
+                    if (!width || !node.computeSize) return;
+                    const size = node.computeSize([width, -1]);
+                    if (!Array.isArray(size)) return;
+                    if (Math.abs((node.size[1] || 0) - size[1]) > 0.5) {
+                        node.size[1] = size[1];
+                    }
+                    node.setDirtyCanvas?.(true, true);
+                    node.graph?.setDirtyCanvas?.(true, true);
+                }, 30);
+            }
+
             // 仅兜底最小尺寸，不做内容实测；V2 DOM 高度由 onResize/onDrawForeground 同步
             requestAnimationFrame(() => {
                 if (node.size[0] < NODE_MIN_W) node.size[0] = NODE_MIN_W;
@@ -485,6 +504,7 @@ app.registerExtension({
                 node.syncLayoutToNode();
                 applyV3MinSize();
                 if (!checkIsV3() && node.onResize) node.onResize(node.size);
+                scheduleFit();
             });
 
             // 把节点数据动态绑定到 UI
@@ -752,6 +772,7 @@ app.registerExtension({
                     if (node.size[0] < NODE_MIN_W) { node.size[0] = NODE_MIN_W; sizeChanged = true; }
                     if (node.size[1] < NODE_MIN_H) { node.size[1] = NODE_MIN_H; sizeChanged = true; }
                     if (!checkIsV3() && sizeChanged && node.onResize) node.onResize(node.size);
+                    scheduleFit();
                     if (app.graph) app.graph.setDirtyCanvas(true, true);
                 };
 

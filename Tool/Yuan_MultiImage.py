@@ -38,6 +38,11 @@ class YuanMultiImage:
                     "display_name": "滑轨数据",
                     "tooltip": "JSON 格式滑轨数据，由前端自动维护。格式：[{\"name\":\"批量图像A\",\"paths\":[\"img1.png\"]}]",
                 }),
+                "最长边": ("INT", {
+                    "default": 1536, "min": 0, "max": 100000, "step": 8,
+                    "display_name": "最长边",
+                    "tooltip": "输出图像的最长边像素，等比缩放另一条边；0 表示保持原始尺寸（与「Yuan 加载视频」同义）。",
+                }),
             },
         }
 
@@ -49,20 +54,32 @@ class YuanMultiImage:
     CATEGORY = "Yuan Tool/图像"
     DESCRIPTION = (
         "加载批量图像（多滑轨版）：支持最多 20 个独立滑轨，每个滑轨单独加载并输出一路图像 batch，"
-        "宽高用 lanczos 向上取整到 16 的倍数。"
+        "最长边等比缩放后，宽高用 lanczos 向上取整到 16 的倍数。"
     )
 
-    def resize_image(self, image, multiple_of=16):
-        """将图像宽高向上取整到 multiple_of 的倍数，使用 lanczos 插值缩放。"""
+    @staticmethod
+    def _fit_longest_edge(width, height, longest_edge):
+        """按最长边等比缩放（只缩不放）；longest_edge <= 0 表示保持原始尺寸。"""
+        if longest_edge <= 0 or width <= 0 or height <= 0:
+            return width, height
+        ratio = longest_edge / max(width, height)
+        if ratio >= 1.0:      # 原图比目标小 → 不放大
+            return width, height
+        return max(1, round(width * ratio)), max(1, round(height * ratio))
+
+    def resize_image(self, image, new_w=None, new_h=None, multiple_of=16):
+        """缩放到指定尺寸；只给 multiple_of 时把宽高向上取整到它的倍数。lanczos 插值。"""
         _, oh, ow, _ = image.shape
 
-        if multiple_of > 1:
-            new_w = ((ow + multiple_of - 1) // multiple_of) * multiple_of
-            new_h = ((oh + multiple_of - 1) // multiple_of) * multiple_of
-        else:
-            new_w = ow
-            new_h = oh
+        if new_w is None or new_h is None:
+            if multiple_of > 1:
+                new_w = ((ow + multiple_of - 1) // multiple_of) * multiple_of
+                new_h = ((oh + multiple_of - 1) // multiple_of) * multiple_of
+            else:
+                new_w, new_h = ow, oh
 
+        new_w = max(1, int(new_w))
+        new_h = max(1, int(new_h))
         if new_w == ow and new_h == oh:
             return torch.clamp(image, 0, 1)
 
@@ -72,8 +89,8 @@ class YuanMultiImage:
         outputs = torch.clamp(outputs, 0, 1)
         return outputs
 
-    def _load_track_images(self, paths):
-        """加载单个滑轨的所有图像，返回合并后的 batch 张量。"""
+    def _load_track_images(self, paths, longest_edge=0):
+        """加载单个滑轨的所有图像，按最长边等比缩放后合并成一个 batch。"""
         track_images = []
 
         for path in paths:
@@ -88,10 +105,12 @@ class YuanMultiImage:
                 image = Image.open(full_path)
                 image = ImageOps.exif_transpose(image)
                 image = image.convert("RGB")
-
                 image_np = np.array(image).astype(np.float32) / 255.0
                 image_tensor = torch.from_numpy(image_np)[None,]
-                image_tensor = self.resize_image(image_tensor, 16)
+                h, w = image_tensor.shape[1], image_tensor.shape[2]
+                tw, th = self._fit_longest_edge(w, h, longest_edge)
+                image_tensor = self.resize_image(image_tensor, tw, th, multiple_of=0)   # 最长边
+                image_tensor = self.resize_image(image_tensor, multiple_of=16)          # 对齐到 16
                 track_images.append(image_tensor)
             except Exception:
                 pass
@@ -137,7 +156,7 @@ class YuanMultiImage:
         y1 = (src_h - target_h) // 2
         return image[:, y1:y1 + target_h, x1:x1 + target_w, :]
 
-    def load_images(self, tracks_data):
+    def load_images(self, tracks_data, 最长边=1536):
         """解析 tracks_data JSON，为每个滑轨加载图像并返回 20 路 IMAGE。"""
         try:
             tracks = json.loads(tracks_data) if tracks_data and tracks_data.strip() else []
@@ -154,7 +173,7 @@ class YuanMultiImage:
                 paths = track.get("paths", [])
                 if isinstance(paths, str):
                     paths = [p.strip() for p in paths.split("\n") if p.strip()]
-                results.append(self._load_track_images(paths))
+                results.append(self._load_track_images(paths, 最长边))
             else:
                 results.append(torch.zeros((1, 64, 64, 3)))
 

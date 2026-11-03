@@ -404,6 +404,22 @@ import { getApi, imageSourceFromCandidate, lookupNodeOutputEntry } from "./Yuan_
             this.onResizeDom = this.onResizeDom.bind(this);
         }
 
+        /** 与 Yuan_VideoSave 一致：节点高度交给 LiteGraph 的 computeSize，不自己算 */
+        scheduleFit() {
+            if (this._fitTimer) return;
+            this._fitTimer = setTimeout(() => {
+                this._fitTimer = null;
+                const node = this.node;
+                if (!node || !node.computeSize || !node.size) return;
+                const size = node.computeSize([node.size[0], -1]);
+                if (Array.isArray(size) && Math.abs((node.size[1] || 0) - size[1]) > 0.5) {
+                    node.size[1] = size[1];
+                    node.setDirtyCanvas?.(true, true);
+                    node.graph?.setDirtyCanvas?.(true, true);
+                }
+            }, 30);
+        }
+
         attach() {
             this._hideHiddenWidgets();
             this._buildDom();
@@ -477,6 +493,13 @@ import { getApi, imageSourceFromCandidate, lookupNodeOutputEntry } from "./Yuan_
                             minWidth: Math.max(PREVIEW_MIN_WIDTH, Number(p.minWidth || 0)),
                         };
                     };
+                    // 高度在 computeSize 里定，并留出底部边距（LiteGraph 的 computeSize 不含它）
+                    this.widget.computeSize = (width) => {
+                        const nodeWidth = (this.node.size && this.node.size[0]) || width || 340;
+                        if (this.root) this.root.style.height = PREVIEW_MIN_HEIGHT + "px";
+                        return [Math.max(10, nodeWidth - 30), PREVIEW_MIN_HEIGHT + 14];
+                    };
+                    this.scheduleFit();
                 }
                 this._applyV3MinSize();
 

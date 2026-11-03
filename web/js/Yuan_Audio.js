@@ -308,6 +308,7 @@ import { getApi, isAudioFileName } from "./Yuan_Common.js";
                 gap: 0;
                 pointer-events: auto;
                 overflow: hidden;
+                flex: 0 0 auto;
             `;
 
             const gallery = document.createElement("div");
@@ -752,7 +753,8 @@ import { getApi, isAudioFileName } from "./Yuan_Common.js";
 
             galleryWidget.computeSize = function (width) {
                 const nodeWidth = node.size?.[0] || width || 220;
-                return [Math.max(10, nodeWidth - 30), getContainerHeight()];
+                // +14：LiteGraph 的 computeSize 不含底部边距，不留会被内容顶穿
+                return [Math.max(10, nodeWidth - 30), getContainerHeight() + 14];
             };
 
             // V3：只绑定拖拽上传事件，不强制 min-height（避免拉伸被锁死）
@@ -775,6 +777,24 @@ import { getApi, isAudioFileName } from "./Yuan_Common.js";
                 }
             }
 
+            /** 节点高度交给 LiteGraph 的 computeSize（与 Yuan_VideoSave 一致） */
+            let fitTimer = null;
+            function scheduleFit() {
+                if (fitTimer) return;
+                fitTimer = setTimeout(() => {
+                    fitTimer = null;
+                    const width = node.size?.[0];
+                    if (!width || !node.computeSize) return;
+                    const size = node.computeSize([width, -1]);
+                    if (!Array.isArray(size)) return;
+                    if (Math.abs((node.size[1] || 0) - size[1]) > 0.5) {
+                        node.size[1] = size[1];
+                    }
+                    node.setDirtyCanvas?.(true, true);
+                    node.graph?.setDirtyCanvas?.(true, true);
+                }, 30);
+            }
+
             /** 初始化时一次性保证最小尺寸；之后不干预用户拉伸 */
             function updateLayout() {
                 attachV3Events();
@@ -782,6 +802,7 @@ import { getApi, isAudioFileName } from "./Yuan_Common.js";
                 if (node.size && node.size[0] < MIN_W) {
                     node.size[0] = MIN_W;
                 }
+                scheduleFit();
                 if (app.graph) app.graph.setDirtyCanvas(true, true);
             }
 

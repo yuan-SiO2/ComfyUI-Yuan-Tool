@@ -28,9 +28,12 @@ import { getApi } from "./Yuan_Common.js";
     const TRACK_HEADER_HEIGHT = 26;
     const TRACK_GALLERY_HEIGHT = 96;
     const TRACK_GAP = 8;
-    const TRACK_TOTAL_HEIGHT = TRACK_HEADER_HEIGHT + TRACK_GALLERY_HEIGHT + TRACK_GAP;
-    const ADD_BTN_HEIGHT = 28;
+    const TRACK_BORDER = 2;     // 每条滑轨上下边框各 1px：常量估算必须算进去，否则节点比内容短
+    const TRACK_TOTAL_HEIGHT = TRACK_HEADER_HEIGHT + TRACK_GALLERY_HEIGHT + TRACK_BORDER + TRACK_GAP;
+    const ADD_BTN_HEIGHT = 25;  // 10px 字号 + 4px 上下内边距 + 1px 边框（实测 DOM 高度）
+    const ADD_BTN_GAP = 6;      // 添加按钮的 margin-top
     const CONTAINER_PADDING = 8;
+    const CONTAINER_BORDER = 2; // 容器上下边框各 1px
 
     // --- 注入全局样式 ---
     if (!document.getElementById('yuan-multiimage-style')) {
@@ -121,7 +124,6 @@ import { getApi } from "./Yuan_Common.js";
         name: "ComfyUI-Yuan-Tool.MultiImage",
         nodeCreated(node) {
             if (node.comfyClass !== "YuanMultiImage") return;
-
             // --- 滑轨数据模型 ---
             let tracks = [];
             /** 每个滑轨的 Y 中心位置（相对于节点左上角），供 getConnectionPos 使用 */
@@ -155,6 +157,8 @@ import { getApi } from "./Yuan_Common.js";
                 margin-top: 5px;
                 padding: ${CONTAINER_PADDING}px;
                 box-sizing: border-box;
+                /* 防被前端 DOM widget 的 flex:1 拉伸（否则 181px 会被撑到 340px，节点高度就对不上） */
+                flex: 0 0 auto;
                 display: flex;
                 flex-direction: column;
                 gap: 0;
@@ -171,7 +175,7 @@ import { getApi } from "./Yuan_Common.js";
             addTrackBtn.innerText = "+ 添加滑轨";
             addTrackBtn.style.cssText = `
                 background: #2d5a2d; border: 1px solid #4a7f4a;
-                margin-top: 6px; width: 100%; padding: 4px;
+                margin-top: ${ADD_BTN_GAP}px; width: 100%; padding: 4px;
             `;
             addTrackBtn.onmouseenter = () => { addTrackBtn.style.background = "#3a7f3a"; };
             addTrackBtn.onmouseleave = () => { addTrackBtn.style.background = "#2d5a2d"; };
@@ -609,7 +613,7 @@ import { getApi } from "./Yuan_Common.js";
                     syncOutputs(trackIndex);
                     renderTracksUI();
                     serializeTracks();
-                    updateLayout(true);
+                    updateLayout();
                 };
                 deleteBtn.disabled = tracks.length <= 1;
                 deleteBtn.style.opacity = tracks.length <= 1 ? "0.4" : "1";
@@ -829,94 +833,69 @@ import { getApi } from "./Yuan_Common.js";
             }
 
             // --- 9. 布局管理 ---
+            /** 容器内容高度：与 DOM 实际尺寸一致（padding + 边框 + 每条滑轨 + 添加按钮） */
             function getContainerHeight() {
-                return CONTAINER_PADDING * 2 + tracks.length * TRACK_TOTAL_HEIGHT + ADD_BTN_HEIGHT + 6;
+                return CONTAINER_PADDING * 2 + CONTAINER_BORDER +
+                    tracks.length * TRACK_TOTAL_HEIGHT + ADD_BTN_HEIGHT + ADD_BTN_GAP;
             }
 
+            // 与 Yuan 视频保存 / 画布同一套做法：高度在 computeSize 里定，节点高度交给 LiteGraph 自己算
+            const CONTAINER_BOTTOM_PAD = 14;   // 节点底部留白（LiteGraph 的 computeSize 不含它，会被内容顶穿）
             galleryWidget.computeSize = function (width) {
-                const nodeWidth = node.size?.[0] || width || 220;
-                return [Math.max(10, nodeWidth - 30), getContainerHeight()];
+                const rowWidth = Math.max(10, (node.size?.[0] || width || 220) - 30);
+                const height = getContainerHeight();
+                container.style.height = height + "px";
+                return [rowWidth, height + CONTAINER_BOTTOM_PAD];
             };
-
-            function getAbsoluteMinHeight() {
-                const galleryY = galleryWidget.last_y || 40;
-                return galleryY + getContainerHeight() + 5;
-            }
+            galleryWidget.computeLayoutSize = () => ({ minWidth: 300, minHeight: 140 });
 
             // 最小宽度取 240 确保轨道头部按钮不被裁剪
             function getMinW() { return 240; }
 
-            let v3EventsAttached = false;
-            function enforceV3CSS() {
-                const isV3 = checkIsV3();
-                if (isV3 && v3NodeElement) {
-                    v3NodeElement.style.removeProperty("min-width");
-                    v3NodeElement.style.setProperty("min-height", getAbsoluteMinHeight() + "px", "important");
-                    if (!v3EventsAttached) {
-                        v3EventsAttached = true;
-                        v3NodeElement.addEventListener("dragover", (e) => e.preventDefault());
-                        v3NodeElement.addEventListener("drop", (e) => {
-                            if (e.dataTransfer && e.dataTransfer.files) {
-                                const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith("image/"));
-                                if (files.length > 0) {
-                                    e.preventDefault();
-                                    e.stopPropagation();
-                                    handleFiles(files, activeTrackIndex);
-                                }
-                            }
-                        });
+            /**
+             * 让节点高度跟上内容：不自己算高度，直接用 LiteGraph 的 computeSize（它已经把标题栏、
+             * 输出端口、每个 widget 的行高和边距都算进去了），再把结果赋给 node.size[1]。
+             * 与 Yuan_VideoSave.scheduleFit 完全一致。
+             */
+            let fitTimer = null;
+            function scheduleFit() {
+                if (fitTimer) return;
+                fitTimer = setTimeout(() => {
+                    fitTimer = null;
+                    const width = node.size?.[0];
+                    if (!width || !node.computeSize) return;
+                    const size = node.computeSize([width, -1]);
+                    if (!Array.isArray(size)) return;
+                    if (Math.abs((node.size[1] || 0) - size[1]) > 0.5) {
+                        node.size[1] = size[1];
                     }
-                }
+                    node.setDirtyCanvas?.(true, true);
+                    node.graph?.setDirtyCanvas?.(true, true);
+                }, 30);
             }
 
             let isLayouting = false;
-            function updateLayout(forceShrink) {
+            function updateLayout() {
                 if (isLayouting) return;
                 isLayouting = true;
-                const minW = getMinW();
-                const absMinH = getAbsoluteMinHeight();
-                node.min_size = [minW, absMinH];
-                enforceV3CSS();
-
-                let targetW = Math.max(node.size[0], minW);
-                let targetH = forceShrink ? absMinH : Math.max(node.size[1], absMinH);
-                if (node.size[0] !== targetW || node.size[1] !== targetH) {
-                    node.setSize([targetW, targetH]);
-                    if (app.graph) app.graph.setDirtyCanvas(true, true);
+                try {
+                    node.size[0] = Math.max(node.size[0], getMinW());
+                    container.style.height = getContainerHeight() + "px";
+                    updateTrackYPositions();
+                    scheduleFit();
+                } finally {
+                    isLayouting = false;
                 }
-                container.style.height = getContainerHeight() + "px";
-                updateTrackYPositions();
-                isLayouting = false;
             }
 
             const origOnResize = node.onResize;
             node.onResize = function (size) {
-                size[0] = Math.max(size[0], getMinW());
-                size[1] = Math.max(size[1], getAbsoluteMinHeight());
                 if (origOnResize) origOnResize.call(this, size);
+                size[0] = Math.max(size[0], getMinW());
                 if (isLayouting) return;
-                node.min_size = [getMinW(), getAbsoluteMinHeight()];
-                enforceV3CSS();
                 container.style.height = getContainerHeight() + "px";
                 updateTrackYPositions();
-            };
-
-            const origComputeSize = node.computeSize;
-            node.computeSize = function (out) {
-                let res = origComputeSize ? origComputeSize.apply(this, arguments) : [getMinW(), 200];
-                res[0] = Math.max(res[0], getMinW());
-                res[1] = Math.max(res[1], getAbsoluteMinHeight());
-                node.min_size = [getMinW(), getAbsoluteMinHeight()];
-                enforceV3CSS();
-                return res;
-            };
-
-            const origSetSize = node.setSize;
-            node.setSize = function (size) {
-                size[0] = Math.max(size[0], getMinW());
-                size[1] = Math.max(size[1], getAbsoluteMinHeight());
-                if (origSetSize) origSetSize.call(this, size); else this.size = size;
-                enforceV3CSS();
+                scheduleFit();
             };
 
             // --- 10. 序列化 / 反序列化钩子 ---
@@ -934,7 +913,7 @@ import { getApi } from "./Yuan_Common.js";
                     renderAllTracks();
                     serializeTracks();
                 }
-                updateLayout(true);
+                updateLayout();
                 updateTrackYPositions();
                 if (app.graph) app.graph.setDirtyCanvas(true, true);
             }
@@ -1033,7 +1012,7 @@ import { getApi } from "./Yuan_Common.js";
 
             // DOM 渲染后 last_y 已稳定，重新校正节点高度
             setTimeout(() => {
-                updateLayout(true);
+                updateLayout();
                 updateTrackYPositions();
             }, 300);
         }

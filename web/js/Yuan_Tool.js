@@ -445,6 +445,184 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
     };
 }
 
+// ---------- Yuan_MiniMaxH3RefEmbeds：递进显示动态端口（与视频生成的参考链路同一套规则） ----------
+// 基础端口常驻；每类参考按「前一个接上了才显示下一个」递进，未使用的同类型端口只留一个
+const MINIMAX_REF_EMBED_BASE_INPUTS = ["vae", "audio_vae", "ref_images"];
+const MINIMAX_REF_EMBED_CHAINS = [
+    ["ref_video_1", "ref_video_2", "ref_video_3"],
+    ["ref_video_audio_1", "ref_video_audio_2", "ref_video_audio_3"],
+    ["ref_audio_1", "ref_audio_2", "ref_audio_3"],
+];
+const MINIMAX_REF_EMBED_ALL_OPTIONAL = [
+    ...MINIMAX_REF_EMBED_BASE_INPUTS,
+    ...MINIMAX_REF_EMBED_CHAINS.flat(),
+];
+
+const MINIMAX_REF_EMBED_PORT_TYPES = {
+    vae: "VAE",
+    audio_vae: "VAE",
+    ref_images: "IMAGE",
+    ref_video_1: "IMAGE", ref_video_2: "IMAGE", ref_video_3: "IMAGE",
+    ref_video_audio_1: "AUDIO", ref_video_audio_2: "AUDIO", ref_video_audio_3: "AUDIO",
+    ref_audio_1: "AUDIO", ref_audio_2: "AUDIO", ref_audio_3: "AUDIO",
+};
+
+function registerYuanMiniMaxH3RefEmbeds(nodeType, portMeta) {
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+        const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+        const self = this;
+
+        // 递进组端口可见性：第一个总是显示；第 k 个（k>=2）在前一个已连接或自身已连接时显示
+        const chainVisible = (chain, idx) => {
+            if (idx === 0) return true;
+            const prevInp = self.inputs.find(inp => inp.name === chain[idx - 1]);
+            if (prevInp && prevInp.link != null) return true;
+            const curInp = self.inputs.find(inp => inp.name === chain[idx]);
+            return !!(curInp && curInp.link != null);
+        };
+
+        const addOptionalInput = (name) => {
+            const meta = portMeta[name] || {};
+            const typ = MINIMAX_REF_EMBED_PORT_TYPES[name] || (meta.type || "*");
+            const opts = { shape: 7, optional: true };
+            if (meta.display_name) opts.display_name = meta.display_name;
+            if (meta.tooltip) opts.tooltip = meta.tooltip;
+            self.addInput(name, typ, opts);
+            const inp = self.inputs.find(inp => inp.name === name);
+            if (inp) {
+                inp.optional = true;
+                if (meta.display_name) inp.label = meta.display_name;
+                if (meta.tooltip) inp.tooltip = meta.tooltip;
+            }
+        };
+
+        const syncPortsReal = () => {
+            if (self._syncing) return;
+            self._syncing = true;
+            try {
+                // 期望端口集合（有序）：基础端口 + 每个递进组当前可见的端口
+                const desiredNames = [...MINIMAX_REF_EMBED_BASE_INPUTS];
+                for (const chain of MINIMAX_REF_EMBED_CHAINS) {
+                    for (let i = 0; i < chain.length; i++) {
+                        if (chainVisible(chain, i)) desiredNames.push(chain[i]);
+                    }
+                }
+
+                // 第一步：保存所有可选端口的连接信息
+                const savedLinks = [];
+                for (let i = self.inputs.length - 1; i >= 0; i--) {
+                    const inp = self.inputs[i];
+                    if (MINIMAX_REF_EMBED_ALL_OPTIONAL.includes(inp.name) && inp.link != null) {
+                        const linkObj = app.graph.links[inp.link];
+                        if (linkObj) {
+                            savedLinks.push({
+                                name: inp.name,
+                                origin_id: linkObj.origin_id,
+                                origin_slot: linkObj.origin_slot,
+                            });
+                        }
+                    }
+                }
+
+                // 第二步：删除不需要的可选端口
+                for (let i = self.inputs.length - 1; i >= 0; i--) {
+                    const inp = self.inputs[i];
+                    if (MINIMAX_REF_EMBED_ALL_OPTIONAL.includes(inp.name) && !desiredNames.includes(inp.name)) {
+                        const idx = self.inputs.findIndex(x => x.name === inp.name);
+                        if (idx !== -1) self.removeInput(idx);
+                    }
+                }
+
+                // 第三步：添加缺少的可选端口（按 desiredNames 顺序，保证排列整洁）
+                for (const name of desiredNames) {
+                    if (!self.inputs.find(inp => inp.name === name)) {
+                        addOptionalInput(name);
+                    }
+                }
+
+                // 第四步：按 desiredNames 顺序整理可选端口（保留连接并修正 target_slot）
+                const required = self.inputs.filter(inp => !MINIMAX_REF_EMBED_ALL_OPTIONAL.includes(inp.name));
+                const optional = [];
+                for (const name of desiredNames) {
+                    const inp = self.inputs.find(i => i.name === name);
+                    if (inp) optional.push(inp);
+                }
+                const currentOptional = self.inputs.filter(inp => MINIMAX_REF_EMBED_ALL_OPTIONAL.includes(inp.name));
+                const orderOk = currentOptional.length === optional.length &&
+                    currentOptional.every((inp, i) => inp === optional[i]);
+                if (!orderOk) {
+                    self.inputs = [...required, ...optional];
+                    // 重排后所有端口的 target_slot 都要按新下标回写
+                    self.inputs.forEach((inp, idx) => {
+                        if (inp.link == null) return;
+                        const l = app.graph.links[inp.link];
+                        if (l) l.target_slot = idx;
+                    });
+                }
+
+                // 第五步：恢复所有保存的连接
+                for (const saved of savedLinks) {
+                    const inp = self.inputs.find(inp => inp.name === saved.name);
+                    if (inp && inp.link == null) {
+                        const originNode = app.graph.getNodeById(saved.origin_id);
+                        if (originNode) {
+                            const targetSlot = self.inputs.indexOf(inp);
+                            try {
+                                originNode.connect(saved.origin_slot, self, targetSlot);
+                            } catch (_) {}
+                        }
+                    }
+                }
+
+                // 第六步：保持当前宽度不变，只更新高度
+                const currentWidth = self.size ? self.size[0] : self.computeSize()[0];
+                self.setSize([currentWidth, self.computeSize()[1]]);
+                app.graph.setDirtyCanvas(true, true);
+            } finally {
+                self._syncing = false;
+            }
+        };
+
+        // 下一 tick 再同步：links 可能尚未挂到 input.link，立即执行会误判端口
+        const scheduleSync = () => {
+            clearTimeout(self._syncTimer);
+            self._syncTimer = setTimeout(syncPortsReal, 0);
+        };
+
+        self._syncPorts = scheduleSync;
+        scheduleSync();
+
+        // 修正初始已创建端口的 label / tooltip（框架自动生成的端口可能未正确应用 display_name）
+        for (const inp of self.inputs) {
+            const meta = portMeta[inp.name];
+            if (meta) {
+                if (meta.display_name) inp.label = meta.display_name;
+                if (meta.tooltip) inp.tooltip = meta.tooltip;
+            }
+        }
+
+        return r;
+    };
+
+    const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function (type, slot, connected, link_info, input_or_output) {
+        const r = onConnectionsChange ? onConnectionsChange.apply(this, arguments) : undefined;
+        // 输入端口（type===1）连接变化时刷新递进显示；_syncing 期间跳过避免递归
+        if (!this._syncing && this._syncPorts && type === 1) {
+            this._syncPorts();
+        }
+        return r;
+    };
+
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function (info) {
+        const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+        if (this._syncPorts) this._syncPorts();
+        return r;
+    };
+}
+
 // ---------- resize_type 条件显隐（RTX 放大 / H3 放大 / Latent 比例缩放通用） ----------
 function registerResizeTypeConditionalWidgets(nodeType) {
     const UPSCALE_BY = "按倍数缩放";
@@ -1250,6 +1428,8 @@ app.registerExtension({
             registerYuanTool(nodeType, buildPortMeta());
         } else if (nodeData.name === "Yuan_MiniMaxH3Video") {
             registerYuanMiniMaxH3Video(nodeType, buildPortMeta());
+        } else if (nodeData.name === "Yuan_MiniMaxH3RefEmbeds") {
+            registerYuanMiniMaxH3RefEmbeds(nodeType, buildPortMeta());
         } else if (nodeData.name === "Yuan_RTXVideoUpscaleH3") {
             registerResizeTypeConditionalWidgets(nodeType);
         } else if (nodeData.name === "Yuan_H3Upscale3D") {

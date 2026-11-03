@@ -676,7 +676,8 @@ function createPlayer(node, scheduleFit) {
         releaseVideo();
     });
 
-    const widget = node.addDOMWidget("播放预览", "div", container, { serialize: false });
+    // hideOnZoom: false —— 否则画布缩小到阈值以下（约 52%）前端会把这块 DOM 隐藏，预览画面就没了
+    const widget = node.addDOMWidget("播放预览", "div", container, { serialize: false, hideOnZoom: false });
     widget.computeSize = function (width) {
         const nodeWidth = node.size?.[0] || width || 360;
         const rowWidth = Math.max(10, nodeWidth - 30);

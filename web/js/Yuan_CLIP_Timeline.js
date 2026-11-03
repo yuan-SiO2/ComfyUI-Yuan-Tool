@@ -164,6 +164,7 @@ function hideWidget(w) {
   w.type = "hidden";
   w.hidden = true;
   w.computeSize = () => [0, -4];
+  w.computedHeight = 0;   // 清掉前端缓存的 24px 行高，否则隐藏参数仍会把节点撑长
 }
 
 // ── V3 (Nodes 2.0) 端口占位处理 ──
@@ -3918,6 +3919,34 @@ app.registerExtension({
             getMinHeight: () => FIXED_HEIGHT,
             getHeight: () => FIXED_HEIGHT,
           });
+
+          // 高度在 computeSize 里定，并留出底部边距；节点高度交给 LiteGraph 算（与 Yuan_VideoSave 一致）
+          (function fitTimelineHeight() {
+            const widget = node._timelineWidget;
+            if (!widget) return;
+            widget.computeSize = function (width) {
+              const nodeWidth = node.size?.[0] || width || 560;
+              container.style.height = FIXED_HEIGHT + "px";
+              return [Math.max(10, nodeWidth - 30), FIXED_HEIGHT + 14];
+            };
+            let fitTimer = null;
+            const scheduleFit = () => {
+              if (fitTimer) return;
+              fitTimer = setTimeout(() => {
+                fitTimer = null;
+                const width = node.size?.[0];
+                if (!width || !node.computeSize) return;
+                const size = node.computeSize([width, -1]);
+                if (!Array.isArray(size)) return;
+                if (Math.abs((node.size[1] || 0) - size[1]) > 0.5) node.size[1] = size[1];
+                node.setDirtyCanvas?.(true, true);
+                node.graph?.setDirtyCanvas?.(true, true);
+              }, 30);
+            };
+            node._timelineScheduleFit = scheduleFit;
+            scheduleFit();
+            setTimeout(scheduleFit, 300);
+          })();
 
           // ── V3 (Nodes 2.0) 尺寸适配：使 DOM 渲染尺寸与 V1 设计保持一致 ──
           (function adaptTimelineV3() {
