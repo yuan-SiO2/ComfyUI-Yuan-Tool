@@ -1,5 +1,5 @@
 /** Yuan Tool · 加载批量图像前端（多滑轨版） */
-import { getApi } from "./Yuan_Common.js";
+import { getApi, prunePlaceholderPorts, chainCallback, setSlotName, hideWidget } from "./Yuan_Common.js";
 
 (function () {
     "use strict";
@@ -131,21 +131,6 @@ import { getApi } from "./Yuan_Common.js";
             /** 标记是否已通过 onConfigure 恢复数据（防止初始化竞态删端口） */
             let hasBeenConfigured = false;
 
-            // --- V3 前端检测 ---
-            let v3NodeElement = null;
-            function checkIsV3() {
-                if (v3NodeElement) return true;
-                let el = container.parentElement;
-                while (el) {
-                    if ((el.tagName && el.tagName.toLowerCase().includes('comfy-node')) ||
-                        (el.classList && el.classList.contains('comfy-node'))) {
-                        v3NodeElement = el;
-                        return true;
-                    }
-                    el = el.parentElement || (el.getRootNode ? el.getRootNode().host : null);
-                }
-                return false;
-            }
 
             // --- 1. UI 主容器（动态高度）---
             const container = document.createElement("div");
@@ -212,27 +197,15 @@ import { getApi } from "./Yuan_Common.js";
             // 将容器作为 DOM widget
             const galleryWidget = node.addDOMWidget("Gallery", "html_gallery", container, { serialize: false });
 
-            // --- 2. 隐藏 tracks_data widget ---
+            // --- 2. 隐藏 tracks_data widget（official visibility 抑制 + 旧画布零高度） ---
             const dataWidget = node.widgets.find(w => w.name === "tracks_data");
-            if (dataWidget) {
-                Object.defineProperty(dataWidget, 'hidden', { get: () => true, set: () => {} });
-                Object.defineProperty(dataWidget, 'type', { get: () => "hidden", set: () => {} });
-                dataWidget.computeSize = function () { return [0, 0]; };
+            hideWidget(dataWidget);
 
-                const hideInterval = setInterval(() => {
-                    if (dataWidget.element) dataWidget.element.style.display = "none";
-                }, 50);
-                dataWidget._hideTimer = hideInterval;
-                setTimeout(() => clearInterval(hideInterval), 1000);
-            }
-
-            // V3：widget 与输入端口共存，移除 tracks_data 占位端口防节点被拉长
-            if (checkIsV3()) {
-                const slot = node.findInputSlot("tracks_data");
-                if (slot >= 0 && !node.inputs[slot].link) {
-                    node.removeInput(slot);
-                }
-            }
+            // V3：移除 tracks_data 占位端口（节点拉长/端口错位）。共享清理 + 绘制回调，
+            // V3 首次渲染后会重建端口，只清一次会漏；签名去重后每帧零开销。
+            const dropTracksPort = () => prunePlaceholderPorts(node, ["tracks_data"]);
+            dropTracksPort();
+            chainCallback(node, "onDrawForeground", dropTracksPort);
 
             // --- 3. 序列化 / 反序列化 ---
             function serializeTracks() {
@@ -272,6 +245,7 @@ import { getApi } from "./Yuan_Common.js";
             }
 
             // --- 4. 输出端口管理 ---
+            // --- 4. 输出端口管理 ---
             /** slot 编号与滑轨索引 1:1 映射（所有滑轨始终输出） */
             function slotToTrackIndex(slotNumber) {
                 return slotNumber < tracks.length ? slotNumber : -1;
@@ -293,26 +267,53 @@ import { getApi } from "./Yuan_Common.js";
                 while (node.outputs.length < targetLen) {
                     node.addOutput(tracks[node.outputs.length].name, "IMAGE");
                 }
-
                 for (let i = 0; i < targetLen; i++) {
-                    if (node.outputs[i]) {
-                        node.outputs[i].name = tracks[i].name;
-                        node.outputs[i].type = "IMAGE";
-                    }
+                    applyOutputName(i, tracks[i].name);
                 }
             }
 
+            /**
+             * 写输出端口名。前端绘制用的是 localized_name（`localized_name || name`），
+             * 只写 name 时画布/重载后仍显示创建时的本地化默认名（如「批量图像B」）——
+             * 这就是"改名后又变回去"的根因，两个字段必须一起写。
+             */
+            function applyOutputName(index, name) {
+                const output = node.outputs && node.outputs[index];
+                if (!output) return;
+                setSlotName(output, name);
+                output.type = "IMAGE";
+            }
             /** 更新输出端口名称（不重建，保持连接） */
             function updateOutputName(trackIndex, newName) {
-                if (node.outputs[trackIndex]) {
-                    node.outputs[trackIndex].name = newName;
+                applyOutputName(trackIndex, newName);
+            }
+
+            /**
+             * 端口名以工作流里保存的输出名为准：旧工作流里 localized_name 是默认名，
+             * tracks_data 里的 name 才是用户命名，加载时用它回填并重写端口名。
+             * 返回是否改动过。
+             */
+            function adoptSavedOutputNames(info) {
+                const saved = Array.isArray(info && info.outputs) ? info.outputs : null;
+                if (!saved || !saved.length) return false;
+                let changed = false;
+                for (let i = 0; i < tracks.length && i < saved.length; i++) {
+                    const name = saved[i] && saved[i].name;
+                    if (typeof name !== "string" || !name) continue;
+                    // 仅当本地是默认名时才采纳存档名，避免覆盖 tracks_data 里的新命名
+                    if (tracks[i].name === getDefaultTrackName(i) && name !== tracks[i].name) {
+                        tracks[i].name = name;
+                        changed = true;
+                    }
                 }
+                return changed;
             }
 
             // --- 5. getConnectionPos 重写：输出端口定位到滑轨右侧 ---
             const origGetConnectionPos = node.getConnectionPos
                 ? node.getConnectionPos.bind(node)
                 : null;
+
 
             node.getConnectionPos = function (isInput, slotNumber, out) {
                 out = out || new Float32Array(2);
@@ -564,10 +565,8 @@ import { getApi } from "./Yuan_Common.js";
                 nameInput.addEventListener("input", () => {
                     tracks[trackIndex].name = nameInput.value || getDefaultTrackName(trackIndex);
                     updateOutputName(trackIndex, tracks[trackIndex].name);
-                });
-                nameInput.addEventListener("blur", () => {
+                    // 边改边写回：只靠 blur 会在"改完直接切工作流"时丢掉新名字
                     serializeTracks();
-                    if (app.graph) app.graph.setDirtyCanvas(true, true);
                 });
                 // 阻止 LiteGraph 键盘事件
                 nameInput.addEventListener("keydown", (e) => e.stopPropagation());
@@ -927,7 +926,8 @@ import { getApi } from "./Yuan_Common.js";
                 // 恢复 tracks（origOnConfigure 后 dataWidget.value 已从工作流恢复）
                 deserializeTracks();
                 if (tracks.length === 0) tracks = [createDefaultTrack()];
-                // 端口数与 tracks 已一致，仅同步名称不删端口
+                // 旧工作流的 localized_name 是默认名：从存档 name 回填，再连同端口名一起重写
+                if (adoptSavedOutputNames(info)) serializeTracks();
                 syncOutputs();
                 // DOM 就绪后再渲染 UI
                 requestAnimationFrame(ensureInitialized);
@@ -983,9 +983,6 @@ import { getApi } from "./Yuan_Common.js";
             const origOnRemoved = node.onRemoved;
             node.onRemoved = function () {
                 document.removeEventListener("paste", pasteHandler, { capture: true });
-                // 清理隐藏 widget 的轮询定时器（最长 1 秒自清理，此处提前终止）
-                if (dataWidget && dataWidget._hideTimer) clearInterval(dataWidget._hideTimer);
-                if (origOnRemoved) origOnRemoved.apply(this, arguments);
             };
 
             // --- 12. 初始化 ---

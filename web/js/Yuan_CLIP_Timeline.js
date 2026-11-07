@@ -1,5 +1,5 @@
 // Yuan CLIPTimeline 多轨道可视化时间轴编辑器（单类 TimelineEditor，节点类型 YuanCLIPTimeline）
-import { uploadChunked } from "./Yuan_Common.js";
+import { uploadChunked, prunePlaceholderPorts } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 
@@ -33,6 +33,10 @@ const HIDDEN_WIDGET_NAMES = [
   "运动图像帧数",
   "段落图像", "运动图像",   // 抑制默认 IMAGE 预览 widget，由编辑器自行管理
 ];
+
+// 需要清理占位端口的隐藏参数（段落图像/运动图像 是真实可连接的 IMAGE 输入，保留）
+const MANAGED_PORT_NAMES = HIDDEN_WIDGET_NAMES.filter(
+  (n) => n !== "段落图像" && n !== "运动图像");
 
 // 工作流兼容：旧版本缺少 帧率/时间单位 时恢复默认值
 const APPENDED_WIDGET_DEFAULTS = [["帧率", 24.0], ["时间单位", "frames"]];
@@ -168,40 +172,10 @@ function hideWidget(w) {
 }
 
 // ── V3 (Nodes 2.0) 端口占位处理 ──
-// V3 下被编辑器隐藏管理的参数会显示为空端口占位把节点拉长，此函数移除这些输入端口（保留真实可连接的 IMAGE 端口）。
-
-function isV3Node(node) {
-  if (node._yuanIsV3Checked) return !!node._yuanIsV3;
-  node._yuanIsV3Checked = true;
-  try {
-    const el = node._timelineWidget?.element ||
-      node.widgets?.find(w => w.element)?.element;
-    let n = el;
-    while (n) {
-      if ((n.tagName && n.tagName.toLowerCase().includes('comfy-node')) ||
-          (n.classList && n.classList.contains('comfy-node'))) {
-        node._yuanIsV3 = true;
-        break;
-      }
-      n = n.parentElement || (n.getRootNode ? n.getRootNode().host : null);
-    }
-  } catch (_) {}
-  return !!node._yuanIsV3;
-}
-
+// V3 下被编辑器隐藏管理的参数会显示为空端口占位把节点拉长：交给共享实现清理
+// （V3 判定不依赖本节点控件的 DOM 挂载时机，签名去重避免每帧 removeInput 触发重排）
 function hideManagedWidgetPorts(node) {
-  if (!node || !Array.isArray(node.inputs) || !isV3Node(node)) return;
-  for (let i = node.inputs.length - 1; i >= 0; i--) {
-    const inp = node.inputs[i];
-    if (!inp) continue;
-    // 段落图像/运动图像 是真实图像输入端口（保留可连接），
-    // 其余由编辑器隐藏管理的参数端口在 V3 下移除
-    if (HIDDEN_WIDGET_NAMES.includes(inp.name) &&
-        inp.name !== "段落图像" && inp.name !== "运动图像") {
-      if (inp.link != null) continue; // 已有连线时保留端口，避免破坏连接
-      try { node.removeInput(i); } catch (_) {}
-    }
-  }
+  prunePlaceholderPorts(node, MANAGED_PORT_NAMES);
 }
 
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
@@ -3965,7 +3939,6 @@ app.registerExtension({
               if (!v3NodeEl) return;
 
               // 移除被编辑器隐藏管理参数的空端口占位（避免节点被拉长）
-              node._yuanIsV3 = true;
               hideManagedWidgetPorts(node);
 
               // 与 V1 一致的最小尺寸：宽=画布520+容器内边距，高=固定设计高度
@@ -4191,8 +4164,8 @@ app.registerExtension({
     // ── 找到所有 YuanCLIPTimeline 节点 ──
     function findTimelineNodes() {
         const graph = getGraph();
-        if (!graph?._nodes) return [];
-        const nodes = graph._nodes;
+        const nodes = graph?.nodes;
+        if (!Array.isArray(nodes)) return [];
         if (!Array.isArray(nodes)) return [];
         return nodes.filter(n => n && n.type === 'YuanCLIPTimeline');
     }
@@ -4315,7 +4288,7 @@ app.registerExtension({
         try { linkData = graph.links.get?.(linkId) ?? graph.links[linkId]; } catch(e) {}
         if (!linkData) { try { linkData = graph._links?.get(linkId); } catch(e2) {} }
         if (!linkData) return [];
-        const srcNode = graph._nodes?.find(n => n?.id === linkData.origin_id) ||
+        const srcNode = graph.nodes?.find(n => n?.id === linkData.origin_id) ||
                         graph.getNodeById?.(linkData.origin_id);
         if (!srcNode) return [];
 
@@ -4599,7 +4572,7 @@ app.registerExtension({
         }
         const graph = getGraph();
         const textareas = document.querySelectorAll('textarea').length;
-        if (graph && graph._nodes && textareas > 0) {
+        if (graph && graph.nodes && textareas > 0) {
             init();
         } else {
             setTimeout(() => waitForReady(retries - 1), 1000);

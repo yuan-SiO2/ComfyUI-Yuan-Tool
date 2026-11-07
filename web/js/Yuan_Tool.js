@@ -1,5 +1,5 @@
 const { app } = window.comfyAPI.app;
-import { uploadChunked } from "./Yuan_Common.js";
+import { uploadChunked, prunePlaceholderPorts } from "./Yuan_Common.js";
 
 // ---------- YuanTool：多帧参考节点（list_mode 动态端口） ----------
 function registerYuanTool(nodeType, portMeta) {
@@ -718,30 +718,10 @@ function yuanEnsureInput(node, name, type, opts, widgetName) {
     }
 }
 
-// V3 (Nodes 2.0) 检测：向上找 comfy-node 元素（含 shadow DOM host）
-function yuanIsV3Node(node) {
-    try {
-        const w = node.widgets && node.widgets.find((x) => x.element);
-        const el = w ? w.element : null;
-        let n = el;
-        while (n) {
-            if ((n.tagName && n.tagName.toLowerCase().includes("comfy-node")) ||
-                (n.classList && n.classList.contains("comfy-node"))) return true;
-            n = n.parentElement || (n.getRootNode ? n.getRootNode().host : null);
-        }
-    } catch (_) {}
-    return false;
-}
-
-// V3 下被隐藏的 widget 会留空端口占位拉长节点，主动移除对应输入端口（有连线的保留，避免破坏连接）
+// V3 (Nodes 2.0) 下被隐藏的 widget 会留空端口占位并拉长节点：交给共享实现清理
+// （V3 判定与签名去重都在 Yuan_Common，避免各节点各写一套、还各自踩 DOM 挂载时机）
 function yuanRemoveHiddenWidgetPorts(node, names) {
-    if (!node || !Array.isArray(node.inputs) || !yuanIsV3Node(node)) return;
-    for (let i = node.inputs.length - 1; i >= 0; i--) {
-        const inp = node.inputs[i];
-        if (inp && names.indexOf(inp.name) !== -1 && inp.link == null) {
-            try { node.removeInput(i); } catch (_) {}
-        }
-    }
+    prunePlaceholderPorts(node, names);
 }
 
 // 兼容 V2（数组）与 V3（Map）的 graph.links 取值，统一归一化为命名属性对象。
@@ -794,10 +774,10 @@ function registerYuanH3MotionContext(nodeType, portMeta) {
     const PORT_IMG = "上下文图像"; // 随模式显隐的真实数据端口（视频图像 + 端口模式）
     const PORT_AUD = "上下文音频"; // 随模式显隐的真实数据端口（视频图像 + 端口模式）
     const PORT_LAT = "上下文潜空间"; // 随模式显隐的真实数据端口（潜空间 + 端口模式）
-    const PORT_VAE = "VAE"; // 仅「视频图像」模式需要的解码端口
+    const PORT_VAE = "VAE"; // 两种模式都需要的解码/转化端口
     const MODE_VALUES = ["上传", "端口", "自动索引"];
     const LINK_VIDEO = "视频图像"; // 「衔接模式」取值：解码→重编码的媒体路径
-    const LINK_LATENT = "潜空间"; // 「衔接模式」取值：直接切片潜空间
+    const LINK_LATENT = "潜空间"; // 「衔接模式」取值：读上一片段 AV 潜空间文件（锚点在裁剪节点已转化）
     const LINK_VALUES = [LINK_VIDEO, LINK_LATENT];
     const LINK_LATENT_WIDGETS = ["潜空间上下文长度", "潜空间音频长度", "衔接余量"];
     const LINK_VIDEO_WIDGETS = ["上下文长度", "音频上下文长度"];
@@ -1017,7 +997,7 @@ function registerYuanH3MotionContext(nodeType, portMeta) {
 
                 // 1) 端口显隐（离开时保存连接，返回时恢复）。哪些端口属于哪种衔接模式：
                 //    上下文图像/上下文音频——仅「视频图像」；上下文潜空间——仅「潜空间」；
-                //    VAE——仅「视频图像」（潜空间模式直接从 AV 潜空间切片，不需要视频 VAE）
+                //    VAE——两种模式都要（潜空间模式在上下文未转化时需要它补一次转化）
                 const portSync = (name, type, label, savedKey, visible) => {
                     if (visible) {
                         if (!(self.inputs && self.inputs.find((i) => i.name === name))) {
@@ -1049,7 +1029,7 @@ function registerYuanH3MotionContext(nodeType, portMeta) {
                 portSync(PORT_IMG, "IMAGE", "上下文图像", "_yuanH3SavedImgLink", isPort && !isLatentLink);
                 portSync(PORT_AUD, "AUDIO", "上下文音频", "_yuanH3SavedAudLink", isPort && !isLatentLink);
                 portSync(PORT_LAT, "LATENT", "上下文潜空间", "_yuanH3SavedLatLink", isPort && isLatentLink);
-                portSync(PORT_VAE, "VAE", "VAE", "_yuanH3SavedVaeLink", !isLatentLink);
+                portSync(PORT_VAE, "VAE", "VAE", "_yuanH3SavedVaeLink", true);
 
                 // 1b) 「衔接模式」专属参数显隐：两条数据路径各用各的参数，互不影响
                 const setWidgetHidden = (name, hidden) => {
@@ -1159,12 +1139,9 @@ async function yuanH3ContextUploadFile(file, onProgress) {
 function registerYuanH3MotionContextTrim(nodeType, portMeta) {
     const LINK_VIDEO = "视频图像"; // 「衔接模式」取值：解码为图像+音频后裁切
     const LINK_DECODE = "解码模式"; // 「衔接模式」取值：只解码为图像+音频，不裁切、不存盘
-    const LINK_LATENT = "潜空间"; // 「衔接模式」取值：直接裁切 AV 潜空间
+    const LINK_LATENT = "潜空间"; // 「衔接模式」取值：在潜空间按整组裁切，再解码输出图像+音频
     const LINK_VALUES = [LINK_VIDEO, LINK_DECODE, LINK_LATENT];
-    // 输出槽定义：两模式类型完全不同（IMAGE+AUDIO ↔ LATENT），切换时整体重建
-    const OUT_VIDEO = [{ name: "图像", type: "IMAGE" }, { name: "音频", type: "AUDIO" }];
-    const OUT_LATENT = [{ name: "潜空间", type: "LATENT" }];
-    // 仅「视频图像」模式需要的解码端口（潜空间模式不解码）
+    // 三种模式的输出槽一致（图像+音频）：潜空间模式在潜空间按整组裁头，再解码输出
     const DECODE_PORTS = [
         { name: "VAE", key: "_yuanH3TrimSavedVaeLink" },
         { name: "audio_vae", key: "_yuanH3TrimSavedAudioVaeLink" },
@@ -1224,81 +1201,13 @@ function registerYuanH3MotionContextTrim(nodeType, portMeta) {
         this._yuanH3TrimBuilt = true;
         const self = this;
         const linkWidget = this.widgets && this.widgets.find((w) => w.name === "衔接模式");
-
-        // 输出槽按模式整体重建：槽数/槽序/类型都不同（0=图像+1=音频 vs 0=潜空间），
-        // 旧连线语义已失效，须先断开再重建。但重建不能无条件丢弃连线：
-        // 后端 RETURN_TYPES 是通配 "*"、RETURN_NAMES 固定两槽，加载工作流时前端会把
-        // 存档输出与静态槽按位合并，类型恒为 "*"（与目标槽的 IMAGE/AUDIO 不等），
-        // 于是每次加载都会触发重建——若无条件断开，输出连线在加载时被清空。
-        // 故按「原始槽位 + 槽类型」记录目标，重建后类型兼容者自动重连，不兼容者
-        // （如另一模式专属的音频输出）留待切回该模式时再恢复。
-        const savedOutLinks = self._yuanH3SavedOutLinks || (self._yuanH3SavedOutLinks = []);
-        const outTypeOk = (a, b) => !a || !b || a === "*" || b === "*" || a === b;
-        const rebuildOutputs = (spec) => {
-            const graph = self.graph || (app && app.graph);
-            // 1) 记录现有输出连线（含槽位与槽类型）
-            if (Array.isArray(self.outputs) && graph && typeof graph.getNodeById === "function") {
-                self.outputs.forEach((o, i) => {
-                    if (!o || !Array.isArray(o.links)) return;
-                    for (const lid of o.links.slice()) {
-                        const l = yuanH3LinkObj(graph, lid);
-                        if (!l) continue;
-                        const dup = savedOutLinks.some((r) => r.slot === i &&
-                            r.target_id === l.target_id && r.target_slot === l.target_slot);
-                        if (!dup) savedOutLinks.push({
-                            slot: i, type: o.type,
-                            target_id: l.target_id, target_slot: l.target_slot,
-                        });
-                    }
-                });
-            }
-            // 2) 断开并重建
-            if (Array.isArray(self.outputs)) {
-                for (let i = self.outputs.length - 1; i >= 0; i--) {
-                    try { if (self.disconnectOutput) self.disconnectOutput(i); } catch (_) {}
-                }
-                self.outputs.length = 0;
-            }
-            for (const s of spec) {
-                if (self.addOutput) self.addOutput(s.name, s.type, {});
-                const o = self.outputs && self.outputs[self.outputs.length - 1];
-                if (o) {
-                    o.name = s.name;
-                    o.type = s.type;
-                    if (!o.links) o.links = [];
-                }
-            }
-            if (Array.isArray(self.outputs)) self.outputs.forEach((o, i) => {
-                o.slot = i;
-                o.slot_index = i;
-            });
-            // 3) 恢复类型兼容的连线；connect 自身还会按目标端口类型再校验一次
-            if (!Array.isArray(self.outputs) || !graph ||
-                typeof graph.getNodeById !== "function") return;
-            for (let i = 0; i < self.outputs.length; i++) {
-                const o = self.outputs[i];
-                for (let k = savedOutLinks.length - 1; k >= 0; k--) {
-                    const rec = savedOutLinks[k];
-                    if (rec.slot !== i || !outTypeOk(rec.type, o.type)) continue;
-                    const target = graph.getNodeById(rec.target_id);
-                    const ti = target && Array.isArray(target.inputs) ? target.inputs[rec.target_slot] : null;
-                    if (!ti) continue; // 目标端口已不存在，保留记录待其恢复
-                    if (ti.link != null) { savedOutLinks.splice(k, 1); continue; } // 已被占用，记录作废
-                    let made = null;
-                    try { made = self.connect(i, target, rec.target_slot); } catch (_) {}
-                    if (made) savedOutLinks.splice(k, 1);
-                }
-            }
-        };
-
-        // 模式切换：重建解码端口与输出槽（端口留空会被后端判定缺输入，必须真正增删）
+        // 模式切换：重建解码端口（端口留空会被后端判定缺输入，必须真正增删）
         const syncTrimMode = () => {
             if (self._trimSyncing) return;
             self._trimSyncing = true;
             try {
                 const mode = normalizeCombo(linkWidget, LINK_VALUES, LINK_VIDEO);
                 self._lastTrimModeValue = mode;
-                const isLatent = mode === LINK_LATENT;
                 const isDecode = mode === LINK_DECODE;
 
                 // 0) 「裁剪帧数」端口仅裁切模式需要：解码模式移除（离开时保存连接、返回时恢复）。
@@ -1338,45 +1247,26 @@ function registerYuanH3MotionContextTrim(nodeType, portMeta) {
                 }
                 if (isDecode) yuanRemoveHiddenWidgetPorts(self, TRIM_WIDGETS);
 
-                // 1) 解码端口仅「潜空间」模式移除（视频图像/解码模式都要解码，离开时保存连接、返回时恢复）
+                // 1) 解码端口两种模式都保留：视频图像/解码模式用于解码，潜空间模式用于
+                //    把尾段锚点经 VAE 转化后再存盘（锚必须与关键帧条件同源）
                 for (const spec of DECODE_PORTS) {
                     const inp = self.inputs && self.inputs.find((i) => i.name === spec.name);
-                    if (isLatent) {
-                        if (!inp) continue;
-                        if (inp.link != null) {
-                            const l = yuanH3LinkObj(app.graph, inp.link);
-                            if (l) self[spec.key] = { origin_id: l.origin_id, origin_slot: l.origin_slot };
-                        }
-                        const idx = self.inputs.findIndex((i) => i.name === spec.name);
-                        if (idx !== -1) self.removeInput(idx);
-                    } else if (!inp) {
-                        const meta = (portMeta && portMeta[spec.name]) || {};
-                        yuanEnsureInput(self, spec.name, "VAE", {
-                            optional: true, tooltip: meta.tooltip,
-                        });
-                        const saved = self[spec.key];
-                        self[spec.key] = null;
-                        if (saved && app && app.graph && typeof app.graph.getNodeById === "function") {
-                            const ni = self.inputs.find((i) => i.name === spec.name);
-                            const ts = self.inputs.indexOf(ni);
-                            const origin = app.graph.getNodeById(saved.origin_id);
-                            if (origin) { try { origin.connect(saved.origin_slot, self, ts); } catch (_) {} }
-                        }
+                    if (inp) continue;
+                    const meta = (portMeta && portMeta[spec.name]) || {};
+                    yuanEnsureInput(self, spec.name, "VAE", {
+                        optional: true, tooltip: meta.tooltip,
+                    });
+                    const saved = self[spec.key];
+                    self[spec.key] = null;
+                    if (saved && app && app.graph && typeof app.graph.getNodeById === "function") {
+                        const ni = self.inputs.find((i) => i.name === spec.name);
+                        const ts = self.inputs.indexOf(ni);
+                        const origin = app.graph.getNodeById(saved.origin_id);
+                        if (origin) { try { origin.connect(saved.origin_slot, self, ts); } catch (_) {} }
                     }
                 }
 
-                // 2) 输出槽随模式重建（潜空间模式只留 1 个 LATENT 槽）
-                const want = isLatent ? OUT_LATENT : OUT_VIDEO;
-                const cur = self.outputs || [];
-                const same = cur.length === want.length &&
-                    cur.every((o, i) => o && o.name === want[i].name &&
-                        (o.type === want[i].type || o.type === "*" || want[i].type === "*"));
-                if (same) {
-                    // 通配 "*" 只是加载时静态槽类型覆盖了存档类型，就地落实即可——不重建就不动连线
-                    cur.forEach((o, i) => { o.type = want[i].type; o.name = want[i].name; });
-                } else {
-                    rebuildOutputs(want);
-                }
+                // 2) 输出槽固定为「图像+音频」，模式切换不再重建输出
 
                 if (self.setSize && self.computeSize) {
                     const curW = self.size ? self.size[0] : self.computeSize()[0];

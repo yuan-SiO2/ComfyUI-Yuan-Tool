@@ -1,5 +1,5 @@
 /** Yuan Tool · Panorama 前端：YuanPanoramaPreview 的自包含 WebGL 球面全景查看器（拖拽旋转、滚轮缩放、360°/180°、图像与 mp4 视频）。 */
-import { getApi, imageSourceFromCandidate, lookupNodeOutputEntry } from "./Yuan_Common.js";
+import { getApi, imageSourceFromCandidate, lookupNodeOutputEntry, prunePlaceholderPorts } from "./Yuan_Common.js";
 
 (function () {
     "use strict";
@@ -523,8 +523,10 @@ import { getApi, imageSourceFromCandidate, lookupNodeOutputEntry } from "./Yuan_
             }
         }
 
-        /** V3 尺寸适配：强制最小尺寸并移除占位端口；V1 无 comfy-node 元素直接跳过 */
+        /** V3 尺寸适配：强制最小尺寸；占位端口清理独立于 DOM 查找，避免挂载时机不同时失效 */
         _applyV3MinSize() {
+            if (!this.node) return;
+            prunePlaceholderPorts(this.node, ["current_view_data"]);
             try {
                 let el = this.root?.parentElement;
                 while (el) {
@@ -532,17 +534,11 @@ import { getApi, imageSourceFromCandidate, lookupNodeOutputEntry } from "./Yuan_
                         (el.classList && el.classList.contains('comfy-node'))) break;
                     el = el.parentElement || (el.getRootNode ? el.getRootNode().host : null);
                 }
-                if (!el || !this.node) return;
+                if (!el) return;
                 this.node.min_size = [PREVIEW_MIN_WIDTH, PREVIEW_MIN_HEIGHT];
                 el.style.removeProperty("min-width");
                 el.style.setProperty("min-width", PREVIEW_MIN_WIDTH + "px", "important");
                 el.style.setProperty("min-height", PREVIEW_MIN_HEIGHT + "px", "important");
-
-                // V3 下 widget 与输入端口共存，移除隐藏管理参数的占位端口
-                const slot = this.node.findInputSlot("current_view_data");
-                if (slot >= 0 && !this.node.inputs[slot].link) {
-                    this.node.removeInput(slot);
-                }
             } catch (_) {}
         }
 

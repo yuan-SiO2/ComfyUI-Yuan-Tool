@@ -724,14 +724,9 @@ def _steps_for_frames(n):
 
 
 def _video_tail_from_latent(latent, n):
-    """直接从生成的 H3 潜空间切出视频尾部 n 个像素帧，跳过 h264 解码与
-    VAE 编码。返回 (blocks, offsets, covered)，形状与编码路径产物一致，
-    下游无需改动。
+    """从生成的 H3 潜空间切出视频尾部 n 个像素帧，返回 (blocks, covered)。
 
-    窗口不必从周期位置 0 起：offsets 是每个块在窗口内的真实帧起点（读自
-    源潜空间中的实际位置），从组边界起得 1,4,4,4,4 累积位，中途起得
-    4,4,4,1,4…，保证固定潜空间与写入的位置始终一致。节点只提供整组，
-    其尾部窗口恰落在周期中间，因此这点很关键。
+    窗口可落在周期任意位置，块的相位由调用方按目标 token 网格（_pixel_frames）赋值。
     """
     video = _video_from_latent(latent)
     total = int(video.shape[2])
@@ -751,11 +746,9 @@ def _video_tail_from_latent(latent, n):
         raise RuntimeError(
             "h3_motion_context: %d steps cover %d frames, expected %d."
             % (steps, covered, n))
-    base = _pixel_frames(start)
-    offsets = [_pixel_frames(start + k) - base for k in range(steps)]
     blocks = [video[:1, :, start + k:start + k + 1].clone()
               for k in range(steps)]
-    return blocks, offsets, covered
+    return blocks, covered
 
 
 def _audio_tail_from_latent(latent, a_frames):
@@ -800,6 +793,17 @@ CONTEXT_EMPTY_REASON = "_h3_motion_context_empty_reason"
 CONTEXT_EMPTY_REASON_DETAIL = "_h3_motion_context_empty_reason_detail"
 # 正常加载时携带的片段序号键，用于生成"已关联片段 N"提示
 CONTEXT_CLIP_INDEX_KEY = "_h3_motion_context_clip_index"
+# 转化标记键：文件里的视频流是否已在保存时经 VAE 往返（v2），未转化时由
+# 运动上下文在应用前补一次转化
+CONTEXT_LATENT_CONVERTED = "_h3_motion_context_video_converted"
+
+
+def _mc_debug(tag, **kv):
+    """YUAN_H3_MC_DEBUG=1 时打印衔接几何，供两条路径逐项对比。"""
+    if os.environ.get("YUAN_H3_MC_DEBUG", "0") != "1":
+        return
+    print("[h3_motion_context] %s %s"
+          % (tag, " ".join("%s=%s" % (k, v) for k, v in kv.items())), flush=True)
 
 # 尾段媒体文件名约定：存储位置目录下 clip_%05d.mp4（片段序号 2 → clip_00002.mp4）
 CLIP_FILE_PREFIX = "clip"
@@ -1006,6 +1010,18 @@ def _context_latent_fingerprint(存储位置, 片段序号, 手动上传, 潜空
 
 
 # ============================================================================
+def _latent_video_converted(path):
+    """读 safetensors 元数据，判断视频流是否已在保存时经 VAE 转化（v2 文件）。"""
+    if _st_safe_open is None:
+        return False
+    try:
+        with _st_safe_open(path, framework="np") as f:
+            meta = f.metadata() or {}
+        return str(meta.get("video_converted", "0")) == "1"
+    except Exception:
+        return False
+
+
 # 潜空间模式：本地 latent 存取（存储位置目录下 latent_%05d_.safetensors）
 # ============================================================================
 
@@ -1029,7 +1045,8 @@ def _load_context_latent(存储位置, 片段序号=1, 手动上传=""):
                 "h3_motion_context: %s is not an h3_motion_context latent "
                 "(missing video/audio streams). Was it saved by the stock "
                 "Save Latent node instead?" % manual_path)
-        return {"samples": [data["video"], data["audio"]]}
+        return {"samples": [data["video"], data["audio"]],
+                CONTEXT_LATENT_CONVERTED: _latent_video_converted(manual_path)}
     try:
         idx = int(片段序号)
     except (TypeError, ValueError):
@@ -1054,14 +1071,13 @@ def _load_context_latent(存储位置, 片段序号=1, 手动上传=""):
             "(missing video/audio streams). Was it saved by the stock "
             "Save Latent node instead?" % path)
     return {"samples": [data["video"], data["audio"]],
-            CONTEXT_CLIP_INDEX_KEY: idx}
+            CONTEXT_CLIP_INDEX_KEY: idx,
+            CONTEXT_LATENT_CONVERTED: _latent_video_converted(path)}
 
 
 def _save_av_latent(latent, 存储位置, 片段序号):
-    """将 AV 潜空间保存为 {存储位置}/latent_%05d_.safetensors。
-
-    重新生成同一片段会覆盖自身的废弃文件，不会堆叠新文件。
-    """
+    """把 AV 潜空间存为 {存储位置}/latent_%05d_.safetensors（锚点已是 VAE 转化后
+    的 latent，故写 v2 元数据）；重复生成同一片段会覆盖旧文件。"""
     if _st_save is None:
         raise RuntimeError("h3_motion_context: safetensors is not "
                            "available; cannot save latents.")
@@ -1077,7 +1093,47 @@ def _save_av_latent(latent, 存储位置, 片段序号):
     path = os.path.join(folder, "%s_%05d_.safetensors"
                         % (filename, int(片段序号)))
     _st_save({"video": video, "audio": audio}, path,
-             metadata={"format": "h3_motion_context_av_v1"})
+             metadata={"format": "h3_motion_context_av_v2",
+                       "video_converted": "1",
+                       "audio_converted": "0"})
+
+
+def _roundtrip_video_latent(latent, VAE, what="锚点"):
+    """把视频流经 VAE 往返（decode→encode），使锚点成为 vae.encode 的产物；
+    音视频关键帧条件只认这种 latent，直接喂采样器输出会被时间平均而发虚。
+    """
+    if VAE is None:
+        raise ValueError(
+            "h3_motion_context: %s需要用视频 VAE 转化一次（decode→encode）。"
+            "请连接「VAE」端口（H3 视频 VAE）。" % what)
+    if isinstance(latent, dict):
+        video, audio = _split_av_streams(latent)
+    else:
+        video, audio = latent, None
+    with torch.no_grad():
+        pix = VAE.decode(video)
+        if pix.ndim == 5:
+            pix = pix[0]
+        z = VAE.encode(pix.contiguous())
+    if int(z.ndim) != 5 or int(z.shape[2]) != int(video.shape[2]):
+        raise ValueError(
+            "h3_motion_context: %s经 VAE 往返后由 %d 步变成 %s，无法逐块对齐；"
+            "请确认 VAE 端口连接的是 H3 视频 VAE。"
+            % (what, int(video.shape[2]),
+               tuple(z.shape) if int(z.ndim) != 5 else int(z.shape[2])))
+    if int(z.shape[1]) != int(video.shape[1]):
+        raise ValueError(
+            "h3_motion_context: %s经 VAE 往返后通道数由 %d 变成 %d；"
+            "连接的 VAE 与上一片段不是同一模型。" % (what, int(video.shape[1]),
+                                              int(z.shape[1])))
+    if not isinstance(latent, dict):
+        return z
+    samples = latent["samples"]
+    new_samples = (NestedTensor([z, audio])
+                   if getattr(samples, "is_nested", False) else [z, audio])
+    out = dict(latent)
+    out["samples"] = new_samples
+    return out
 
 
 def _tail_portion_latent(delivered, tail_len):
@@ -1226,9 +1282,13 @@ class Yuan_H3MotionContext:
                                "尾部的媒体文件（.mp4）解码后经视频 VAE 编码为"
                                "本片段开头的关键帧引导，与官方 Add Guide 同"
                                "路径，分辨率可不同（按本片段缩放）。潜空间"
-                               "——直接从上一片段的 H3 AV 潜空间切片（.safetensors，"
-                               "跳过解码/重编码，无质量损失），但要求两片段"
-                               "分辨率一致、窗口须为整 VRF 组（17 的倍数）。"}),
+                               "——直接读上一片段的 H3 AV 潜空间文件"
+                               "（.safetensors，跳过像素文件与裁切/缩放）。锚点在"
+                               "「H3 运动裁剪」保存时已做一次 decode→encode 转化"
+                               "（与视频图像同源），本节点直接应用；旧文件或端口"
+                               "直连的未转化潜空间会在此处补一次转化，那种情况下才"
+                               "需要连接 VAE。要求两片段分辨率一致、窗口须为整"
+                               " VRF 组（17 的倍数）。"}),
                 "模式": (["上传", "端口", "自动索引"], {
                     "default": "自动索引",
                     "tooltip": "上下文来源三选一：上传——仅用手动上传的媒体"
@@ -1276,36 +1336,38 @@ class Yuan_H3MotionContext:
                 "潜空间上下文长度": (["17", "34", "51", "68"], {
                     "default": "34",
                     "tooltip": "仅「潜空间」模式生效：从前一片段潜空间延续的"
-                               "画面帧数。每 17 帧是 H3 潜空间的一整个 VRF 组"
-                               "（5 个潜空间步），只有整组长度才能从尾部切片"
-                               "又被「运动裁剪」整组切回，接缝处像素与时间"
-                               "完全对齐；非整组长度会打乱剩余潜空间的时序"
-                               "相位、导致画面闪烁。更长窗口桥接力更强，但会"
-                               "从交付片段头部扣除更多长度。"}),
+                               "画面帧数。17 的倍数是整 VRF 组（5 个潜空间步），"
+                               "只有整组长度才能从尾部切片、又被「运动裁剪」"
+                               "整组切回，接缝处像素与时间完全对齐；本片段头部"
+                               "会扣掉同样长度，因此它同时是「重叠帧数」——"
+                               "交付段第一帧正好接在上一片段末帧之后。更长窗口"
+                               "桥接力更强，但从交付片段头部扣除更多长度。"}),
                 "潜空间音频长度": (["0", "17", "34", "51", "68"], {
                     "default": "17",
                     "tooltip": "仅「潜空间」模式生效：从前一片段潜空间尾部"
                                "取声音的帧数（按 24fps 画面换算，音频潜空间"
-                               "按 40Hz 连续采样、无 VRF 分组），独立于画面"
-                               "窗口。「运动裁剪」按画面/音频两窗口的较大值"
-                               "整段移除。设为 0 时不取音频：连接 audio_vae "
-                               "时改用真实编码的静音（潜空间填零不是静音），"
+                               "按 40Hz 连续采样、无 VRF 分组）。上限按画面"
+                               "锚窗收窄：超出会把裁剪量顶大，在接缝处多挖"
+                               "一段。设为 0 时不取音频：连接 audio_vae 时"
+                               "改用真实编码的静音（潜空间填零不是静音），"
                                "避免固定的上一片段画面诱导模型带出上一片段"
                                "的声音；未连接时模型自由生成。"}),
                 "衔接余量": (["0", "17", "34"], {
-                    "default": "17",
-                    "tooltip": "仅「潜空间」模式生效：在锚定窗口之外、可见"
-                               "剪辑起点之前多留一段整组长度的「自由沉降区」，"
-                               "模型在这段里不再被强制对齐上一片段尾帧，可"
-                               "平滑过渡到全新内容；这段随「运动裁剪」整组"
-                               "移除、不出现在交付剪辑里。设 0 时可见段紧贴"
-                               "锚定窗（旧行为，贴边可能偏僵硬/抖动）。"}),
+                    "default": "0",
+                    "tooltip": "仅「潜空间」模式生效。锚定窗覆盖上一片段末 n 帧、"
+                               "并从本片段头部扣掉同样 n 帧，前后正好首尾相接；"
+                               "此值再额外扣掉 margin 帧，拼接处就会跳过一段时间"
+                               "（17 帧≈0.71s），观感是跳剪、鬼影、发糊。所以"
+                               "要做到看不出拼接，必须保持 0；非 0 只在允许跳剪"
+                               "（如换镜头）时才用。"}),
             },
             "optional": {
                 "VAE": ("VAE", {
-                    "tooltip": "H3 视频 VAE（仅「视频图像」模式使用）。把上一"
-                               "片段尾帧编码为关键帧 latent，与官方 Add Guide "
-                               "连接 image 的路径相同。"}),
+                    "tooltip": "H3 视频 VAE。「视频图像」用它把上一片段尾帧"
+                               "编码为关键帧 latent；「潜空间」仅在上下文来源未经"
+                               "转化时使用（旧 v1 文件、或「端口」直连的采样器"
+                               "输出），用于补一次 decode→encode。由新版"
+                               "「H3 运动裁剪」保存的 v2 文件已转化，无需连接。"}),
                 "audio_vae": ("VAE", {
                     "tooltip": "H3 音频 VAE。「视频图像」模式下「音频上下文"
                                "长度」大于 0 时必须连接，用于把上一片段尾部的"
@@ -1343,8 +1405,7 @@ class Yuan_H3MotionContext:
     DESCRIPTION = ("把上一片段尾部的画面与音频固定为本片段开头的引导，"
                    "支持两条数据路径：「视频图像」模式全面对齐官方 Add Guide "
                    "for MiniMax H3（图像经视频 VAE 编码、音频经音频 VAE 编码，"
-                   "锚定在第 0 帧并追加进正向条件化）；「潜空间」模式直接从"
-                   "上一片段 AV 潜空间尾部切片，跳过解码/重编码。上下文来源"
+                   "锚定在第 0 帧并追加进正向条件化）；「潜空间」模式直接读"
                    "支持 上传/端口/自动索引。裁剪帧数输出为字符串\"状态:长度\""
                    "（如 1:22），供「H3 运动裁剪」解析。")
 
@@ -1357,7 +1418,7 @@ class Yuan_H3MotionContext:
         if 衔接模式 == "潜空间":
             return self._apply_latent(
                 条件化, 潜空间, 启用上下文, 模式, 存储位置, 片段序号,
-                潜空间上下文长度, 潜空间音频长度, 衔接余量, audio_vae,
+                潜空间上下文长度, 潜空间音频长度, 衔接余量, audio_vae, VAE,
                 上下文潜空间, 手动上传)
         # 引导窗口与音频窗口的请求值；无上下文/直通路径下，尾段保存长度
         # 仍按两窗口较大值输出，保证下一片段有可衔接的媒体文件
@@ -1515,15 +1576,20 @@ class Yuan_H3MotionContext:
             条件化, {"minimax_keyframes": keyframes})
         if a > 0:
             hint += "（含音频）"
+        _mc_debug("context.image", guide_frames=g, audio_frames=a, cut=cut,
+                  keyframes=len(keyframes), guide_shape=tuple(guide.shape),
+                  latent_frames=frame_count)
         return {"result": (out, "1:%d" % cut), "ui": {
             "h3_hint": hint}}
 
     def _apply_latent(self, 条件化, 潜空间, 启用上下文, 模式, 存储位置, 片段序号,
-                      上下文长度, 音频上下文长度, 衔接余量, audio_vae,
+                      上下文长度, 音频上下文长度, 衔接余量, audio_vae, VAE,
                       上下文潜空间, 手动上传):
-        """潜空间衔接：直接从上一片段的 AV 潜空间切片，不做解码/重编码。
+        """潜空间衔接：从上一片段的 AV 潜空间切片，再做一次 VAE 转化后作为锚点。
 
-        要求分辨率一致、窗口为整 VRF 组；内部锚点与关键帧/引用共存由布局、载荷两补丁支持。
+        切片本身仍跳过像素文件与裁切/缩放（.safetensors 直读、整 VRF 组对齐），
+        但锚点必须经 decode→encode 归一到关键帧条件的 latent 空间，与「视频图像」
+        路径同源；内部锚点与关键帧/引用共存由布局、载荷两补丁支持。
         """
         if not 启用上下文:
             # 直通：尾段保存长度固定一个整组（17 帧）
@@ -1585,11 +1651,13 @@ class Yuan_H3MotionContext:
         # 切片前对齐到整组网格，使切出的帧正好是整 VRF 组覆盖的帧
         n = next((g for g in VIDEO_RUN_GRID if g <= n), 0)
 
-        # 衔接余量：在锚定窗之外、可见剪起点之前多留一段整组长度的沉降区
+        # 余量非 0 会让交付段起点后移、拼接处跳过 margin 帧（时间轴出现空洞）；
+        # 音频锚窗不得超过画面锚窗，否则同样把裁剪量顶大
         margin = int(衔接余量 or 0)
+        a_win = min(int(音频上下文长度), n)
         # 裁剪量取画面窗、音频窗、画面窗+衔接余量 的较大值并吸附整组
         trim_frames = next((g for g in VIDEO_RUN_GRID
-                            if g <= max(n, int(音频上下文长度), n + margin)), 0)
+                            if g <= max(n, a_win, n + margin)), 0)
         if trim_frames < 5:
             raise RuntimeError(
                 "h3_motion_context: 无法从 VIDEO_RUN_GRID 选出裁剪长度，"
@@ -1610,9 +1678,23 @@ class Yuan_H3MotionContext:
                 "h3_motion_context: %d 帧窗口不是整数个潜空间步。"
                 "VIDEO_RUN_GRID 已与 VAE 不匹配；拒绝渲染以避免接缝错位。" % n)
 
-        blocks, offsets, covered = _video_tail_from_latent(上下文潜空间, n)
+        blocks, covered = _video_tail_from_latent(上下文潜空间, n)
         span = covered
-        indices = list(offsets)
+        # 锚点须是 vae.encode 的产物：「H3 运动裁剪」存盘时已转化（v2），
+        # 只有旧文件或端口直连的未转化潜空间才在这里补一次。
+        converted = (isinstance(上下文潜空间, dict)
+                     and bool(上下文潜空间.get(CONTEXT_LATENT_CONVERTED)))
+        if not converted:
+            _video_rt = _roundtrip_video_latent(
+                torch.cat(blocks, dim=2), VAE, what="「潜空间」模式的锚点")
+            blocks = [_video_rt[:, :, k:k + 1].clone()
+                      for k in range(int(_video_rt.shape[2]))]
+            del _video_rt
+        # 时间坐标用目标片段自己的 token 网格（0/1/5/9/13 帧位），与「视频图像」一致
+        indices = [_pixel_frames(k) for k in range(len(blocks))]
+        _mc_debug("context.latent", frames=n, steps=len(blocks),
+                  declared=indices, trim=trim_frames, converted=converted,
+                  block=tuple(blocks[0].shape))
         # 追加到已有 keyframes（而非整表替换），可与其他关键帧节点混用
         existing_keyframes = list(条件化[0][1].get("minimax_keyframes", []))
         keyframes = existing_keyframes + [
@@ -1626,9 +1708,9 @@ class Yuan_H3MotionContext:
         # 固定真实编码的静音，避免固定画面诱导模型带出上一片段的声音
         audio_ref = None
         audio_silent = False
-        if int(音频上下文长度) > 0:
+        if a_win > 0:
             audio_latent, ref_audio_t = _audio_tail_from_latent(
-                上下文潜空间, int(音频上下文长度))
+                上下文潜空间, a_win)
             audio_ref = {"kind": "audio", "ref_audio_t": ref_audio_t,
                          "audio_latent": audio_latent}
         elif audio_vae is not None:
@@ -1661,6 +1743,9 @@ class Yuan_H3MotionContext:
                 else "已关联上下文")
         if audio_silent:
             hint += "，音频上下文=静音"
+        if margin > 0:
+            hint += ("；余量 %d 帧会在拼接处跳过（%.2fs）"
+                     % (margin, margin / float(FPS)))
         return {"result": (out, trim_str), "ui": {"h3_hint": hint}}
 
     @classmethod
@@ -1680,10 +1765,10 @@ class Yuan_H3MotionContext:
 # ============================================================================
 
 class Yuan_H3MotionContextTrim:
-    """按「裁剪帧数」对 AV 潜空间做两段式裁切，输出槽随「衔接模式」切换。
+    """按「裁剪帧数」对 AV 潜空间做两段式裁切，三种模式都输出 IMAGE+AUDIO。
 
-    - 视频图像：解码为图像+音频后按像素裁切，尾段存 clip_%05d.mp4，输出 IMAGE+AUDIO；
-    - 潜空间：直接在 AV 潜空间按整 VRF 组裁切，尾段存 latent_%05d_.safetensors，输出 LATENT；
+    - 视频图像：解码后按像素裁切，尾段存 clip_%05d.mp4；
+    - 潜空间：在 AV 潜空间按整 VRF 组裁切后解码，尾段存 latent_%05d_.safetensors；
     - 解码模式：只解码，不裁切、不存盘。
 
     尾段供下一片段「H3 运动上下文」加载衔接。
@@ -1707,9 +1792,12 @@ class Yuan_H3MotionContextTrim:
                                "不裁头也不存盘，「裁剪帧数」端口随「片段序号」"
                                "「保存到本地」「存储位置」一并隐藏（该选项"
                                "仅本节点有，与「H3 运动上下文」的衔接模式无"
-                               "需一致）；潜空间——直接裁切 AV 潜空间，输出"
-                               " LATENT，尾段存 .safetensors，无质量损失但"
-                               "要求两片段分辨率一致。"}),
+                               "需一致）；潜空间——按整 VRF 组直接裁切 AV 潜空间"
+                               "（音频同步裁、相位不乱），再解码输出同样的"
+                               "图像+音频，尾段存 .safetensors；尾段存盘前会经"
+                               " VAE 做一次 decode→encode 转化（锚点必须与「视频"
+                               "图像」同源），因此也要连接 VAE；要求两片段分辨率"
+                               "一致。"}),
                 "片段序号": ("INT", {
                     "default": 1, "min": 1, "max": 9999,
                     "tooltip": "本片段在链条中的序号。「视频图像」模式设为2"
@@ -1742,74 +1830,52 @@ class Yuan_H3MotionContextTrim:
                                "语义：裁头与尾段等长）。未接入时不裁头、不"
                                "保存尾段（等于不保存本地），也不会报错。"}),
                 "VAE": ("VAE", {
-                    "tooltip": "H3 视频 VAE（仅「视频图像」模式使用）。把 AV "
-                               "潜空间的视频流解码为像素帧。"}),
+                    "tooltip": "H3 视频 VAE。两条裁切模式都要用：解码 AV 潜空间"
+                               "为像素帧；「潜空间」模式另外用它把要存盘的尾段锚点"
+                               "做一次 decode→encode 转化。"}),
                 "audio_vae": ("VAE", {
-                    "tooltip": "H3 音频 VAE（仅「视频图像」模式使用）。把 AV "
-                               "潜空间的音频流解码为波形。"}),
+                    "tooltip": "H3 音频 VAE。把 AV 潜空间的音频流解码为波形"
+                               "（两条裁切模式输出音频都需要它）。"}),
             },
         }
 
-    # 输出槽类型/顺序由前端按「衔接模式」重建（视频图像：IMAGE+AUDIO；
-    # 潜空间：LATENT）。此处声明为 AnyType 通配，避免静态声明与实际输出槽
-    # 不一致；隐含模式（未加载前端脚本）下第 0 槽即潜空间输出。
-    RETURN_TYPES = ("*", "*")
+    # 三种衔接模式的输出一致：图像 + 音频。潜空间模式只把裁切放在潜空间侧
+    # （整 VRF 组对齐），随后复用同一条解码路径，下游无需按模式区分。
+    RETURN_TYPES = ("IMAGE", "AUDIO")
     RETURN_NAMES = ("图像", "音频")
+    OUTPUT_TOOLTIPS = ("按「裁剪帧数」裁头后的画面帧。",
+                       "与画面同步裁头后的音频。")
     FUNCTION = "trim"
     OUTPUT_NODE = True
     CATEGORY = "Yuan Tool/MiniMax"
     DESCRIPTION = ("按「H3 运动上下文」输出的裁剪帧数字符串\"状态:长度\"对 H3 "
-                   "采样器的 AV 潜空间做两段式裁切，尾段存盘供下一片段衔接。"
-                   "「视频图像」模式解码为图像+音频后按像素裁切，输出"
-                   "图像/音频；「潜空间」模式直接按整 VRF 组裁切，输出潜空间；"
-                   "「解码模式」只解码不裁切，输出整段图像/音频。")
+                   "采样器的 AV 潜空间做两段式裁切并输出图像+音频，尾段存盘供"
+                   "下一片段衔接。「视频图像」模式解码后按像素裁切、尾段存 mp4；"
+                   "「潜空间」模式按整 VRF 组直接裁切潜空间（音频同步、相位不乱）"
+                   "再解码输出同等图像+音频，尾段存 .safetensors；"
+                   "「解码模式」只解码不裁切。")
 
     def trim(self, 潜空间, 裁剪帧数=None, 片段序号=1, 保存到本地=True,
              存储位置="H3-Mubu", 衔接模式="视频图像", VAE=None, audio_vae=None):
-        if 衔接模式 == "潜空间":
-            return (self._trim_latent(潜空间, 裁剪帧数, 片段序号,
-                                      保存到本地, 存储位置),)
         if VAE is None:
             raise ValueError(
-                "h3_motion_context: 「视频图像」衔接模式需要连接 VAE（H3 视频"
-                "VAE）以解码 AV 潜空间；若要直接裁切潜空间请把「衔接模式」"
-                "改为「潜空间」。")
+                "h3_motion_context: 「%s」衔接模式需要连接 VAE（H3 视频 VAE）"
+                "以解码 AV 潜空间。" % 衔接模式)
         if audio_vae is None:
             raise ValueError(
-                "h3_motion_context: 「视频图像」衔接模式需要连接 audio_vae"
-                "（H3 音频 VAE）以解码音频流；若要直接裁切潜空间请把"
-                "「衔接模式」改为「潜空间」。")
-        # 「解码模式」：只走「视频图像」的解码段，不裁头、不存盘。前端在此模式已移除
-        # 「裁剪帧数」输入端口并隐藏「片段序号」「保存到本地」「存储位置」，故这里
-        # 不读这些参数，原样输出整段图像+音频。
+                "h3_motion_context: 「%s」衔接模式需要连接 audio_vae（H3 音频 "
+                "VAE）以解码音频流。" % 衔接模式)
+        # 「解码模式」：只解码，不裁头、不存盘。前端在此模式已移除「裁剪帧数」
+        # 输入端口并隐藏「片段序号」「保存到本地」「存储位置」。
         if 衔接模式 == "解码模式":
-            return self._decode_only(潜空间, VAE, audio_vae)
-        # 解析"状态:长度"："1:22"=裁头 22 帧、尾段存 22 帧；"0:22"=不裁头、尾段存 22 帧；
-        # 纯数字 n 视为 n=tail=n；未接入（None）按 0 处理。
-        s = "" if 裁剪帧数 is None else str(裁剪帧数).strip()
-        if ":" in s:
-            state_str, _, len_str = s.partition(":")
-            try:
-                state = int(state_str or "1")
-            except ValueError:
-                state = 1
-            try:
-                maxlen = int(len_str or "0")
-            except ValueError:
-                maxlen = 0
-            if state:
-                n, tail = maxlen, maxlen
-            else:
-                n, tail = 0, maxlen
-        else:
-            try:
-                n = int(float(s or 0))
-            except ValueError:
-                n = 0
-            tail = n
-        n = max(0, n)
-        tail = max(0, tail)
-        # 像素域裁切：任意帧数均可，无需吸附整组（无 VRF 相位约束）
+            return self._decode_output(潜空间, VAE, audio_vae)
+        n, tail = _parse_trim(裁剪帧数)
+        if 衔接模式 == "潜空间":
+            # 潜空间按整组裁头（音频同步），再复用同一条解码输出：下游无需区分模式
+            delivered = self._cut_latent(潜空间, n, tail, 片段序号, 保存到本地,
+                                         存储位置, VAE)
+            return self._decode_output(delivered, VAE, audio_vae)
+        # 「视频图像」：解码后按像素裁切（任意帧数均可，无 VRF 相位约束）
         pixels, wave, sample_rate = self._decode_av(潜空间, VAE, audio_vae)
         total = int(pixels.shape[0])
         if n >= total:
@@ -1835,13 +1901,11 @@ class Yuan_H3MotionContextTrim:
                 {"waveform": delivered_wave, "sample_rate": sample_rate})
 
     def _decode_av(self, 潜空间, VAE, audio_vae):
-        """AV 潜空间 → 像素帧与波形（「视频图像」与「解码模式」共用的解码段）。
+        """AV 潜空间 → 像素帧与波形（三种衔接模式共用的解码段）。
 
         返回 (pixels [T,H,W,3], wave [B,2,L], sample_rate)。"""
         video, audio = _split_av_streams(潜空间)
-        # 解码：视频流 → [T,H,W,3] 像素帧；音频流 → [1,2,L] 波形
-        # （VAE 包装器 decode 返回 [B,L,2]，movedim 回 ComfyUI AUDIO
-        # 约定的 [B,声道,样本]）
+        # VAE 包装器返回 [B,L,2]，movedim 回 ComfyUI AUDIO 约定的 [B,声道,样本]
         pixels = VAE.decode(video)
         if pixels.ndim == 5:
             pixels = pixels[0]
@@ -1853,39 +1917,24 @@ class Yuan_H3MotionContextTrim:
             wave = wave[None].movedim(1, -1)  # [L,2] → [1,2,L]
         return pixels, wave, sample_rate
 
-    def _decode_only(self, 潜空间, VAE, audio_vae):
-        """「解码模式」：把整段 AV 潜空间解码为图像+音频，不裁切、不存盘。"""
+    def _decode_output(self, 潜空间, VAE, audio_vae):
+        """解码 AV 潜空间并打包成 (图像, 音频) 输出节点的返回值。
+
+        「解码模式」整段解码与「潜空间」模式裁头后解码共用。
+        """
         pixels, wave, sample_rate = self._decode_av(潜空间, VAE, audio_vae)
         return (pixels, {"waveform": wave, "sample_rate": sample_rate})
 
-    def _trim_latent(self, 潜空间, 裁剪帧数=None, 片段序号=1,
-                     保存到本地=True, 存储位置="H3-Mubu"):
-        # 「潜空间」模式：直接在 AV 潜空间上裁切。裁剪帧数格式同上，
-        # 未接入（None）按 0 处理。
-        s = "" if 裁剪帧数 is None else str(裁剪帧数).strip()
-        if ":" in s:
-            state_str, _, len_str = s.partition(":")
-            try:
-                state = int(state_str or "1")
-            except ValueError:
-                state = 1
-            try:
-                maxlen = int(len_str or "0")
-            except ValueError:
-                maxlen = 0
-            if state:
-                n, tail = maxlen, maxlen
-            else:
-                n, tail = 0, maxlen
-        else:
-            try:
-                n = int(float(s or 0))
-            except ValueError:
-                n = 0
-            tail = n
-        n = max(0, n)
+    def _cut_latent(self, 潜空间, n, tail, 片段序号, 保存到本地=True,
+                    存储位置="H3-Mubu", VAE=None):
+        """在 AV 潜空间上按整 VRF 组裁头，返回交付潜空间并（可选）存盘尾段。
+
+        裁切量由调用方解析（_parse_trim）；解码输出由 _decode_av 复用，本函数
+        不碰像素。存盘尾段先经 VAE 往返转化为锚点 latent。
+        """
         # 向下吸附到最近的整组（17 的倍数）：非整组裁切会打乱剩余潜空间的
         # VRF 相位导致闪烁；小于 17 时吸附为 0（不裁剪，原样直通）
+        n = max(0, n)
         n -= n % 17
         tail = max(0, tail)
         tail -= tail % 17
@@ -1919,12 +1968,40 @@ class Yuan_H3MotionContextTrim:
                        else [video, audio])
         out = dict(潜空间)
         out["samples"] = new_samples
-        # 在裁头结果的尾部再取一段保存到本地，供下一片段的「H3 运动上下文」使用；
-        # tail 为 0 时仍按 17 帧保存
+        # 尾段存盘供下一片段「H3 运动上下文」使用；存盘前先转化为锚点 latent
         if 保存到本地 and tail > 0:
-            _save_av_latent(_tail_portion_latent(out, tail),
-                            存储位置, 片段序号)
+            _tail_latent = _roundtrip_video_latent(
+                _tail_portion_latent(out, tail), VAE, what="尾段锚点")
+            _save_av_latent(_tail_latent, 存储位置, 片段序号)
+            _mc_debug("trim.latent", n=n, tail=tail, total=total,
+                      removed_px=removed, removed_steps=k, audio_cut=audio_cut)
+            del _tail_latent
         return out
+
+
+def _parse_trim(s):
+    """解析「裁剪帧数」的"状态:长度"："1:22"=裁头 22 且尾段存 22，"0:22"=不裁头、
+    尾段存 22；纯数字视为 n=tail=n；None 按 0。两条裁切路径共用。
+    """
+    s = "" if s is None else str(s).strip()
+    if ":" in s:
+        state_str, _, len_str = s.partition(":")
+        try:
+            state = int(state_str or "1")
+        except ValueError:
+            state = 1
+        try:
+            maxlen = int(len_str or "0")
+        except ValueError:
+            maxlen = 0
+        n, tail = (maxlen, maxlen) if state else (0, maxlen)
+    else:
+        try:
+            n = int(float(s or 0))
+        except ValueError:
+            n = 0
+        tail = n
+    return max(0, n), max(0, tail)
 
 
 def _save_av_media(pixels, waveform, sample_rate, 存储位置, 片段序号):

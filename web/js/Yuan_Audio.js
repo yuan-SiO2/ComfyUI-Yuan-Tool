@@ -1,5 +1,5 @@
 /** Yuan Tool · 音频前端：音频列表（互斥播放/上传/选择/拖拽排序）+ 音频分流（按输出数量修剪端口）。 */
-import { getApi, isAudioFileName } from "./Yuan_Common.js";
+import { getApi, isAudioFileName, prunePlaceholderPorts, chainCallback, hideWidget } from "./Yuan_Common.js";
 
 (function () {
     "use strict";
@@ -378,27 +378,14 @@ import { getApi, isAudioFileName } from "./Yuan_Common.js";
 
             const galleryWidget = node.addDOMWidget("AudioGallery", "yuan_audio_gallery", container, { serialize: false });
 
-            // --- 2. 隐藏 audio_list_data widget ---
+            // --- 2. 隐藏 audio_list_data widget（official visibility 抑制 + 旧画布零高度） ---
             const dataWidget = node.widgets.find(w => w.name === "audio_list_data");
-            if (dataWidget) {
-                Object.defineProperty(dataWidget, "hidden", { get: () => true, set: () => {} });
-                Object.defineProperty(dataWidget, "type", { get: () => "hidden", set: () => {} });
-                dataWidget.computeSize = function () { return [0, 0]; };
-
-                const hideInterval = setInterval(() => {
-                    if (dataWidget.element) dataWidget.element.style.display = "none";
-                }, 50);
-                dataWidget._hideTimer = hideInterval;
-                setTimeout(() => clearInterval(hideInterval), 1000);
-            }
-
-            // V3：移除 audio_list_data 占位输入端口（避免节点被拉长）
-            if (checkIsV3()) {
-                const slot = node.findInputSlot("audio_list_data");
-                if (slot >= 0 && !node.inputs[slot].link) {
-                    node.removeInput(slot);
-                }
-            }
+            hideWidget(dataWidget);
+            // V3：移除 audio_list_data 占位输入端口（节点拉长/端口错位）。用共享清理并挂到
+            // 绘制回调上——V3 会在首次渲染后重建端口，只清一次会漏，签名去重后每帧零开销。
+            const dropDataPort = () => prunePlaceholderPorts(node, ["audio_list_data"]);
+            dropDataPort();
+            chainCallback(node, "onDrawForeground", dropDataPort);
 
             // --- 3. 序列化 / 反序列化 ---
             function serializeFiles() {
@@ -859,7 +846,6 @@ import { getApi, isAudioFileName } from "./Yuan_Common.js";
                     stopGlobalPlayback();
                 }
                 closeFilePicker();
-                if (dataWidget && dataWidget._hideTimer) clearInterval(dataWidget._hideTimer);
                 if (origOnRemoved) origOnRemoved.apply(this, arguments);
             };
 

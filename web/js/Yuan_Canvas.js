@@ -205,7 +205,7 @@ async function waitForImageLoads(instance) {
 
 /** 排队前确保画布有内容且待上传的合成图已自动上传，运行时可直接输出合成图像。 */
 async function ensureCanvasesUploadedBeforeQueue() {
-    const graphNodes = app?.graph?._nodes || [];
+    const graphNodes = app?.graph?.nodes || [];
     const uploads = [];
     for (const node of graphNodes) {
         const instance = node?.compositorInstance;

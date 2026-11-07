@@ -34,7 +34,7 @@ app.registerExtension({
     },
     afterConfigureGraph() {
         // 等待图反序列化恢复所有节点与连线后再重排
-        for (const node of app.graph?._nodes ?? []) {
+        for (const node of app.graph?.nodes ?? []) {
             if (SAMPLERS.has(node.type)) orderModelInputs(node);
         }
     },

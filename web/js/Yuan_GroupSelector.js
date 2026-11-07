@@ -222,7 +222,7 @@ function groupInsideNodes(group) {
     const children = group._children;
     const list = children && typeof children[Symbol.iterator] === "function"
         ? [...children]
-        : [...(group._nodes ?? group.nodes ?? [])];
+        : [...(group.nodes ?? [])];
     return list.filter((node) => {
         if (!node || node.type === YUAN_GROUP_SELECTOR_TYPE) return false;
         if (typeof node.mode !== "number") return false;

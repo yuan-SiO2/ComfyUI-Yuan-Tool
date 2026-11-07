@@ -1449,7 +1449,9 @@ class YuanVideoSave:
         if not os.path.exists(preview_path):
             candidates = [path for path in media_files if os.path.exists(path)]
             preview_path = candidates[0] if candidates else output_files[-1]
-            preview_name = os.path.basename(preview_path)
+        # 始终用真实文件名的 basename：保证前端拿到的 filename 带扩展名（云端/自定义前缀下
+        # 可能拿到没有扩展名的名字，浏览器会当成图片、直接显示「预览加载失败」）
+        preview_name = os.path.basename(preview_path)
         preview = {
             "filename": preview_name,
             "subfolder": subfolder,

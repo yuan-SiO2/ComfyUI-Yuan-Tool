@@ -1,5 +1,7 @@
 // 「选项」节点（YuanPrimitive）：COMBO 输入展开为 Yes/No 互斥开关写回目标节点，非 COMBO 保持原生行为。
 const { app } = window.comfyAPI.app;
+import { setSlotName } from "./Yuan_Common.js";
+
 
 const YUAN_PRIMITIVE_TYPE = "YuanPrimitive";
 const YUAN_PRIMITIVE_TITLE = "选项";
@@ -69,7 +71,7 @@ app.registerExtension({
                 const options = this._extractComboOptions(e);
                 if (options) {
                     // 端口标签改为所连输入名，避免显示成 COMBO
-                    if (this.outputs?.[0]) this.outputs[0].name = n;
+                    if (this.outputs?.[0]) setSlotName(this.outputs[0], n);
                     const [w, h] = this.size;
                     const s = this._createComboToggles(options, t, n);
                     if (typeof this._finalizeWidget === "function") {

@@ -1,5 +1,5 @@
 /** Yuan Tool · 加载视频前端：为 Yuan_VideoUI 节点提供视频预览、时间轴裁剪、镜头智能分段与裁剪框交互 UI。 */
-import { findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput, getApi, hideWidget, showWidget, uploadChunked } from "./Yuan_Common.js";
+import { findComfyNodeEl, enforceV3MinSize, prunePlaceholderPorts, getApi, hideWidget, showWidget, uploadChunked } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 
@@ -1460,15 +1460,9 @@ app.registerExtension({
                             ? node.domWidget.element.parentElement : null;
                         const v3El = findComfyNodeEl(mountEl);
 
-                        // 移除 UI 托管参数的空占位端口（端口名签名变化检测，
-                        // 避免工作流切换后 V3 重建端口时每帧 removeInput 触发重排）
-                        if (v3El && Array.isArray(node.inputs)) {
-                            const sig = node.inputs.map(i => i.name).join("|");
-                            if (sig !== node._yuanVideoPortSig) {
-                                for (const name of MANAGED_PARAM_NAMES) removeV3PlaceholderInput(node, name);
-                                node._yuanVideoPortSig = node.inputs.map(i => i.name).join("|");
-                            }
-                        }
+                        // 移除 UI 托管参数的空占位端口：共享清理自带签名去重，且 V3 判定
+                        // 不再依赖本节点 DOM 控件是否已挂载（否则工作流切换后端口会残留）
+                        prunePlaceholderPorts(node, MANAGED_PARAM_NAMES);
 
                         // 最小尺寸（元素引用缓存，常量尺寸只写一次）
                         if (v3El) {

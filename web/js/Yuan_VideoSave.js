@@ -1,5 +1,5 @@
 /** Yuan Tool · 视频保存前端：高级设置折叠、格式参数显隐与播放预览窗口。 */
-import { chainCallback, findComfyNodeEl, getApi, hideWidget, showWidget } from "./Yuan_Common.js";
+import { chainCallback, getApi, hideWidget, showWidget, pruneHiddenWidgetPorts } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 const api = getApi();
@@ -239,7 +239,7 @@ function createPlayer(node, scheduleFit) {
 
     function nodeInGraph(target) {
         const graph = target?.graph;
-        const nodes = graph?._nodes || graph?.nodes;
+        const nodes = graph?.nodes;
         if (!Array.isArray(nodes)) {
             return true;   // 拿不到图信息时保守处理，不当作残留
         }
@@ -553,6 +553,9 @@ function createPlayer(node, scheduleFit) {
         }
     }
 
+    /** 当前这次预览的 404 重试入口（由 setPreview 设置，图片与视频共用） */
+    let retryCurrentPreview = null;
+
     function setPreview(preview, force = false) {
         if (!preview || !preview.filename) {
             return;
@@ -581,9 +584,41 @@ function createPlayer(node, scheduleFit) {
         empty.style.display = "none";
         caption.style.display = "none";
 
-        if (VIDEO_EXTENSIONS.has(extensionOf(params.filename))) {
+        // 后端会给 format（video/mp4、image/gif…）：优先按格式判断是不是视频，
+        // 文件名没有扩展名（云端常见）时也不会误走 <img> 分支
+        const isVideo = String(params.format || "").startsWith("video") ||
+            VIDEO_EXTENSIONS.has(extensionOf(params.filename));
+
+        // 云端常见：文件实际落盘在另一类目录（output/temp），按声明类型取会 404 —— 换一种再试一次
+        let retriedType = false;
+        retryCurrentPreview = (videoBranch) => {
+            if (retriedType) {
+                showCaption("预览加载失败，请检查输出文件是否存在。");
+                return;
+            }
+            retriedType = true;
+            const otherType = params.type === "temp" ? "output" : "temp";
+            const retryUrl = buildViewUrl({ ...params, type: otherType });
+            state.url = retryUrl;
+            if (videoBranch) {
+                const element = mountVideo();
+                element.src = retryUrl;
+                element.load();
+                if (!state.paused) {
+                    const attempt = element.play();
+                    if (attempt && typeof attempt.catch === "function") {
+                        attempt.catch(() => {});
+                    }
+                }
+            } else {
+                image.src = retryUrl;
+            }
+        };
+
+        if (isVideo) {
             const element = mountVideo();
             element.style.display = "block";
+            element.onerror = () => retryCurrentPreview && retryCurrentPreview(true);
             element.src = state.url;
             element.muted = true;
             element.load();
@@ -617,6 +652,10 @@ function createPlayer(node, scheduleFit) {
 
     image.addEventListener("error", () => {
         if (!image.getAttribute("src")) {
+            return;
+        }
+        if (retryCurrentPreview) {
+            retryCurrentPreview(false);
             return;
         }
         showCaption("预览加载失败，请检查输出文件是否存在。");
@@ -862,6 +901,7 @@ function addVideoSaveUI(node) {
             }
         }
         applyFormatWidgets();
+        dropHiddenPlaceholderPorts();
         scheduleFit();
     }
 
@@ -972,36 +1012,13 @@ function addVideoSaveUI(node) {
         scheduleFit();
     });
 
-    // V3（Nodes 2.0）会为隐藏的控件显示空端口并拉长节点，按隐藏状态移除这些占位端口。
-    let portSignature = "";
-    chainCallback(node, "onDrawForeground", function () {
-        const mount = player.container.parentElement;
-        if (!mount || !findComfyNodeEl(mount) || !Array.isArray(node.inputs)) {
-            return;
-        }
-        const hidden = [];
-        for (const name of [...ADVANCED_WIDGET_NAMES, ...FORMAT_WIDGET_NAMES]) {
-            const widget = widgets[name];
-            if (!widget) {
-                continue;
-            }
-            if (widget.hidden || widget.options?.hidden) {
-                hidden.push(name);
-            }
-        }
-        const inputs = node.inputs.map((input) => input.name).join("|");
-        const signature = `${hidden.join("|")}::${inputs}`;
-        if (signature === portSignature) {
-            return;
-        }
-        for (const name of hidden) {
-            const slot = node.findInputSlot?.(name);
-            if (slot >= 0 && node.inputs[slot] && !node.inputs[slot].link) {
-                node.removeInput(slot);
-            }
-        }
-        portSignature = `${hidden.join("|")}::${node.inputs.map((input) => input.name).join("|")}`;
-    });
+    // 隐藏控件会留下空占位端口：既拉长节点，又与「图像」端口错位重叠。
+    // 不枚举名字（新增格式参数不会漏），直接清掉本节点所有隐藏控件的未连线端口。
+    function dropHiddenPlaceholderPorts() {
+        pruneHiddenWidgetPorts(node);
+    }
+    node._yuanVideoDropPlaceholders = dropHiddenPlaceholderPorts;
+    chainCallback(node, "onDrawForeground", dropHiddenPlaceholderPorts);
 
     if ((node.size?.[0] || 0) < 360) {
         node.size[0] = 360;
@@ -1062,7 +1079,7 @@ app.registerExtension({
     },
     afterConfigureGraph() {
         // 工作流反序列化后再排列一次：此时连线已就绪，可同步槽位
-        for (const node of app.graph?._nodes ?? []) {
+        for (const node of app.graph?.nodes ?? []) {
             if (node?.type === NODE_NAME) {
                 hoistImageInput(node);
             }

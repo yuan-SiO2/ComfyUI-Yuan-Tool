@@ -3,7 +3,7 @@
  * （复刻自 Yuan-TV「加载音频 UI」节点，适配本插件 V2/V3 双前端：
  *   V3 下移除隐藏参数的占位输入端口；Vue 控件不走原生 callback，用 onDrawForeground 轮询同步）。
  */
-import { getApi, findComfyNodeEl, enforceV3MinSize, removeV3PlaceholderInput, isAudioFileName, chainCallback, hideWidget, showWidget } from "./Yuan_Common.js";
+import { getApi, findComfyNodeEl, enforceV3MinSize, prunePlaceholderPorts, isAudioFileName, chainCallback, hideWidget, showWidget } from "./Yuan_Common.js";
 
 const { app } = window.comfyAPI.app;
 
@@ -87,15 +87,9 @@ app.registerExtension({
             }
             node.isYuanAudioV3 = checkIsV3;
 
-            // V3：移除被隐藏管理参数的空占位端口（已有连线的保留不删）。
-            // 以输入端口名签名做变化检测：端口列表未变时直接跳过，
-            // 避免每帧调用 removeInput 触发重排（工作流切换时节点"闪一下"的根源之一）
-            function removePlaceholderPorts(n, force) {
-                if (!checkIsV3() || !n || !Array.isArray(n.inputs)) return;
-                const sig = n.inputs.map(i => i.name).join("|");
-                if (!force && sig === n._yuanAudioPortSig) return;
-                for (const name of MANAGED_PARAMS) removeV3PlaceholderInput(n, name);
-                n._yuanAudioPortSig = n.inputs.map(i => i.name).join("|");
+            // V3：移除被隐藏管理参数的空占位端口（共享实现，签名去重、保留已有连线）
+            function removePlaceholderPorts(n) {
+                prunePlaceholderPorts(n, MANAGED_PARAMS);
             }
             node._yuanAudioRemovePorts = removePlaceholderPorts;
 

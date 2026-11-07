@@ -38,12 +38,76 @@ export function enforceV3MinSize(comfyNodeEl, minW, minH) {
 /** 移除 V3 下隐藏管理参数的空占位端口（避免节点被拉长）；已有连线的端口保留不删 */
 export function removeV3PlaceholderInput(node, name) {
     if (!node || !Array.isArray(node.inputs)) return false;
-    const slot = node.findInputSlot(name);
-    if (slot >= 0 && !node.inputs[slot].link) {
+    let slot = typeof node.findInputSlot === "function" ? node.findInputSlot(name) : -1;
+    if (slot < 0) slot = node.inputs.findIndex((inp) => inp && inp.name === name);
+    if (slot >= 0 && node.inputs[slot] && !node.inputs[slot].link) {
         try { node.removeInput(slot); return true; } catch (_) {}
     }
     return false;
 }
+
+/**
+ * 设置端口（输入/输出槽）的显示名。
+ * 前端绘制标签用的是 `localized_name || name`（Slot.draw），而后端 RETURN_NAMES 会把
+ * localized_name 预填成声明名；只改 name 时画布/重载后仍显示旧名。
+ */
+export function setSlotName(slot, name) {
+    if (!slot) return;
+    slot.name = name;
+    slot.localized_name = name;
+}
+
+/**
+ * 前端是否为 V3（Nodes 2.0）渲染。
+ * 先读 LiteGraph 的开关，再看文档里是否存在 comfy-node 元素——不能依赖「本节点的
+ * 某个控件是否已挂载 DOM」，否则占位端口的清理会随挂载时机不同而静默失效。
+ */
+let v3ModeCache = null;
+export function isV3NodesMode() {
+    if (v3ModeCache !== null) return v3ModeCache;
+    let v3 = false;
+    try {
+        if (window.LiteGraph && window.LiteGraph.vueNodesMode) v3 = true;
+    } catch (_) {}
+    if (!v3) {
+        try { v3 = !!document.querySelector("comfy-node"); } catch (_) {}
+    }
+    v3ModeCache = v3;
+    return v3;
+}
+
+/**
+ * 清理"名字已知"的隐藏控件占位端口（V3 下用）。签名去重：端口列表未变时零开销。
+ */
+export function prunePlaceholderPorts(node, names) {
+    if (!isV3NodesMode()) return;
+    pruneNamedPorts(node, names);
+}
+
+/**
+ * 清理"本节点所有隐藏控件"的占位端口：不依赖任何名字清单或前端版本判定。
+ * 只要控件被本节点隐藏且端口未连线，就移除——新增格式参数也不会漏（杜绝"删一个
+ * 又来一个"）。被用户显式转成输入的控件已不在 node.widgets 里，因此不会被误删。
+ */
+export function pruneHiddenWidgetPorts(node) {
+    if (!node || !Array.isArray(node.inputs) || !Array.isArray(node.widgets)) return;
+    const hidden = [];
+    for (const w of node.widgets) {
+        if (!w || !w.name) continue;
+        if (w.hidden || (w.options && w.options.hidden)) hidden.push(w.name);
+    }
+    if (hidden.length) pruneNamedPorts(node, hidden);
+}
+
+/** 移除一批名字对应的未连线输入端口；以「名字 + 端口列表」签名去重。 */
+function pruneNamedPorts(node, names) {
+    if (!node || !Array.isArray(node.inputs) || !names || !names.length) return;
+    const sig = () => `${names.join("|")}::${node.inputs.map((i) => i && i.name).join("|")}`;
+    if (sig() === node._yuanPortPruneSig) return;
+    for (const name of names) removeV3PlaceholderInput(node, name);
+    node._yuanPortPruneSig = sig();
+}
+
 
 /** 将 ComfyUI 图像 UI 条目（{filename, subfolder, type, storage}）转为 /view URL；api 为空时返回相对路径。 */
 function comfyImageEntryToUrl(entry, api) {
@@ -176,15 +240,16 @@ export function hideWidget(w) {
     w.hidden = true;
     if (!w.options) w.options = {};
     w.options.hidden = true;
-
-    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
-        w.computeSize = () => [0, -4];
-        if (!w._hiddenDrawHooked) {
-            w._origDraw = w.hasOwnProperty('draw') ? w.draw : undefined;
-            w._hiddenDrawHooked = true;
-        }
-        w.draw = () => { };
+    // 注意：不要写 w.visibility —— 它是只读 getter（内部 _visibility），
+    // 直接赋值会在严格模式抛 TypeError 并中断工作流加载；hidden 的 setter 已经同步了它。
+    // 旧画布渲染由 LiteGraph 自绘、不读 visibility：用零高度 + 空绘制达到同样效果
+    if (!w._yuanHiddenHooked) {
+        w._yuanHiddenHooked = true;
+        w._yuanOrigDraw = Object.prototype.hasOwnProperty.call(w, "draw") ? w.draw : undefined;
+        w._yuanOrigSize = w.computeSize;
     }
+    w.computeSize = () => [0, -4];
+    w.draw = () => {};
     if (w.element) w.element.style.display = "none";
 }
 
@@ -193,17 +258,14 @@ export function showWidget(w) {
     if (!w) return;
     w.hidden = false;
     if (w.options) w.options.hidden = false;
-
-    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
-        delete w.computeSize;
-        if (w._hiddenDrawHooked) {
-            if (w._origDraw !== undefined) {
-                w.draw = w._origDraw;
-            } else {
-                delete w.draw;
-            }
-            delete w._hiddenDrawHooked;
-        }
+    if (w._yuanHiddenHooked) {
+        if (w._yuanOrigDraw !== undefined) w.draw = w._yuanOrigDraw;
+        else delete w.draw;
+        if (w._yuanOrigSize) w.computeSize = w._yuanOrigSize;
+        else delete w.computeSize;
+        delete w._yuanHiddenHooked;
+        delete w._yuanOrigDraw;
+        delete w._yuanOrigSize;
     }
     if (w.element) w.element.style.display = "";
 }
