@@ -125,8 +125,10 @@ def _euler_step(state, denoised, sigma, sigma_next):
 def _resize_keyframes(cond, h, w):
     """关键帧条件的 latent 与生成网格同尺寸，这里缩放到低分辨率网格。
 
-    逐帧做空间缩放，绝不在时间维上插值；缩放后补一次逐通道逐帧均值匹配，
-    抵消 bilinear 带来的颜色漂移（低分辨率网格本就无法表达的方差不予恢复）。
+    逐帧做空间缩放，绝不在时间维上插值；缩放后补一次逐通道均值**与方差**匹配。
+    只补均值会把锚点的对比度削平（bilinear 收缩方差），低分前缀因此拿到一个
+    "均值对、锐度平"的锚点，高分收尾再把它锐回来，观感上就是锚点附近更容易
+    出硬边和高光截断；方差回填让低分锚点保持原来的能量。
     """
     out = []
     for tensor, d in cond:
@@ -153,8 +155,12 @@ def _resize_keyframes(cond, h, w):
                         lat.float(), size=(h, w), mode="bilinear", align_corners=False
                     )
                 source_mean = lat.float().mean(dim=(-2, -1), keepdim=True)
+                source_std = lat.float().std(dim=(-2, -1), keepdim=True)
                 resized_mean = resized_latent.mean(dim=(-2, -1), keepdim=True)
-                kf["latent"] = (resized_latent + (source_mean - resized_mean)).to(lat)
+                resized_std = resized_latent.std(dim=(-2, -1), keepdim=True)
+                scale = (source_std / resized_std.clamp_min(1e-4)).clamp(0.5, 2.0)
+                kf["latent"] = ((resized_latent - resized_mean) * scale
+                                + source_mean).to(lat)
             resized.append(kf)
         d["minimax_keyframes"] = resized
         out.append((tensor, d))

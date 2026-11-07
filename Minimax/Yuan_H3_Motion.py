@@ -5,6 +5,7 @@
 """
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -618,21 +619,187 @@ def _resize_guide(image, width, height):
     return samples.movedim(1, -1)
 
 
-def _encode_guide_color_neutral(vae, guide, width, height, frames):
-    """把引导帧编码为关键帧 latent，并按一次编码→解码往返测得的逐通道均值偏移做补偿。
+# ============================================================================
+# 锚点色调闭环（不动点 + 增益补偿）
+#
+# 实测（固定内容、同一 seed、本机 H3 模型 + int8_convrot VAE）：
+#   ① encode→decode 不是不动点：单次往返逐通道 DC 偏 ±0.05…0.8、对比度 −9%、
+#      亮度 −0.4%。锚点是"每段一次往返"的产物，误差逐段叠加 → 发灰/偏色。
+#   ② 锚点→输出的色调存在系统增益：实测 +2.3%/段，且几乎与 seed 无关
+#      （4 个 seed 的增益 1.0219…1.0230）。把输出色调原样当下一段锚点，
+#      亮度就按 B(n+1)≈1.023·B(n) 递推放大，高光先截断 →
+#      "画面越来越亮、白点越来越多、色彩逐步偏移"。
+#
+# 因此这里做两件事：
+#   · 往返在**像素域**逐通道 mean/std 闭环 → 每段锚点的色调等于尾段画面本身（不动点）；
+#   · 用上一段**实测增益**把锚点色调预先除掉 → 负反馈，切断 B(n+1)=g·B(n) 递推。
+# 增益是自标定的（存在同目录 tone_%05d.json 里），换模型/换 LoRA/换分辨率都会重新收敛。
+# ============================================================================
 
-    只补偿均值（DC），避免全量相减引入锐化；往返结果尺寸不符时跳过补偿直接编码。
+# 往返后色调回归次数（每次 = encode + decode + 像素域预补偿）
+TONE_CLOSURES = max(1, int(os.environ.get("YUAN_H3_TONE_CLOSURES", "1")))
+# 单次闭环允许的最大修正量，防止偶发极端画面把锚点拉飞
+TONE_MEAN_LIMIT = 0.06
+# 单次闭环允许的最大修正量。目标色调本身已被「参考带」限死，这里只防止
+# 极端画面（大片纯黑/纯白）让校正量爆掉，因此给得比较宽。
+TONE_MEAN_LIMIT = 0.25
+TONE_STD_LIMIT = 0.60
+# 锚点色调相对「链首参考」的硬边界：均值 ±0.04、对比度 ±20%。
+# 这是有界性的保证——不管模型增益多大，锚点色调都出不了这个带，
+# 链条就不会逐段发散（白点越滚越多 / 越来越暗）。
+TONE_DRIFT_MEAN = max(0.0, float(os.environ.get("YUAN_H3_TONE_LIMIT", "0.04")))
+TONE_DRIFT_STD = max(0.0, float(os.environ.get("YUAN_H3_TONE_LIMIT_STD", "0.20")))
+# 带内的跟随比例（1.0 = 完全跟随上一段，0 = 顶死在链首参考）。
+TONE_PULL = min(1.0, max(0.0, float(os.environ.get("YUAN_H3_TONE_PULL", "0.6"))))
+
+
+def _tone_stats(pix):
+    """逐通道 (mean, std)。pix: [...,3] 像素，任意前导维。"""
+    x = pix.float().reshape(-1, 3)
+    return x.mean(0), x.std(0)
+
+
+def _tone_match(pix, mean, std):
+    """逐通道把 pix 的 mean/std 拉到目标值（幅度夹取，结果裁到 [0,1]）。"""
+    x = pix.float()
+    mu, sd = _tone_stats(x)
+    scale = (std.to(x) / sd.clamp_min(1e-4)).clamp(
+        1.0 - TONE_STD_LIMIT, 1.0 + TONE_STD_LIMIT)
+    shift = (mean.to(x) - mu).clamp(-TONE_MEAN_LIMIT, TONE_MEAN_LIMIT)
+def _tone_target(src, ref, pull=None, limit=None, relative=False):
+    """锚点目标色调 = 链首参考 + pull·(本段源色调 − 参考)，再夹进硬边界。
+
+    两层保护：
+      · pull<1：带内只跟随一部分，抑制 锚点→输出 的增益放大；
+      · limit：无论模型增益多大，锚点色调都出不了 ref±limit，
+        因此链条**有界**（不会像原样回喂那样逐段变亮、白点越滚越多）。
+    relative=True 时按比例夹取（用于对比度 std）。ref 缺失时原样返回源色调。
     """
-    latent = vae.encode(guide.contiguous())
-    rendered = vae.decode(latent)
-    if rendered.ndim == 5:
-        rendered = rendered[0]
-    if (rendered.ndim == 4 and int(rendered.shape[0]) == frames
-            and tuple(rendered.shape[1:3]) == (height, width)):
-        bias = (rendered.to(guide) - guide).mean(dim=(0, 1, 2), keepdim=True)
-        guide = (guide - bias).clamp(0.0, 1.0)
-        latent = vae.encode(guide.contiguous())
-    return latent
+    if ref is None:
+        return src
+    r = ref.to(src)
+    pull = TONE_PULL if pull is None else float(pull)
+    out = r + pull * (src - r)
+    lim = (TONE_DRIFT_STD if relative else TONE_DRIFT_MEAN) if limit is None else float(limit)
+    if relative:
+        return out.clamp(min=r * (1.0 - lim), max=r * (1.0 + lim))
+    return out.clamp(min=r - lim, max=r + lim)
+
+
+def _encode_anchor_pixels(vae, pixels, target_mean, target_std, closures=None):
+    """像素 → 锚点 latent：把 **decode(锚点)** 的色调钉在目标上（往返的不动点）。
+
+    关键在"预补偿"：一次 encode 之后 decode 出来还会再漂 δ，所以要把 δ 先减去。
+      r   = decode(encode(p))            ← 算子作用一次的结果
+      p'  = p − (tone(r) − target)       ← 把漂移反向加回输入
+      z   = encode(p')                   ← 于是 tone(decode(z)) ≈ target
+    校正只用到逐通道标量统计量，不要求 r 与 p 逐像素对应（H3 VAE 解码帧数
+    可能与输入帧数不同，此时按统计量校正依然成立）。
+    返回 (latent, 实测色调)。
+    """
+    closures = TONE_CLOSURES if closures is None else max(1, int(closures))
+    p = pixels.float().contiguous()
+    z = None
+    for _ in range(closures):
+        z = vae.encode(p)
+        rendered = vae.decode(z)
+        if rendered.ndim == 5:
+            rendered = rendered[0]
+        if rendered.ndim != 4 or int(rendered.shape[-1]) < 3:
+            return z, _tone_stats(p)   # 形状无法解读：退回单次编码
+        rendered = rendered[..., :3]
+        pm, ps = _tone_stats(p)
+        rm, rs = _tone_stats(rendered)
+        want_mean = pm + (target_mean.to(pm) - rm).clamp(
+            -TONE_MEAN_LIMIT, TONE_MEAN_LIMIT)
+        want_std = ps * (target_std.to(ps) / rs.clamp_min(1e-4)).clamp(
+            1.0 - TONE_STD_LIMIT, 1.0 + TONE_STD_LIMIT)
+        p = ((p - pm) * (want_std / ps.clamp_min(1e-4)).to(p)
+             + want_mean.to(p)).clamp(0.0, 1.0)
+    z = vae.encode(p)
+    return z, _tone_stats(p)
+
+
+def _encode_guide_color_neutral(vae, guide, width, height, frames,
+                                target_mean=None, target_std=None):
+    """把引导帧编码为关键帧 latent，并对往返漂移做逐通道 mean/std 闭环。
+
+    target_* 给出锚点应有的色调（比例控制的输出）；缺省时等于引导帧自身色调。
+    返回 (latent, 实测色调)。
+    """
+    src_mean, src_std = _tone_stats(guide)
+    tm = src_mean if target_mean is None else target_mean.to(src_mean)
+    ts = src_std if target_std is None else target_std.to(src_std)
+    latent, used = _encode_anchor_pixels(vae, guide, tm, ts)
+    _mc_debug("tone.pixels", frames=frames,
+              src_mean=tuple(round(float(v), 4) for v in src_mean),
+              target_mean=tuple(round(float(v), 4) for v in tm),
+              used_mean=tuple(round(float(v), 4) for v in used[0]),
+              src_std=tuple(round(float(v), 4) for v in src_std),
+              used_std=tuple(round(float(v), 4) for v in used[1]),
+              pull=TONE_PULL)
+    return latent, used
+
+
+def _tone_state_path(存储位置, 片段序号):
+    """锚点色调状态文件：{输出}/{存储位置}/tone_%05d.json（按片段序号命名）。"""
+    loc = (存储位置 or "").strip().strip('"').strip("'") or "H3-Mubu"
+    return os.path.join(folder_paths.get_output_directory(), loc,
+                        "tone_%05d.json" % int(片段序号))
+
+
+def _tone_state_load(存储位置, 片段序号):
+    """读上一段保存的链首参考与锚点实测色调；缺失/损坏返回四个 None。
+
+    返回 (ref_mean, ref_std, last_anchor_mean, last_anchor_std)：
+    前两项是整条链共用的参考色调，后两项只用于诊断（对比模型实际增益）。
+    """
+    try:
+        path = _tone_state_path(存储位置, 片段序号)
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return (torch.tensor(d["ref_mean"], dtype=torch.float32),
+                torch.tensor(d["ref_std"], dtype=torch.float32),
+                torch.tensor(d["anchor_mean"], dtype=torch.float32),
+                torch.tensor(d["anchor_std"], dtype=torch.float32))
+    except Exception:
+        return None, None, None, None
+
+
+def _tone_state_save(存储位置, 片段序号, ref, tone_used, tone_src):
+    """记下链首参考、本段喂入锚点的实测色调与本段源色调。失败不影响出图。"""
+    try:
+        path = _tone_state_path(存储位置, 片段序号)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".%d.tmp" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"segment": int(片段序号),
+                       "pull": TONE_PULL,
+                       "ref_mean": [float(v) for v in ref[0]],
+                       "ref_std": [float(v) for v in ref[1]],
+                       "anchor_mean": [float(v) for v in tone_used[0]],
+                       "anchor_std": [float(v) for v in tone_used[1]],
+                       "src_mean": [float(v) for v in tone_src[0]],
+                       "src_std": [float(v) for v in tone_src[1]]}, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        _mc_debug("tone.state.write_failed", err=repr(e))
+
+
+def _tone_reference(tone_src, ref_mean, ref_std):
+    """链首参考：首段（无历史状态）就用本段源色调当参考。
+
+    另外做一次"失效"判定：源色调离参考超过 3 个带宽（换模型/跨链残留/场景整段
+    换光）时重新起基线，避免旧参考把新链条硬拽回上一部的色调。
+    """
+    if ref_mean is None or ref_std is None:
+        return tone_src
+    if float((tone_src[0] - ref_mean.to(tone_src[0])).abs().max()) > 3.0 * max(
+            TONE_DRIFT_MEAN, 1e-3):
+        _mc_debug("tone.ref.reset", src=tuple(round(float(v), 4) for v in tone_src[0]),
+                  old=tuple(round(float(v), 4) for v in ref_mean))
+        return tone_src
+    return ref_mean, ref_std
 
 
 def _tail_audio_latent(audio_vae, waveform, sample_rate, frames):
@@ -994,6 +1161,13 @@ def _context_latent_fingerprint(存储位置, 片段序号, 手动上传, 潜空
     try:
         fp = _dir_fingerprint(_build_latent_load_path(存储位置)
                               if 潜空间模式 else _build_load_path(存储位置))
+        # 锚点色调状态（tone_<上一段>.json）也参与计算：它一变锚点就变，
+        # 不纳入指纹会让"清了状态却命中缓存"的情况继续用旧锚点。
+        try:
+            st = os.stat(_tone_state_path(存储位置, int(片段序号) - 1))
+            fp += "|tone:%d:%d" % (st.st_mtime_ns, st.st_size)
+        except Exception:
+            fp += "|tone:none"
     except Exception:
         return float("NaN")
     # 目录缺失时改扫 output 目录下的实际文件取指纹
@@ -1098,9 +1272,23 @@ def _save_av_latent(latent, 存储位置, 片段序号):
                        "audio_converted": "0"})
 
 
-def _roundtrip_video_latent(latent, VAE, what="锚点"):
+def _decode_video_latent(video, VAE, what="锚点"):
+    """把视频 latent 解成像素 [T,H,W,3]，并校验形状（供锚点色调闭环用）。"""
+    with torch.no_grad():
+        pix = VAE.decode(video)
+    if pix.ndim == 5:
+        pix = pix[0]
+    return pix.float()
+
+
+def _roundtrip_video_latent(latent, VAE, what="锚点", target_mean=None,
+                            target_std=None, tone_out=None, closures=None):
     """把视频流经 VAE 往返（decode→encode），使锚点成为 vae.encode 的产物；
     音视频关键帧条件只认这种 latent，直接喂采样器输出会被时间平均而发虚。
+
+    往返不是不动点（见文件头部「锚点色调闭环」注释），所以这里在像素域把
+    decode(锚点) 的逐通道 mean/std 钉到 target_*（缺省 = 源画面自身色调）。
+    tone_out 传入列表可回收实测色调。
     """
     if VAE is None:
         raise ValueError(
@@ -1110,11 +1298,15 @@ def _roundtrip_video_latent(latent, VAE, what="锚点"):
         video, audio = _split_av_streams(latent)
     else:
         video, audio = latent, None
-    with torch.no_grad():
-        pix = VAE.decode(video)
-        if pix.ndim == 5:
-            pix = pix[0]
-        z = VAE.encode(pix.contiguous())
+    pix = _decode_video_latent(video, VAE, what)
+    tone_src = _tone_stats(pix)
+    z, tone_used = _encode_guide_color_neutral(
+        VAE, pix, int(pix.shape[2]), int(pix.shape[1]), int(pix.shape[0]),
+        target_mean, target_std)
+    if tone_out is not None:
+        tone_out.append(tone_used)
+    if tone_out is not None:
+        tone_out.append(tone_used)
     if int(z.ndim) != 5 or int(z.shape[2]) != int(video.shape[2]):
         raise ValueError(
             "h3_motion_context: %s经 VAE 往返后由 %d 步变成 %s，无法逐块对齐；"
@@ -1126,6 +1318,11 @@ def _roundtrip_video_latent(latent, VAE, what="锚点"):
             "h3_motion_context: %s经 VAE 往返后通道数由 %d 变成 %d；"
             "连接的 VAE 与上一片段不是同一模型。" % (what, int(video.shape[1]),
                                               int(z.shape[1])))
+    _mc_debug("tone.latent", what=what,
+              src_mean=tuple(round(float(v), 4) for v in tone_src[0]),
+              used_mean=tuple(round(float(v), 4) for v in tone_used[0]),
+              src_std=tuple(round(float(v), 4) for v in tone_src[1]),
+              used_std=tuple(round(float(v), 4) for v in tone_used[1]))
     if not isinstance(latent, dict):
         return z
     samples = latent["samples"]
@@ -1499,8 +1696,9 @@ class Yuan_H3MotionContext:
                 % (g, frame_count))
 
         # 引导帧：取尾部 g 帧，按官方 Add Guide 同款 center 裁剪缩放到
-        # 本片段分辨率，经视频 VAE 编码为关键帧 latent（编码时做逐通道均值
-        # 往返偏色闭环补偿，切断链条逐段累积的发黄漂移）
+        # 本片段分辨率，经视频 VAE 编码为关键帧 latent。
+        # 编码走「锚点色调闭环」：像素域逐通道 mean/std 钉回引导帧自身色调，
+        # 并按上一段实测增益预除（切断 锚点→输出 的 +2.3%/段 递推）。
         guide = _resize_guide(pixels[available - g:], width, height)
         if width % 16 or height % 16:
             raise ValueError(
@@ -1512,10 +1710,18 @@ class Yuan_H3MotionContext:
                 "h3_motion_context: 「视频图像」衔接模式需要连接 VAE（H3 视频"
                 "VAE）以编码引导画面；若要跳过解码/重编码请把「衔接模式」"
                 "改为「潜空间」。")
+        # 色调闭环：链首参考 + 比例回拉 → 目标色调（切断 锚点→输出 的递推）
+        seg_idx = int(片段序号)
+        ref_mean, ref_std, last_mean, last_std = _tone_state_load(
+            存储位置, seg_idx - 1)
+        tone_src = _tone_stats(guide)
+        ref = _tone_reference(tone_src, ref_mean, ref_std)
+        target_mean = _tone_target(tone_src[0], ref[0])
+        target_std = _tone_target(tone_src[1], ref[1], relative=True)
         try:
-            keyframe = {"resolved_frame_index": 0,
-                        "latent": _encode_guide_color_neutral(
-                            VAE, guide, width, height, g)}
+            guide_latent, guide_tone = _encode_guide_color_neutral(
+                VAE, guide, width, height, g, target_mean, target_std)
+            keyframe = {"resolved_frame_index": 0, "latent": guide_latent}
         except RuntimeError as e:
             raise RuntimeError(
                 "h3_motion_context: VAE 编码引导片段失败。\n"
@@ -1559,6 +1765,10 @@ class Yuan_H3MotionContext:
                 z = z[..., :track_steps].clone()
             keyframe["audio_latent"] = z
 
+        # 落盘：链首参考（首段即本段源色调）+ 本段实测锚点色调，供下一段回拉
+        _tone_state_save(存储位置, seg_idx, ref, guide_tone, tone_src)
+        hint += "；色调回拉 %.0f%%" % (100.0 * TONE_PULL)
+
         # 裁剪量：覆盖画面引导窗与音频窗的较大值——音频窗比画面窗长时只裁
         # 画面窗会让固定音频泄漏进交付部分
         cut = max(g, a)
@@ -1585,11 +1795,11 @@ class Yuan_H3MotionContext:
     def _apply_latent(self, 条件化, 潜空间, 启用上下文, 模式, 存储位置, 片段序号,
                       上下文长度, 音频上下文长度, 衔接余量, audio_vae, VAE,
                       上下文潜空间, 手动上传):
-        """潜空间衔接：从上一片段的 AV 潜空间切片，再做一次 VAE 转化后作为锚点。
+        """潜空间衔接：从上一片段 AV 潜空间切片，经色调闭环转化后作为锚点。
 
-        切片本身仍跳过像素文件与裁切/缩放（.safetensors 直读、整 VRF 组对齐），
-        但锚点必须经 decode→encode 归一到关键帧条件的 latent 空间，与「视频图像」
-        路径同源；内部锚点与关键帧/引用共存由布局、载荷两补丁支持。
+        切片对齐整 VRF 组后直接取 latent；锚点必须经 decode→encode 归一到关键帧
+        条件认的 latent 空间，并在此做色调闭环（往返不动点 + 参考带内的比例回拉），
+        与「视频图像」路径同源；内部锚点与关键帧/引用共存由布局、载荷两补丁支持。
         """
         if not 启用上下文:
             # 直通：尾段保存长度固定一个整组（17 帧）
@@ -1681,15 +1891,46 @@ class Yuan_H3MotionContext:
         blocks, covered = _video_tail_from_latent(上下文潜空间, n)
         span = covered
         # 锚点须是 vae.encode 的产物：「H3 运动裁剪」存盘时已转化（v2），
-        # 只有旧文件或端口直连的未转化潜空间才在这里补一次。
+        # 只有旧文件或端口直连的未转化潜空间才需要额外的往返。
         converted = (isinstance(上下文潜空间, dict)
                      and bool(上下文潜空间.get(CONTEXT_LATENT_CONVERTED)))
-        if not converted:
-            _video_rt = _roundtrip_video_latent(
-                torch.cat(blocks, dim=2), VAE, what="「潜空间」模式的锚点")
-            blocks = [_video_rt[:, :, k:k + 1].clone()
-                      for k in range(int(_video_rt.shape[2]))]
-            del _video_rt
+        # 色调闭环：无论是否已转化都要过一遍——锚点必须与尾段画面同色调，
+        # 且要按比例回拉到链首参考，否则 锚点→输出 的增益会逐段放大。
+        # 解码整段后一次做完，再按潜空间步逐块切回，相位不变。
+        # VAE 未连接时（本模式允许）退回原路径：已转化的 latent 直接使用，
+        # 未转化的由 _roundtrip_video_latent 抛出明确报错。
+        seg_idx = int(片段序号)
+        ref_mean, ref_std, last_mean, last_std = _tone_state_load(
+            存储位置, seg_idx - 1)
+        if VAE is None:
+            if not converted:
+                _video_rt = _roundtrip_video_latent(
+                    torch.cat(blocks, dim=2), VAE, what="「潜空间」模式的锚点")
+                blocks = [_video_rt[:, :, k:k + 1].clone()
+                          for k in range(int(_video_rt.shape[2]))]
+                del _video_rt
+            tone_note = "；未连接 VAE，跳过色调闭环"
+        else:
+            with torch.no_grad():
+                _tail_video = torch.cat(blocks, dim=2)
+                _pix_src = _decode_video_latent(_tail_video, VAE, "「潜空间」模式的锚点")
+                _tone_src = _tone_stats(_pix_src)
+                _ref = _tone_reference(_tone_src, ref_mean, ref_std)
+                _anchor, guide_tone = _encode_guide_color_neutral(
+                    VAE, _pix_src, int(_pix_src.shape[2]), int(_pix_src.shape[1]),
+                    int(_pix_src.shape[0]),
+                    _tone_target(_tone_src[0], _ref[0]),
+                    _tone_target(_tone_src[1], _ref[1], relative=True))
+            if int(_anchor.shape[2]) != int(_tail_video.shape[2]):
+                raise ValueError(
+                    "h3_motion_context: 「潜空间」模式的锚点经往返后由 %d 步变成 %d 步，"
+                    "无法逐块对齐；请确认 VAE 端口连接的是 H3 视频 VAE。"
+                    % (int(_tail_video.shape[2]), int(_anchor.shape[2])))
+            blocks = [_anchor[:, :, k:k + 1].clone()
+                      for k in range(int(_anchor.shape[2]))]
+            del _tail_video, _pix_src, _anchor
+            _tone_state_save(存储位置, seg_idx, _ref, guide_tone, _tone_src)
+            tone_note = "；色调回拉 %.0f%%" % (100.0 * TONE_PULL)
         # 时间坐标用目标片段自己的 token 网格（0/1/5/9/13 帧位），与「视频图像」一致
         indices = [_pixel_frames(k) for k in range(len(blocks))]
         _mc_debug("context.latent", frames=n, steps=len(blocks),
@@ -1746,6 +1987,7 @@ class Yuan_H3MotionContext:
         if margin > 0:
             hint += ("；余量 %d 帧会在拼接处跳过（%.2fs）"
                      % (margin, margin / float(FPS)))
+        hint += tone_note
         return {"result": (out, trim_str), "ui": {"h3_hint": hint}}
 
     @classmethod
