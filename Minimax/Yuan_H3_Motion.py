@@ -731,13 +731,6 @@ def _encode_guide_color_neutral(vae, guide, width, height, frames,
     tm = src_mean if target_mean is None else target_mean.to(src_mean)
     ts = src_std if target_std is None else target_std.to(src_std)
     latent, used = _encode_anchor_pixels(vae, guide, tm, ts)
-    _mc_debug("tone.pixels", frames=frames,
-              src_mean=tuple(round(float(v), 4) for v in src_mean),
-              target_mean=tuple(round(float(v), 4) for v in tm),
-              used_mean=tuple(round(float(v), 4) for v in used[0]),
-              src_std=tuple(round(float(v), 4) for v in src_std),
-              used_std=tuple(round(float(v), 4) for v in used[1]),
-              pull=TONE_PULL)
     return latent, used
 
 
@@ -782,8 +775,8 @@ def _tone_state_save(存储位置, 片段序号, ref, tone_used, tone_src):
                        "src_mean": [float(v) for v in tone_src[0]],
                        "src_std": [float(v) for v in tone_src[1]]}, f)
         os.replace(tmp, path)
-    except Exception as e:
-        _mc_debug("tone.state.write_failed", err=repr(e))
+    except Exception:
+        pass
 
 
 def _tone_reference(tone_src, ref_mean, ref_std):
@@ -796,8 +789,6 @@ def _tone_reference(tone_src, ref_mean, ref_std):
         return tone_src
     if float((tone_src[0] - ref_mean.to(tone_src[0])).abs().max()) > 3.0 * max(
             TONE_DRIFT_MEAN, 1e-3):
-        _mc_debug("tone.ref.reset", src=tuple(round(float(v), 4) for v in tone_src[0]),
-                  old=tuple(round(float(v), 4) for v in ref_mean))
         return tone_src
     return ref_mean, ref_std
 
@@ -964,13 +955,6 @@ CONTEXT_CLIP_INDEX_KEY = "_h3_motion_context_clip_index"
 # 运动上下文在应用前补一次转化
 CONTEXT_LATENT_CONVERTED = "_h3_motion_context_video_converted"
 
-
-def _mc_debug(tag, **kv):
-    """YUAN_H3_MC_DEBUG=1 时打印衔接几何，供两条路径逐项对比。"""
-    if os.environ.get("YUAN_H3_MC_DEBUG", "0") != "1":
-        return
-    print("[h3_motion_context] %s %s"
-          % (tag, " ".join("%s=%s" % (k, v) for k, v in kv.items())), flush=True)
 
 # 尾段媒体文件名约定：存储位置目录下 clip_%05d.mp4（片段序号 2 → clip_00002.mp4）
 CLIP_FILE_PREFIX = "clip"
@@ -1318,11 +1302,6 @@ def _roundtrip_video_latent(latent, VAE, what="锚点", target_mean=None,
             "h3_motion_context: %s经 VAE 往返后通道数由 %d 变成 %d；"
             "连接的 VAE 与上一片段不是同一模型。" % (what, int(video.shape[1]),
                                               int(z.shape[1])))
-    _mc_debug("tone.latent", what=what,
-              src_mean=tuple(round(float(v), 4) for v in tone_src[0]),
-              used_mean=tuple(round(float(v), 4) for v in tone_used[0]),
-              src_std=tuple(round(float(v), 4) for v in tone_src[1]),
-              used_std=tuple(round(float(v), 4) for v in tone_used[1]))
     if not isinstance(latent, dict):
         return z
     samples = latent["samples"]
@@ -1786,9 +1765,6 @@ class Yuan_H3MotionContext:
             条件化, {"minimax_keyframes": keyframes})
         if a > 0:
             hint += "（含音频）"
-        _mc_debug("context.image", guide_frames=g, audio_frames=a, cut=cut,
-                  keyframes=len(keyframes), guide_shape=tuple(guide.shape),
-                  latent_frames=frame_count)
         return {"result": (out, "1:%d" % cut), "ui": {
             "h3_hint": hint}}
 
@@ -1933,9 +1909,6 @@ class Yuan_H3MotionContext:
             tone_note = "；色调回拉 %.0f%%" % (100.0 * TONE_PULL)
         # 时间坐标用目标片段自己的 token 网格（0/1/5/9/13 帧位），与「视频图像」一致
         indices = [_pixel_frames(k) for k in range(len(blocks))]
-        _mc_debug("context.latent", frames=n, steps=len(blocks),
-                  declared=indices, trim=trim_frames, converted=converted,
-                  block=tuple(blocks[0].shape))
         # 追加到已有 keyframes（而非整表替换），可与其他关键帧节点混用
         existing_keyframes = list(条件化[0][1].get("minimax_keyframes", []))
         keyframes = existing_keyframes + [
@@ -2215,8 +2188,6 @@ class Yuan_H3MotionContextTrim:
             _tail_latent = _roundtrip_video_latent(
                 _tail_portion_latent(out, tail), VAE, what="尾段锚点")
             _save_av_latent(_tail_latent, 存储位置, 片段序号)
-            _mc_debug("trim.latent", n=n, tail=tail, total=total,
-                      removed_px=removed, removed_steps=k, audio_cut=audio_cut)
             del _tail_latent
         return out
 

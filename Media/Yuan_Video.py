@@ -1,6 +1,5 @@
 """Yuan 加载视频节点：内置预览、时间轴裁剪、镜头智能分段与裁剪框交互。"""
 
-import logging
 import os
 import gc
 import asyncio
@@ -23,8 +22,6 @@ from ..Yuan_common import (
     save_json_cache,
     video_duration,
 )
-
-LOGGER = logging.getLogger("Yuan.Video")
 
 # 自定义 API 路由：从系统任意路径读取视频/音频/图片，供前端预览
 _VIEW_ALLOWED_EXTS = (
@@ -749,9 +746,8 @@ class YuanVideoUI:
                     waveform = waveform.unsqueeze(0)
                     audio_dict = {"waveform": waveform, "sample_rate": sample_rate}
 
-            except Exception as exc:
-                # 音频流提取失败时不影响主流程，但要留下痕迹，否则用户只会看到静音输出
-                LOGGER.warning("视频音频流提取失败，节点将输出静音：%s", exc)
+            except Exception:
+                pass
 
         # 正常路径显式关闭容器；异常路径由 PyAV 容器对象的析构（refcount 归零）释放
         container.close()

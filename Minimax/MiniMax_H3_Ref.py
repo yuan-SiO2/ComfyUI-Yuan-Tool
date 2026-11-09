@@ -23,7 +23,6 @@ extra_conds 取走，在 PackedLayout 里排到 text 之后、目标 video/audio
 """
 
 import hashlib
-import logging
 import math
 import os
 
@@ -61,8 +60,6 @@ REF_SIZE_MATCH = "匹配"
 REF_SIZE_MAX = "最大"
 CACHE_DISK = "磁盘"
 CACHE_OFF = "关闭"
-
-LOG = "[MiniMaxH3Ref]"
 
 
 # --------------------------------------------------------------------------- 磁盘缓存
@@ -137,12 +134,10 @@ def _cache_load(key):
         if not os.path.isfile(path):
             return None
         bundle = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:  # 目录不可写、文件损坏、torch 版本没有 weights_only……
-        logging.warning("%s 参考嵌入缓存不可读（%s），改为重新编码", LOG, exc)
+    except Exception:  # 目录不可写、文件损坏、torch 版本没有 weights_only……
         return None
     if not isinstance(bundle, dict) or bundle.get("version") != BUNDLE_VERSION:
         return None
-    logging.info("%s 参考嵌入磁盘缓存命中 %s", LOG, key[:12])
     return bundle
 
 
@@ -153,9 +148,7 @@ def _cache_store(key, bundle):
         tmp = path + ".tmp"
         torch.save(bundle, tmp)
         os.replace(tmp, path)
-        logging.info("%s 参考嵌入写入磁盘缓存 %s", LOG, key[:12])
-    except Exception as exc:
-        logging.warning("%s 缓存写入失败：%s", LOG, exc)
+    except Exception:
         if tmp and os.path.exists(tmp):
             try:
                 os.remove(tmp)
@@ -408,9 +401,6 @@ class YuanMiniMaxH3RefEmbeds:
 
         bundle = _build_bundle(match_mode, match_width, match_height, vae, audio_vae,
                                ref_images, videos, audios)
-        logging.info("%s 参考嵌入编码完成：%d 个呈现项 / 块 %s / 条件行约 %d", LOG,
-                     bundle["info"]["items"], bundle["info"]["blocks"],
-                     bundle["info"]["condition_rows"])
         if key is not None:
             _cache_store(key, bundle)
         return (_bundle_to_device(bundle),)
@@ -449,14 +439,11 @@ class YuanMiniMaxH3RefToVideo:
 
     def generate(self, clip, refs, prompt, width, height, length):
         latent, frame_count = _empty_av_latent(width, height, length)
-        _log_target(length, frame_count, latent)
         bundle = _prepare(refs)
         items = [_copy_item(item) for item in bundle["ref_items"]]
         blocks = [dict(block) for block in bundle["ref_blocks"]]
 
-        dropped = _trim_items(items, blocks, frame_count)
-        if dropped:
-            logging.info("%s 参考视频超出目标时长，按 17k+5 网格裁掉 %d 帧", LOG, dropped)
+        _trim_items(items, blocks, frame_count)
 
         # 送进分词器的只有呈现信息（type / data / timestamps），块下标是本插件内部用的
         presented = [{key: value for key, value in item.items() if key != "block"} for item in items]
@@ -465,16 +452,6 @@ class YuanMiniMaxH3RefToVideo:
         if blocks:
             cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": blocks})
         return (cond, latent)
-
-
-def _log_target(length, frame_count, latent):
-    """把目标时长换算打进日志：帧数被对齐、latent 形状不对，一眼就能看出来。"""
-    streams = latent["samples"].tensors
-    logging.info("%s 目标时长 length=%d → %d 帧 / %.3f 秒 @24fps，视频 latent %s，音频 latent %s",
-                 LOG, length, frame_count, frame_count / FPS, tuple(streams[0].shape),
-                 tuple(streams[1].shape))
-    if frame_count != length:
-        logging.info("%s length=%d 不在 17k+5 网格上，已向上对齐到 %d 帧", LOG, length, frame_count)
 
 
 def _prepare(refs):

@@ -5,7 +5,6 @@
 
 from functools import partial
 import inspect
-import logging
 import math
 
 import torch
@@ -15,8 +14,6 @@ from comfy.ldm.minimax.model import PackedLayout
 import comfy.model_base
 import comfy.patcher_extension
 import comfy.sampler_helpers
-
-_LOGGER = logging.getLogger(__name__)
 
 
 def _regions(length, tile_count=2):
@@ -126,8 +123,6 @@ def _tiled_forward(executor, streams, timestep, context, transformer_options, mi
         try:
             payload = _tile_payload(minimax_payload or {}, context, video, audio, axis, start, end)
         except Exception:
-            # 构造失败时退回整帧前向并告警
-            _LOGGER.warning("H3 高分辨率分块构造失败，已退回整帧前向", exc_info=True)
             return executor(streams, timestep, context, transformer_options,
                             minimax_payload=minimax_payload, **kwargs)
         tile = video.narrow(axis, start, end - start).contiguous()

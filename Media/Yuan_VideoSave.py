@@ -9,7 +9,6 @@ from __future__ import annotations
 import datetime
 import glob
 import json
-import logging
 import math
 import os
 import re
@@ -29,7 +28,6 @@ from server import PromptServer
 import folder_paths
 from comfy.utils import ProgressBar
 
-LOGGER = logging.getLogger("Yuan.VideoSave")
 ENCODE_ARGS = ("utf-8", "backslashreplace")
 
 VIDEO_FORMAT_FOLDER = "Yuan_video_formats"
@@ -350,9 +348,6 @@ def _ffmpeg_path():
 
     candidates = list(dict.fromkeys(candidates))
     if not candidates:
-        LOGGER.error(
-            "未找到 FFmpeg，视频格式将无法使用。请安装 imageio-ffmpeg 或把 FFmpeg 加入系统 PATH。"
-        )
         return None
     if len(candidates) == 1:
         return candidates[0]
@@ -429,8 +424,7 @@ def _read_format_file(path: str):
         with open(path, "r", encoding="utf-8") as stream:
             data = json.load(stream)
         return data if isinstance(data, dict) else None
-    except Exception as exc:
-        LOGGER.warning("读取视频格式文件失败：%s；%s", path, exc)
+    except Exception:
         return None
 
 
@@ -449,8 +443,8 @@ def _collect_format_files() -> dict:
             path = folder_paths.get_full_path(VIDEO_FORMAT_FOLDER, name)
             if path:
                 files[os.path.splitext(os.path.basename(name))[0]] = path
-    except Exception as exc:
-        LOGGER.warning("读取自定义视频格式目录失败：%s", exc)
+    except Exception:
+        pass
 
     return files
 
@@ -472,7 +466,6 @@ def _build_format_records():
         if video_format is None:
             continue
         if "gifski_pass" in video_format and _gifski_path() is None:
-            LOGGER.info("未检测到 Gifski，已隐藏格式：%s", stem)
             continue
 
         label = FORMAT_LABELS.get(stem, stem)
@@ -483,7 +476,6 @@ def _build_format_records():
         try:
             widgets = [list(widget) for widget in list(_iterate_format(video_format))]
         except Exception as exc:
-            LOGGER.warning("解析视频格式失败：%s；%s", stem, exc)
             continue
 
         records.append(
@@ -613,7 +605,6 @@ def apply_format_widgets(record, kwargs):
         if name not in kwargs:
             default = _default_widget_value(widget)
             kwargs[name] = default
-            LOGGER.warning("输出格式参数“%s”缺失，已使用默认值：%s", name, default)
 
     iterator = _iterate_format(video_format, False)
     for value in iterator:
@@ -714,7 +705,6 @@ def ffmpeg_process(frame_data, args, video_format, video_metadata, file_path, en
                 + metadata_args
             )
         except Exception as exc:
-            LOGGER.warning("写入视频元数据失败，将跳过元数据：%s", exc)
             metadata_path = None
 
     total_frames = 0
@@ -769,8 +759,6 @@ def ffmpeg_process(frame_data, args, video_format, video_metadata, file_path, en
             f"返回码：{return_code}\n"
             f"FFmpeg 信息：\n{error_text[-4000:]}"
         )
-    if error_text.strip():
-        LOGGER.info("FFmpeg 输出信息：%s", error_text.strip()[-2000:])
     return total_frames
 
 
@@ -1088,8 +1076,6 @@ class YuanVideoSave:
             音频 = 音频[0] if 音频 else None
 
         if record["kind"] == "image":
-            if 音频 is not None:
-                LOGGER.warning("动图输出格式不支持音频，已忽略“音频”输入。")
             image_kwargs = {}
             if record["extension"] == "gif":
                 image_kwargs["disposal"] = 2
@@ -1170,7 +1156,6 @@ class YuanVideoSave:
 
                 frames = map(pad_frame, frames)
                 dimensions = (image_width + pad_x, image_height + pad_y)
-                LOGGER.warning("图像尺寸不符合编码器要求，已自动补边到 %s×%s。", *dimensions)
             else:
                 dimensions = (image_width, image_height)
             preview_width, preview_height = dimensions
@@ -1259,11 +1244,6 @@ class YuanVideoSave:
                         capture_output=True,
                         check=True,
                     )
-                    if pre_pass_result.stderr:
-                        LOGGER.info(
-                            "预编码信息：%s",
-                            pre_pass_result.stderr.decode(*ENCODE_ARGS)[-2000:],
-                        )
                 except subprocess.CalledProcessError as exc:
                     raise RuntimeError(
                         "FFmpeg 预编码失败：\n"
@@ -1327,7 +1307,6 @@ class YuanVideoSave:
                 media_files.append(file_path)
 
             if "%03d" in str(video_format.get("extension", "")) and 音频 is not None:
-                LOGGER.warning("图像序列格式无法混入音频，已忽略“音频”输入。")
                 音频 = None
 
             audio_waveform = None
@@ -1346,7 +1325,6 @@ class YuanVideoSave:
                 )
                 audio_pass = video_format.get("audio_pass")
                 if not audio_pass:
-                    LOGGER.warning("所选视频格式没有专用音频编码器，已改用默认音频编码。")
                     audio_pass = (
                         ["-c:a", "aac"]
                         if video_format["extension"] in ("mp4", "mov")
@@ -1414,11 +1392,6 @@ class YuanVideoSave:
                         capture_output=True,
                         check=True,
                     )
-                    if mux_result.stderr:
-                        LOGGER.info(
-                            "音频混流信息：%s",
-                            mux_result.stderr.decode(*ENCODE_ARGS)[-2000:],
-                        )
                 except subprocess.CalledProcessError as exc:
                     if not mux_existed and os.path.exists(output_file_with_audio_path):
                         try:
