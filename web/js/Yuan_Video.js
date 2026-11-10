@@ -1,0 +1,2201 @@
+/** Yuan Tool · 加载视频前端：为 Yuan_VideoUI 节点提供视频预览、时间轴裁剪、镜头智能分段与裁剪框交互 UI。 */
+import { findComfyNodeEl, enforceV3MinSize, prunePlaceholderPorts, getApi, hideWidget, showWidget, uploadChunked } from "./Yuan_Common.js";
+
+const { app } = window.comfyAPI.app;
+
+/** UI 托管参数：widget 值由 DOM UI 驱动并隐藏，V3 下需移除其空占位输入端口 */
+const MANAGED_PARAM_NAMES = [
+    "开始时间", "结束时间", "时长", "开始帧", "结束帧", "时长帧数",
+    "显示模式", "裁剪X", "裁剪Y", "裁剪宽度", "裁剪高度", "输出模式", "分段索引",
+];
+
+const api = getApi();
+
+app.registerExtension({
+    name: "Comfy.YuanTool.VideoUI",
+    async beforeRegisterNodeDef(nodeType, nodeData, app) {
+        if (nodeData.name === "Yuan_VideoUI") {
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            const onConfigure = nodeType.prototype.onConfigure;
+            const onResize = nodeType.prototype.onResize;
+            const onDrawForeground = nodeType.prototype.onDrawForeground;
+
+            // 工作流加载时立即恢复视频 UI
+            nodeType.prototype.onConfigure = function (info) {
+                if (onConfigure) {
+                    onConfigure.apply(this, arguments);
+                }
+
+                // 恢复保存的显示模式对应的输入框（不换算/不覆盖数值）
+                if (this.toggleWidgetVisibility) this.toggleWidgetVisibility();
+                if (this.syncToggleVisual) this.syncToggleVisual();
+                if (this.syncOutputToggleVisual) this.syncOutputToggleVisual();
+
+                if (this.widgets) {
+                    const videoWidget = this.widgets.find(w => w.name === "视频");
+                    if (videoWidget && videoWidget.value && this.updatePreview) {
+                        this.updatePreview(videoWidget.value);
+                    }
+                }
+
+                if (this.syncLayoutToNode) {
+                    setTimeout(() => {
+                        this.syncLayoutToNode();
+                    }, 0);
+                }
+            };
+
+            // 逐帧校正 DOM 高度：工作流加载/重载后也能立即与节点底边精确对齐
+            nodeType.prototype.onDrawForeground = function (ctx) {
+                if (onDrawForeground) onDrawForeground.apply(this, arguments);
+
+                if (this.domWidget && this.domWidget.element && this.domWidget.last_y) {
+                    const remainingHeight = this.size[1] - this.domWidget.last_y - 18;
+                    const currentHeight = parseFloat(this.domWidget.element.style.height);
+                    const targetHeight = Math.max(150, remainingHeight);
+
+                    // 高度偏差 >1px 才写回，避免每帧触发重排
+                    if (isNaN(currentHeight) || Math.abs(currentHeight - targetHeight) > 1) {
+                        this.domWidget.element.style.height = `${targetHeight}px`;
+                    }
+                }
+            };
+
+            // 用户拉伸节点大小时同步 DOM 高度
+            nodeType.prototype.onResize = function (size) {
+                if (onResize) onResize.apply(this, arguments);
+                if (this.syncLayoutToNode) {
+                    this.syncLayoutToNode();
+                }
+                if (this.domWidget && this.domWidget.element) {
+                    this.domWidget.element.style.margin = "0";
+
+                    // last_y 未就绪时的兜底估算
+                    let yOffset = this.domWidget.last_y;
+                    if (!yOffset) {
+                        yOffset = 30; // LiteGraph 标题高度兜底
+                        if (this.widgets) {
+                            for (let w of this.widgets) {
+                                if (w === this.domWidget) break;
+                                yOffset += (w.computeSize ? w.computeSize()[1] : 20) + 4;
+                            }
+                        }
+                    }
+
+                    const remainingHeight = size[1] - yOffset - 18;
+                    this.domWidget.element.style.height = `${Math.max(150, remainingHeight)}px`;
+                }
+            };
+
+            nodeType.prototype.onNodeCreated = function () {
+                const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+                const node = this;
+
+                node._initializing = true;
+                node._should_reset_trim = false;
+
+                // 屏蔽 ComfyUI 写入 imgs 预览图
+                Object.defineProperty(node, 'imgs', {
+                    get: function() { return undefined; },
+                    set: function(val) { /* 忽略 ComfyUI 设置的预览图 */ },
+                    configurable: true
+                });
+
+                const videoWidget = this.widgets.find((w) => w.name === "视频");
+                const frameRateWidget = this.widgets.find((w) => w.name === "帧率");
+                const displayModeWidget = this.widgets.find((w) => w.name === "显示模式");
+
+                const startTimeWidget = this.widgets.find((w) => w.name === "开始时间");
+                const endTimeWidget = this.widgets.find((w) => w.name === "结束时间");
+                const durationWidget = this.widgets.find((w) => w.name === "时长");
+
+                const startFrameWidget = this.widgets.find((w) => w.name === "开始帧");
+                const endFrameWidget = this.widgets.find((w) => w.name === "结束帧");
+                const durationFramesWidget = this.widgets.find((w) => w.name === "时长帧数");
+
+                const cropXWidget = this.widgets.find((w) => w.name === "裁剪X");
+                const cropYWidget = this.widgets.find((w) => w.name === "裁剪Y");
+                const cropWWidget = this.widgets.find((w) => w.name === "裁剪宽度");
+                const cropHWidget = this.widgets.find((w) => w.name === "裁剪高度");
+
+                const outputModeWidget = this.widgets.find((w) => w.name === "输出模式");
+                const segmentIndexWidget = this.widgets.find((w) => w.name === "分段索引");
+
+                // ==== Widget 隐藏与同步引擎 ====
+                let isSyncing = false;
+
+                node.toggleWidgetVisibility = function () {
+                    // 时间/帧 六 widget 全部迁移到 UI 时间轴左侧输入框显示，节点面板始终隐藏
+                    hideWidget(startTimeWidget);
+                    hideWidget(endTimeWidget);
+                    hideWidget(durationWidget);
+                    hideWidget(startFrameWidget);
+                    hideWidget(endFrameWidget);
+                    hideWidget(durationFramesWidget);
+                    hideWidget(displayModeWidget); // 由 UI 按钮驱动
+
+                    hideWidget(cropXWidget);
+                    hideWidget(cropYWidget);
+                    hideWidget(cropWWidget);
+                    hideWidget(cropHWidget);
+
+                    // 智能分段模式下显示分段索引，自定义裁剪模式下隐藏
+                    const isSmart = outputModeWidget && outputModeWidget.value === "智能分段输出";
+                    if (isSmart) {
+                        showWidget(segmentIndexWidget);
+                    } else {
+                        hideWidget(segmentIndexWidget);
+                    }
+                    hideWidget(outputModeWidget); // 由 UI 开关驱动
+
+                    if (app.graph) {
+                        app.graph.setDirtyCanvas(true, true);
+                    }
+
+                    // 节点最小尺寸约束：仅当用户宽/高小于最小值时抬高，不覆盖用户设定
+                    const minSize = node.computeSize();
+                    node.size[0] = Math.max(node.size[0], minSize[0]);
+                    node.size[1] = Math.max(node.size[1], minSize[1]);
+
+                    if (node.onResize) node.onResize(node.size);
+                    app.graph.setDirtyCanvas(true, true);
+                };
+
+                node.syncFramesFromTime = function () {
+                    if (isSyncing || !frameRateWidget) return;
+                    isSyncing = true;
+                    const fr = frameRateWidget.value || 24;
+                    if (startTimeWidget && startFrameWidget) startFrameWidget.value = Math.round(startTimeWidget.value * fr);
+                    if (endTimeWidget && endFrameWidget) endFrameWidget.value = Math.round(endTimeWidget.value * fr);
+                    if (durationWidget && durationFramesWidget) durationFramesWidget.value = Math.round(durationWidget.value * fr);
+                    isSyncing = false;
+                };
+
+                node.syncTimeFromFrames = function () {
+                    if (isSyncing || !frameRateWidget) return;
+                    isSyncing = true;
+                    const fr = frameRateWidget.value || 24;
+                    if (startTimeWidget && startFrameWidget) startTimeWidget.value = parseFloat((startFrameWidget.value / fr).toFixed(3));
+                    if (endTimeWidget && endFrameWidget) endTimeWidget.value = parseFloat((endFrameWidget.value / fr).toFixed(3));
+                    if (durationWidget && durationFramesWidget) durationFramesWidget.value = parseFloat((durationFramesWidget.value / fr).toFixed(3));
+                    isSyncing = false;
+                };
+
+                // 绑定常规输入回调：改动后自动同步到另一组
+                function bindWidget(w, isFrame, isFrameRate = false) {
+                    if (!w) return;
+                    const orig = w.callback;
+                    w.callback = function () {
+                        if (orig) orig.apply(this, arguments);
+                        if (isFrame) node.syncTimeFromFrames();
+                        else node.syncFramesFromTime();
+
+                        // 帧率变化时强制重绘刻度，保证刻度与新帧率一致
+                        if (duration === 0 || isFrameRate) updateRuler();
+                        updateUI(true);
+                    };
+                }
+
+                bindWidget(startTimeWidget, false);
+                bindWidget(endTimeWidget, false);
+                bindWidget(startFrameWidget, true);
+                bindWidget(endFrameWidget, true);
+                bindWidget(frameRateWidget, false, true); // 帧率变化：重算帧值并重绘刻度
+
+                // 绑定到节点，供 onConfigure 恢复视频预览调用
+                node.updatePreview = function (filename) {
+                    if (!filename || filename === "无") {
+                        return;
+                    }
+                    let url;
+
+                    // 绝对路径（盘符:\ 或 / 开头）走后端自定义查看接口
+                    if (filename.match(/^[a-zA-Z]:\\/) || filename.startsWith('/')) {
+                        url = api.apiURL(`/yuan_tool/video_custom_view?filename=${encodeURIComponent(filename)}`);
+                    } else {
+                        url = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=input`);
+                    }
+
+                    if (videoPreview) videoPreview.src = url;
+                };
+
+                if (videoWidget) {
+                    const originalCallback = videoWidget.callback;
+                    videoWidget.callback = function () {
+                        if (originalCallback) originalCallback.apply(this, arguments);
+                        if (!node._initializing) {
+                            node._should_reset_trim = true;
+                        }
+                        if (node.updatePreview) node.updatePreview(this.value);
+                    };
+                }
+
+                // 初始化：补默认显示模式并立即隐藏托管控件
+                if (displayModeWidget && !displayModeWidget.value) displayModeWidget.value = "秒";
+                node.toggleWidgetVisibility();
+
+                // ==== 选择视频文件按钮 ====
+                const fileInput = document.createElement("input");
+                fileInput.type = "file";
+                fileInput.accept = "video/*";
+                fileInput.style.display = "none";
+                document.body.appendChild(fileInput);
+
+                const btnWidget = this.addWidget("button", "选择视频上传", null, () => {
+                    fileInput.click();
+                });
+
+                // 上传策略：优先本地绝对路径，其次查重、分片、标准上传
+                const uploadFile = async (file) => {
+                    try {
+                        if (errorMsg) errorMsg.style.display = "none";
+
+                        // 快路径：桌面环境提供绝对路径时免上传直接使用
+                        if (file.path) {
+                            if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(file.path)) {
+                                videoWidget.options.values.push(file.path);
+                            }
+                            videoWidget.value = file.path;
+                            node._should_reset_trim = true;
+                            node.updatePreview(file.path);
+                            node.syncFramesFromTime();
+                            return;
+                        }
+
+                        // 先查服务端是否已有同名同大小文件，避免重复上传
+                        const safeFileName = file.name.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                        try {
+                            const checkResp = await api.fetchApi(`/yuan_tool/video_check_file?filename=${encodeURIComponent(safeFileName)}&size=${file.size}`);
+                            if (checkResp.status === 200) {
+                                const checkResult = await checkResp.json();
+                                if (checkResult.exists) {
+                                    if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(checkResult.name)) {
+                                        videoWidget.options.values.push(checkResult.name);
+                                    }
+                                    videoWidget.value = checkResult.name;
+                                    node._should_reset_trim = true;
+                                    node.updatePreview(checkResult.name);
+                                    node.syncFramesFromTime();
+                                    return;
+                                }
+                            }
+                        } catch (e) {
+                        }
+
+                        btnWidget.name = "上传中...";
+                        node.setDirtyCanvas(true, false);
+
+                        const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB 分片
+
+                        if (file.size > CHUNK_SIZE) {
+                            const safeName = Date.now() + "_" + safeFileName;
+                            const data = await uploadChunked(file, {
+                                chunkSize: CHUNK_SIZE,
+                                filename: safeName,
+                                sendChunk: async (formData) => {
+                                    const resp = await api.fetchApi("/yuan_tool/video_upload_chunk", {
+                                        method: "POST",
+                                        body: formData,
+                                    });
+                                    if (resp.status !== 200) {
+                                        throw new Error("Chunk upload failed");
+                                    }
+                                    return resp.json();
+                                },
+                                onProgress: (done, total) => {
+                                    btnWidget.name = `上传中... ${Math.round((done / total) * 100)}%`;
+                                    node.setDirtyCanvas(true, false);
+                                },
+                            });
+                            if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(data.name)) {
+                                videoWidget.options.values.push(data.name);
+                            }
+                            videoWidget.value = data.name;
+                            node._should_reset_trim = true;
+                            node.updatePreview(data.name);
+                            node.syncFramesFromTime();
+                        } else {
+                            // 小文件走标准上传
+                            const body = new FormData();
+                            body.append("image", file);
+
+                            const resp = await api.fetchApi("/upload/image", {
+                                method: "POST",
+                                body: body,
+                              // 不传 subfolder，落到 input 根目录
+                            });
+
+                            if (resp.status === 413) {
+                                throw new Error("File too large. Make sure python backend has the chunking update.");
+                            }
+
+                            if (resp.status === 200) {
+                                const data = await resp.json();
+                                if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(data.name)) {
+                                    videoWidget.options.values.push(data.name);
+                                }
+                                videoWidget.value = data.name;
+                                node._should_reset_trim = true;
+                                node.updatePreview(data.name);
+                                node.syncFramesFromTime();
+                            } else {
+                                throw new Error(`Upload failed: ${resp.statusText}`);
+                            }
+                        }
+                    } catch (error) {
+                        if (errorMsg) {
+                            errorMsg.textContent = "上传失败，请查看控制台。";
+                            errorMsg.style.display = "block";
+                        }
+                    } finally {
+                        btnWidget.name = "选择视频上传";
+                        node.setDirtyCanvas(true, false);
+                        fileInput.value = ""; // 复位，便于再次选择同一文件
+                    }
+                };
+
+                fileInput.addEventListener("change", (e) => {
+                    if (e.target.files.length) {
+                        uploadFile(e.target.files[0]);
+                    }
+                });
+
+                // 支持把视频文件直接拖放到节点画布上传
+                node.onDragOver = function (e) {
+                    if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes("Files")) {
+                        e.preventDefault();
+                        return true;
+                    }
+                    return false;
+                };
+
+                node.onDragDrop = function (e) {
+                    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                        const file = e.dataTransfer.files[0];
+                        if (file.type.startsWith('video/') || file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/)) {
+                            uploadFile(file);
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                node.onDropFile = function (file) {
+                    // 校验 MIME 或常见视频扩展名，确保不会漏掉可上传文件
+                    if (file.type.startsWith('video/') || file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/)) {
+                        uploadFile(file);
+                        return true;
+                    }
+                    return false;
+                };
+
+                // 节点移除时清理该节点专属的 DOM 元素
+                const originalOnRemove = node.onRemoved;
+                node.onRemoved = function () {
+                    if (fileInput && fileInput.parentNode) fileInput.parentNode.removeChild(fileInput);
+                    if (originalOnRemove) originalOnRemove.apply(this, arguments);
+                };
+
+                // ==== UI 容器（预览 + 时间轴） ====
+                const container = document.createElement("div");
+                const defaultBg = "rgba(30, 30, 30, 0.9)";
+                Object.assign(container.style, {
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "10px",
+                    width: "100%",
+                    margin: "0",
+                    padding: "10px",
+                    boxSizing: "border-box",
+                    background: defaultBg,
+                    borderRadius: "6px",
+                    color: "white",
+                    fontFamily: "sans-serif",
+                    marginTop: "8px",
+                    flexShrink: "0",
+                    transition: "background 0.2s"
+                });
+
+                const errorMsg = document.createElement("div");
+                Object.assign(errorMsg.style, {
+                    color: "#ff6b6b",
+                    fontSize: "12px",
+                    display: "none",
+                    marginBottom: "4px",
+                    flexShrink: "0",
+                    boxSizing: "border-box"
+                });
+                container.appendChild(errorMsg);
+
+                // 顶栏：显示模式切换与裁剪总时长
+                const playerTop = document.createElement("div");
+                Object.assign(playerTop.style, {
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    padding: "0 2px",
+                    marginBottom: "-4px",
+                    flexShrink: "0",
+                    boxSizing: "border-box",
+                    flexWrap: "wrap", // 空间不足时允许换行防挤压
+                    gap: "6px",
+                    position: "relative"
+                });
+
+                // 模式切换开关容器
+                const toggleWrapper = document.createElement("div");
+                Object.assign(toggleWrapper.style, {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    background: "rgba(0, 0, 0, 0.2)",
+                    padding: "0 8px",
+                    borderRadius: "4px",
+                    height: "22px",
+                    boxSizing: "border-box"
+                });
+
+                const segmentedToggle = document.createElement("div");
+                Object.assign(segmentedToggle.style, {
+                    display: "flex",
+                    alignItems: "center",
+                    background: "rgba(0, 0, 0, 0.35)",
+                    border: "1px solid rgba(56, 189, 248, 0.3)",
+                    borderRadius: "4px",
+                    overflow: "hidden",
+                    height: "18px",
+                    flexShrink: "0",
+                    cursor: "pointer"
+                });
+
+                const createSegBtn = (label) => {
+                    const btn = document.createElement("span");
+                    btn.textContent = label;
+                    Object.assign(btn.style, {
+                        fontSize: "11px",
+                        fontWeight: "bold",
+                        padding: "0 8px",
+                        lineHeight: "18px",
+                        color: "rgba(255,255,255,0.45)",
+                        background: "transparent",
+                        transition: "background 0.2s, color 0.2s",
+                        userSelect: "none",
+                        whiteSpace: "nowrap"
+                    });
+                    return btn;
+                };
+
+                const segTime = createSegBtn("时间");
+                const segDivider = document.createElement("span");
+                segDivider.style.cssText = "width:1px;height:12px;background:rgba(56,189,248,0.25);flex-shrink:0;";
+                const segFrames = createSegBtn("帧");
+
+                segmentedToggle.appendChild(segTime);
+                segmentedToggle.appendChild(segDivider);
+                segmentedToggle.appendChild(segFrames);
+
+                const applySegmentState = (frames) => {
+                    if (frames) {
+                        segTime.style.background = "transparent";
+                        segTime.style.color = "rgba(255,255,255,0.45)";
+                        segFrames.style.background = "rgba(37,126,235,0.85)";
+                        segFrames.style.color = "#fff";
+                    } else {
+                        segTime.style.background = "rgba(56,189,248,0.85)";
+                        segTime.style.color = "#fff";
+                        segFrames.style.background = "transparent";
+                        segFrames.style.color = "rgba(255,255,255,0.45)";
+                    }
+                };
+
+                let isFramesMode = false;
+                applySegmentState(false); // 默认：时间模式
+
+                // 统一模式切换入口：UI 按钮与节点面板"显示模式"下拉共用。
+                // 切换只改变 UI 输入框的标签描述与显示值（时间组 <-> 帧组），
+                // 不换算/不覆盖数值——两组各自独立，"是什么就是什么"。
+                const applyDisplayMode = (nextFramesMode) => {
+                    isFramesMode = nextFramesMode;
+                    applySegmentState(isFramesMode);
+
+                    if (displayModeWidget) displayModeWidget.value = isFramesMode ? "帧" : "秒";
+
+                    node.toggleWidgetVisibility();
+                    updateTimeInputMode();
+                    updateRuler();
+                    updateUI(true);
+                };
+
+                const doToggle = () => applyDisplayMode(!isFramesMode);
+
+                segmentedToggle.onclick = doToggle;
+
+                // 供下方初始化 rAF 模拟点击，恢复保存的显示模式
+                const switchBox = { onclick: doToggle };
+
+                // 节点面板"显示模式"下拉直接切换时，同样触发同步
+                if (displayModeWidget) {
+                    const origDmCb = displayModeWidget.callback;
+                    displayModeWidget.callback = function () {
+                        if (origDmCb) origDmCb.apply(this, arguments);
+                        applyDisplayMode(this.value === "帧");
+                    };
+                }
+
+                // 工作流重载时恢复开关高亮（同步保存的显示模式）
+                node.syncToggleVisual = function () {
+                    const savedIsFrames = displayModeWidget && displayModeWidget.value === "帧";
+                    isFramesMode = savedIsFrames;
+                    applySegmentState(savedIsFrames);
+                    // 同步刷新 UI 输入框的标签描述与显示值（时间组/帧组各自独立）
+                    updateTimeInputMode();
+                };
+
+                toggleWrapper.appendChild(segmentedToggle);
+
+                const leftContainer = document.createElement("div");
+                Object.assign(leftContainer.style, {
+                    flex: "1 1 0%",
+                    display: "flex",
+                    justifyContent: "flex-start",
+                    minWidth: "max-content"
+                });
+                leftContainer.appendChild(toggleWrapper);
+
+                // ---------- 输出模式切换按钮（自定义裁剪输出 / 智能分段输出） ----------
+                const outputToggleWrapper = document.createElement("div");
+                Object.assign(outputToggleWrapper.style, {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    background: "rgba(0, 0, 0, 0.2)",
+                    padding: "0 8px",
+                    borderRadius: "4px",
+                    height: "22px",
+                    boxSizing: "border-box",
+                    marginLeft: "8px"
+                });
+
+                const outputSegmentedToggle = document.createElement("div");
+                Object.assign(outputSegmentedToggle.style, {
+                    display: "flex",
+                    alignItems: "center",
+                    background: "rgba(0, 0, 0, 0.35)",
+                    border: "1px solid rgba(56, 189, 248, 0.3)",
+                    borderRadius: "4px",
+                    overflow: "hidden",
+                    height: "18px",
+                    flexShrink: "0",
+                    cursor: "pointer"
+                });
+
+                const segCustom = createSegBtn("自定义裁剪");
+                const segDivider2 = document.createElement("span");
+                segDivider2.style.cssText = "width:1px;height:12px;background:rgba(56,189,248,0.25);flex-shrink:0;";
+                const segSmart = createSegBtn("智能分段");
+
+                outputSegmentedToggle.appendChild(segCustom);
+                outputSegmentedToggle.appendChild(segDivider2);
+                outputSegmentedToggle.appendChild(segSmart);
+
+                const applyOutputSegState = (smart) => {
+                    if (smart) {
+                        segCustom.style.background = "transparent";
+                        segCustom.style.color = "rgba(255,255,255,0.45)";
+                        segSmart.style.background = "rgba(37,126,235,0.85)";
+                        segSmart.style.color = "#fff";
+                    } else {
+                        segCustom.style.background = "rgba(56,189,248,0.85)";
+                        segCustom.style.color = "#fff";
+                        segSmart.style.background = "transparent";
+                        segSmart.style.color = "rgba(255,255,255,0.45)";
+                    }
+                };
+
+                let isSmartMode = false;
+                applyOutputSegState(false); // 默认：自定义裁剪输出
+
+                // 检测分段按钮：位于“输出模式”右侧，仅智能分段模式下显示
+                const detectBtn = document.createElement("button");
+                detectBtn.textContent = "检测分段";
+                Object.assign(detectBtn.style, {
+                    display: "none",
+                    background: "rgba(56, 189, 248, 0.85)",
+                    color: "#fff", border: "none", borderRadius: "4px",
+                    padding: "0 10px", height: "18px", fontSize: "12px", fontWeight: "bold",
+                    cursor: "pointer", flexShrink: "0"
+                });
+
+                const doOutputToggle = () => {
+                    isSmartMode = !isSmartMode;
+                    applyOutputSegState(isSmartMode);
+
+                    if (outputModeWidget) outputModeWidget.value = isSmartMode ? "智能分段输出" : "自定义裁剪输出";
+                    detectBtn.style.display = isSmartMode ? "block" : "none";
+                    node.toggleWidgetVisibility();
+                    app.graph.setDirtyCanvas(true, false);
+                    // 切到智能分段时自动恢复已保存的分段（后端缓存命中则秒回，不会重新分割）
+                    if (isSmartMode && node.tryRestoreCachedSegments) node.tryRestoreCachedSegments();
+                    // 时间轴显示：自定义裁剪 = 长条，智能分段 = 小方块
+                    applyOutputTimelineVisual(isSmartMode);
+                    // 开始-结束-时长：智能分段下只读并展示当前分段，自定义裁剪下恢复可编辑
+                    setTimeBoxReadonly(isSmartMode);
+                    node.syncTimeInputs();
+                };
+
+                outputSegmentedToggle.onclick = doOutputToggle;
+
+                const outputSwitchBox = { onclick: doOutputToggle };
+
+                // 工作流加载时恢复输出模式的高亮状态
+                node.syncOutputToggleVisual = function () {
+                    const savedIsSmart = outputModeWidget && outputModeWidget.value === "智能分段输出";
+                    isSmartMode = savedIsSmart;
+                    applyOutputSegState(savedIsSmart);
+                    detectBtn.style.display = savedIsSmart ? "block" : "none";
+                    // 工作流加载后自动恢复已保存的分段（仅查缓存，不会重新分割）
+                    if (savedIsSmart && node.tryRestoreCachedSegments) node.tryRestoreCachedSegments();
+                    // 时间轴显示：自定义裁剪 = 长条，智能分段 = 小方块
+                    applyOutputTimelineVisual(savedIsSmart);
+                    // 开始-结束-时长：智能分段下只读并展示当前分段，自定义裁剪下恢复可编辑
+                    setTimeBoxReadonly(savedIsSmart);
+                    node.syncTimeInputs();
+                };
+
+                // 直接通过原生下拉框切换输出模式时，也同步按钮高亮与检测按钮显隐
+                if (outputModeWidget) {
+                    const origOutCb = outputModeWidget.callback;
+                    outputModeWidget.callback = function () {
+                        if (origOutCb) origOutCb.apply(this, arguments);
+                        node.syncOutputToggleVisual();
+                    };
+                }
+
+                outputToggleWrapper.appendChild(outputSegmentedToggle);
+                outputToggleWrapper.appendChild(detectBtn);
+                leftContainer.appendChild(outputToggleWrapper);
+
+                playerTop.appendChild(leftContainer);
+
+                const cropBtn = document.createElement("button");
+                cropBtn.textContent = "裁剪";
+                Object.assign(cropBtn.style, {
+                    background: "rgba(255, 255, 255, 0.1)",
+                    color: "white",
+                    border: "none",
+                    borderRadius: "4px",
+                    padding: "0 8px",
+                    height: "22px",
+                    fontSize: "12px",
+                    fontWeight: "bold",
+                    cursor: "pointer"
+                });
+
+                let isCropVisible = false;
+
+                const cropUIContainer = document.createElement("div");
+                Object.assign(cropUIContainer.style, {
+                    display: "flex", alignItems: "center", gap: "6px", zIndex: "11"
+                });
+
+                const cropDims = document.createElement("span");
+                Object.assign(cropDims.style, {
+                    fontSize: "12px", color: "#38bdf8", fontWeight: "bold",
+                    display: "none", padding: "0 6px", pointerEvents: "none"
+                });
+
+                const cropEditContainer = document.createElement("div");
+                Object.assign(cropEditContainer.style, {
+                    display: "none", alignItems: "center", gap: "4px"
+                });
+
+                const arSelect = document.createElement("select");
+                Object.assign(arSelect.style, {
+                    background: "#222", color: "#fff", border: "1px solid #555",
+                    borderRadius: "3px", fontSize: "12px", padding: "2px", outline: "none",
+                    cursor: "pointer"
+                });
+                const ratios = [
+                    { name: "自由", val: 0 },
+                    { name: "原始", val: -1 },
+                    { name: "1:1", val: 1 },
+                    { name: "4:5", val: 4 / 5 },
+                    { name: "5:4", val: 5 / 4 },
+                    { name: "16:9", val: 16 / 9 },
+                    { name: "9:16", val: 9 / 16 },
+                    { name: "4:3", val: 4 / 3 },
+                    { name: "3:4", val: 3 / 4 },
+                    { name: "3:2", val: 3 / 2 },
+                    { name: "2:3", val: 2 / 3 },
+                    { name: "2:1", val: 2 },
+                    { name: "1:2", val: 1 / 2 }
+                ];
+                ratios.forEach(r => {
+                    const opt = document.createElement("option");
+                    opt.textContent = r.name;
+                    opt.value = r.val;
+                    arSelect.appendChild(opt);
+                });
+
+                const wInput = document.createElement("input");
+                const hInput = document.createElement("input");
+                const inputStyle = {
+                    width: "40px", background: "rgba(0,0,0,0.5)", color: "#38bdf8",
+                    border: "1px solid #555", borderRadius: "3px", fontSize: "12px",
+                    textAlign: "center", padding: "2px", outline: "none"
+                };
+                Object.assign(wInput.style, inputStyle);
+                Object.assign(hInput.style, inputStyle);
+                wInput.type = "text";
+                hInput.type = "text";
+
+                const xSpan = document.createElement("span");
+                xSpan.textContent = "x";
+                xSpan.style.color = "#888";
+                xSpan.style.fontSize = "12px";
+
+                cropEditContainer.appendChild(arSelect);
+                cropEditContainer.appendChild(wInput);
+                cropEditContainer.appendChild(xSpan);
+                cropEditContainer.appendChild(hInput);
+
+                cropUIContainer.appendChild(cropDims);
+                cropUIContainer.appendChild(cropEditContainer);
+                playerTop.appendChild(cropUIContainer);
+
+                const rightContainer = document.createElement("div");
+                Object.assign(rightContainer.style, {
+                    flex: "1 1 0%",
+                    display: "flex",
+                    justifyContent: "flex-end",
+                    gap: "6px",
+                    minWidth: "max-content"
+                });
+                // 时间输入框：样式为「口-口 口」，对应「开始时间-结束时间 时长」。
+                // 只显示输入框，不显示文字标签；悬停输入框可查看说明（开始时间/结束时间/时长，单位秒）。
+                const timeInputWrap = document.createElement("div");
+                Object.assign(timeInputWrap.style, {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "2px",
+                    minWidth: "max-content"
+                });
+
+                const mkTimeBox = (tip) => {
+                    const inp = document.createElement("input");
+                    inp.type = "number";
+                    inp.step = "0.01";
+                    inp.min = "0";
+                    inp.title = tip;
+                    Object.assign(inp.style, {
+                        width: "58px",
+                        height: "22px",
+                        boxSizing: "border-box",
+                        background: "rgba(0, 0, 0, 0.4)",
+                        color: "#38bdf8",
+                        border: "1px solid rgba(56, 189, 248, 0.3)",
+                        borderRadius: "4px",
+                        textAlign: "center",
+                        fontSize: "12px",
+                        fontWeight: "bold",
+                        outline: "none",
+                        padding: "0 2px"
+                    });
+                    return inp;
+                };
+                const startTimeBox = mkTimeBox("开始时间（秒）");
+                const endTimeBox = mkTimeBox("结束时间（秒）");
+                const durationBox = mkTimeBox("时长（秒）");
+
+                const timeDash = document.createElement("span");
+                timeDash.textContent = "-";
+                Object.assign(timeDash.style, {
+                    color: "rgba(255, 255, 255, 0.4)",
+                    fontSize: "12px",
+                    fontWeight: "bold",
+                    padding: "0 1px"
+                });
+                const timeGap = document.createElement("span");
+                timeGap.style.width = "8px";
+
+                // 框旁边不显示文字标签，只显示框；说明放在鼠标悬停提示（title）里
+                timeInputWrap.appendChild(startTimeBox);
+                timeInputWrap.appendChild(timeDash);
+                timeInputWrap.appendChild(endTimeBox);
+                timeInputWrap.appendChild(timeGap);
+                timeInputWrap.appendChild(durationBox);
+
+                // 当前生效的分段（用于智能分段下时间框展示/只读）：
+                // 优先已选中的分段，否则回退到“分段索引”对应的分段（无落入结果时取第 0 段）。
+                const activeSegment = () => {
+                    if (!segmentsCacheData || !segmentsCacheData.segments || !segmentsCacheData.segments.length) return null;
+                    if (selectedSegment && selectedSegment.end > selectedSegment.start) return selectedSegment;
+                    const idx = segmentIndexWidget ? (parseInt(segmentIndexWidget.value) || 0) : 0;
+                    return segmentsCacheData.segments.find((x) => x.index === idx) || segmentsCacheData.segments[0];
+                };
+
+                // 智能分段时时间框只读（范围由小方块 / 分段索引决定）
+                const setTimeBoxReadonly = (ro) => {
+                    const tips = { start: "开始时间（秒）", end: "结束时间（秒）", duration: "时长（秒）" };
+                    const map = { start: startTimeBox, end: endTimeBox, duration: durationBox };
+                    Object.keys(map).forEach((role) => {
+                        const box = map[role];
+                        box.readOnly = ro;
+                        box.style.opacity = ro ? "0.55" : "1";
+                        box.style.cursor = ro ? "not-allowed" : "text";
+                        box.title = ro ? "智能分段下由小方块 / 分段索引决定" : tips[role];
+                    });
+                };
+
+                // widget 值变化时回写输入框（按当前显示模式取对应组的值）；
+                // 智能分段下展示当前选中分段的起止范围（只读）。
+                node.syncTimeInputs = function () {
+                    const isFrames = isFramesMode;
+                    const fr = frameRateWidget ? (frameRateWidget.value || 24) : 24;
+
+                    const seg = activeSegment();
+                    if (isSmartMode && seg) {
+                        if (isFrames) {
+                            startTimeBox.value = parseFloat((seg.start * fr).toFixed(3));
+                            endTimeBox.value = parseFloat((seg.end * fr).toFixed(3));
+                            durationBox.value = parseFloat(((seg.end - seg.start) * fr).toFixed(3));
+                        } else {
+                            startTimeBox.value = parseFloat(seg.start.toFixed(2));
+                            endTimeBox.value = parseFloat(seg.end.toFixed(2));
+                            durationBox.value = parseFloat((seg.end - seg.start).toFixed(2));
+                        }
+                        return;
+                    }
+
+                    if (isFrames) {
+                        if (startFrameWidget) startTimeBox.value = parseFloat(startFrameWidget.value) || 0;
+                        if (endFrameWidget) endTimeBox.value = parseFloat(endFrameWidget.value) || 0;
+                        if (durationFramesWidget) durationBox.value = parseFloat(durationFramesWidget.value) || 0;
+                    } else {
+                        if (startTimeWidget) startTimeBox.value = parseFloat(startTimeWidget.value) || 0;
+                        if (endTimeWidget) endTimeBox.value = parseFloat(endTimeWidget.value) || 0;
+                        if (durationWidget) durationBox.value = parseFloat(durationWidget.value) || 0;
+                    }
+                };
+
+                // 切换时间/帧：更新输入框的悬停说明与显示值（不换算，各自独立）
+                const updateTimeInputMode = () => {
+                    const isFrames = isFramesMode;
+                    startTimeBox.title = isFrames ? "开始帧" : "开始时间（秒）";
+                    endTimeBox.title = isFrames ? "结束帧" : "结束时间（秒）";
+                    durationBox.title = isFrames ? "时长帧数" : "时长（秒）";
+                    node.syncTimeInputs();
+                };
+
+                // 输入框变化时写入当前显示模式对应的 widget，不换算另一组。
+                // 时长输入框：仅在【当前组内】调整结束值（结束=开始+时长），绝不跨组换算。
+                // 智能分段下范围由小方块 / 分段索引决定，不接收手动修改。
+                const applyTimeBoxChange = (role) => {
+                    if (isSmartMode) return;
+                    const isFrames = isFramesMode;
+                    const fr = frameRateWidget ? (frameRateWidget.value || 24) : 24;
+                    const pick = (r) => isFrames
+                        ? (r === "start" ? startFrameWidget : r === "end" ? endFrameWidget : durationFramesWidget)
+                        : (r === "start" ? startTimeWidget : r === "end" ? endTimeWidget : durationWidget);
+                    const startW = pick("start");
+                    const endW = pick("end");
+                    const durW = pick("duration");
+                    const box = role === "start" ? startTimeBox : role === "end" ? endTimeBox : durationBox;
+                    if (!durW) return;
+                    const n = parseFloat(box.value);
+                    if (isNaN(n) || n < 0) { box.value = durW.value; return; }
+
+                    if (role === "duration") {
+                        // 时长语义：结束 = 开始 + 时长（仅当前组内，可自动回推开始）
+                        const activeScale = isFrames ? Math.round(getActiveDuration() * fr) : getActiveDuration();
+                        const d = Math.min(n, activeScale);
+                        const s0 = startW ? parseFloat(startW.value) || 0 : 0;
+                        let newStart = s0;
+                        let newEnd = s0 + d;
+                        if (newEnd > activeScale) {
+                            newEnd = activeScale;
+                            newStart = activeScale - d;
+                        }
+                        if (startW) startW.value = newStart;
+                        if (endW) endW.value = newEnd;
+                        if (durW) durW.value = d;
+                    } else {
+                        const w = role === "start" ? startW : endW;
+                        if (!w) return;
+                        if (parseFloat(w.value) === n) return;
+                        w.value = n;
+                    }
+
+                    if (duration === 0) updateRuler();
+                    updateUI(true);
+                    if (app.graph) app.graph.setDirtyCanvas(true, false);
+                };
+                startTimeBox.addEventListener("change", () => applyTimeBoxChange("start"));
+                endTimeBox.addEventListener("change", () => applyTimeBoxChange("end"));
+                durationBox.addEventListener("change", () => applyTimeBoxChange("duration"));
+
+                rightContainer.appendChild(timeInputWrap);
+                rightContainer.appendChild(cropBtn);
+                playerTop.appendChild(rightContainer);
+
+                let currentAspectRatio = 0;
+
+                const handleManualDimensionInput = (isWidth) => {
+                    const vw = videoPreview.videoWidth;
+                    const vh = videoPreview.videoHeight;
+                    if (!vw || !vh) return;
+
+                    let newW = parseInt(wInput.value) || Math.round((cropWWidget ? parseFloat(cropWWidget.value) || 1 : 1) * vw);
+                    let newH = parseInt(hInput.value) || Math.round((cropHWidget ? parseFloat(cropHWidget.value) || 1 : 1) * vh);
+
+                    if (currentAspectRatio > 0) {
+                        if (isWidth) {
+                            newH = Math.round(newW / currentAspectRatio);
+                        } else {
+                            newW = Math.round(newH * currentAspectRatio);
+                        }
+                    }
+
+                    newW = Math.max(1, Math.min(newW, vw));
+                    newH = Math.max(1, Math.min(newH, vh));
+
+                    let cw_val = newW / vw;
+                    let ch_val = newH / vh;
+
+                    let cx = cropXWidget ? parseFloat(cropXWidget.value) || 0 : 0;
+                    let cy = cropYWidget ? parseFloat(cropYWidget.value) || 0 : 0;
+
+                    if (cx + cw_val > 1) cx = 1 - cw_val;
+                    if (cy + ch_val > 1) cy = 1 - ch_val;
+
+                    if (cropXWidget) cropXWidget.value = parseFloat(cx.toFixed(3));
+                    if (cropYWidget) cropYWidget.value = parseFloat(cy.toFixed(3));
+                    if (cropWWidget) cropWWidget.value = parseFloat(cw_val.toFixed(3));
+                    if (cropHWidget) cropHWidget.value = parseFloat(ch_val.toFixed(3));
+
+                    updateCropUI();
+                    app.graph.setDirtyCanvas(true, false);
+                };
+
+                wInput.addEventListener("change", () => handleManualDimensionInput(true));
+                hInput.addEventListener("change", () => handleManualDimensionInput(false));
+                wInput.addEventListener("keydown", (e) => { if (e.key === "Enter") handleManualDimensionInput(true); });
+                hInput.addEventListener("keydown", (e) => { if (e.key === "Enter") handleManualDimensionInput(false); });
+
+                arSelect.onchange = () => {
+                    currentAspectRatio = parseFloat(arSelect.value);
+                    if (currentAspectRatio === -1 && videoPreview.videoWidth) {
+                        currentAspectRatio = videoPreview.videoWidth / videoPreview.videoHeight;
+                    }
+                    if (currentAspectRatio > 0 && videoPreview.videoWidth) {
+                        const vw = videoPreview.videoWidth;
+                        const vh = videoPreview.videoHeight;
+                        let cw_val = cropWWidget ? parseFloat(cropWWidget.value) || 1 : 1;
+                        let cx = cropXWidget ? parseFloat(cropXWidget.value) || 0 : 0;
+                        let cy = cropYWidget ? parseFloat(cropYWidget.value) || 0 : 0;
+
+                        const actualW = cw_val * vw;
+                        let actualH = actualW / currentAspectRatio;
+                        let ch_val = actualH / vh;
+
+                        if (ch_val > 1) {
+                            ch_val = 1;
+                            const newActualW = vh * currentAspectRatio;
+                            cw_val = newActualW / vw;
+                        }
+                        if (cy + ch_val > 1) cy = 1 - ch_val;
+                        if (cx + cw_val > 1) cx = 1 - cw_val;
+
+                        if (cropXWidget) cropXWidget.value = parseFloat(cx.toFixed(3));
+                        if (cropYWidget) cropYWidget.value = parseFloat(cy.toFixed(3));
+                        if (cropWWidget) cropWWidget.value = parseFloat(cw_val.toFixed(3));
+                        if (cropHWidget) cropHWidget.value = parseFloat(ch_val.toFixed(3));
+
+                        updateCropUI();
+                        app.graph.setDirtyCanvas(true, false);
+                    }
+                };
+
+                cropBtn.onclick = () => {
+                    isCropVisible = !isCropVisible;
+                    cropBtn.style.background = isCropVisible ? "#38bdf8" : "rgba(255, 255, 255, 0.1)";
+                    cropBtn.style.color = isCropVisible ? "black" : "white";
+                    if (isCropVisible) {
+                        cropBox.style.display = "block";
+                        cropEditContainer.style.display = "flex";
+                        cropDims.style.display = "none";
+                    } else {
+                        cropBox.style.display = "none";
+                        cropEditContainer.style.display = "none";
+                        // 关闭时 cropDims 的显隐由 updateCropUI 统一处理
+                    }
+                    if (isCropVisible) {
+                        videoPreview.pause();
+                        videoPreview.controls = false;
+                    } else {
+                        videoPreview.controls = true;
+                    }
+                    updateCropUI();
+                };
+
+                container.appendChild(playerTop);
+
+                // 视频预览区（原生控件）
+                const videoWrapper = document.createElement("div");
+                Object.assign(videoWrapper.style, {
+                    position: "relative",
+                    width: "100%",
+                    flexGrow: "1",
+                    minHeight: "0px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: "#000",
+                    borderRadius: "4px",
+                    overflow: "hidden"
+                });
+
+                const videoPreview = document.createElement("video");
+                Object.assign(videoPreview.style, {
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "contain",
+                    outline: "none",
+                    boxSizing: "border-box"
+                });
+                videoPreview.controls = true;
+                videoPreview.controlsList = "nodownload nofullscreen noremoteplayback";
+                // 只加载元数据，不让浏览器预载整段源视频（否则硬件解码整片，占用 GPU/内存）
+                videoPreview.preload = "metadata";
+                // 静音：避免音频解码开销，也允许浏览器以更低开销渲染
+                videoPreview.muted = true;
+                videoWrapper.appendChild(videoPreview);
+
+                const cropBox = document.createElement("div");
+                Object.assign(cropBox.style, {
+                    position: "absolute",
+                    border: "2px dashed #38bdf8",
+                    display: "none",
+                    pointerEvents: "auto",
+                    cursor: "move",
+                    boxSizing: "border-box",
+                    boxShadow: "0 0 0 9999px rgba(0, 0, 0, 0.5)",
+                    zIndex: "10",
+                    overflow: "hidden"
+                });
+
+                // 三分构图参考线
+                for (let i = 1; i <= 2; i++) {
+                    const vLine = document.createElement("div");
+                    Object.assign(vLine.style, {
+                        position: "absolute", left: `${i * 33.33}%`, top: "0", bottom: "0",
+                        borderLeft: "1px dashed rgba(255,255,255,0.3)", pointerEvents: "none"
+                    });
+                    const hLine = document.createElement("div");
+                    Object.assign(hLine.style, {
+                        position: "absolute", top: `${i * 33.33}%`, left: "0", right: "0",
+                        borderTop: "1px dashed rgba(255,255,255,0.3)", pointerEvents: "none"
+                    });
+                    cropBox.appendChild(vLine);
+                    cropBox.appendChild(hLine);
+                }
+
+                const createCropHandle = (cursor, pos, borders) => {
+                    const h = document.createElement("div");
+                    Object.assign(h.style, {
+                        position: "absolute",
+                        width: "20px",
+                        height: "20px",
+                        background: "transparent",
+                        cursor: cursor,
+                        pointerEvents: "auto",
+                        ...borders,
+                        ...pos
+                    });
+                    return h;
+                };
+
+                const tlHandle = createCropHandle("nwse-resize", { top: "-3px", left: "-3px" }, { borderTop: "6px solid #38bdf8", borderLeft: "6px solid #38bdf8" });
+                const trHandle = createCropHandle("nesw-resize", { top: "-3px", right: "-3px" }, { borderTop: "6px solid #38bdf8", borderRight: "6px solid #38bdf8" });
+                const blHandle = createCropHandle("nesw-resize", { bottom: "-3px", left: "-3px" }, { borderBottom: "6px solid #38bdf8", borderLeft: "6px solid #38bdf8" });
+                const brHandle = createCropHandle("nwse-resize", { bottom: "-3px", right: "-3px" }, { borderBottom: "6px solid #38bdf8", borderRight: "6px solid #38bdf8" });
+
+                const tmHandle = createCropHandle("ns-resize", { top: "-3px", left: "50%", transform: "translateX(-50%)" }, { borderTop: "6px solid #38bdf8", width: "16px", height: "10px" });
+                const bmHandle = createCropHandle("ns-resize", { bottom: "-3px", left: "50%", transform: "translateX(-50%)" }, { borderBottom: "6px solid #38bdf8", width: "16px", height: "10px" });
+                const lmHandle = createCropHandle("ew-resize", { top: "50%", left: "-3px", transform: "translateY(-50%)" }, { borderLeft: "6px solid #38bdf8", width: "10px", height: "16px" });
+                const rmHandle = createCropHandle("ew-resize", { top: "50%", right: "-3px", transform: "translateY(-50%)" }, { borderRight: "6px solid #38bdf8", width: "10px", height: "16px" });
+
+                const handles = [tlHandle, trHandle, blHandle, brHandle, tmHandle, bmHandle, lmHandle, rmHandle];
+                handles.forEach(h => cropBox.appendChild(h));
+                videoWrapper.appendChild(cropBox);
+
+                container.appendChild(videoWrapper);
+
+                // 裁剪区：时间刻度尺 + 滑块
+                const trimArea = document.createElement("div");
+                Object.assign(trimArea.style, {
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                    background: "rgba(0, 0, 0, 0.35)",
+                    padding: "12px",
+                    borderRadius: "6px",
+                    border: "1px solid rgba(255, 255, 255, 0.05)",
+                    flexShrink: "0", // 缩小节点时时间轴不被挤压
+                    boxSizing: "border-box"
+                });
+
+                const timeRuler = document.createElement("div");
+                Object.assign(timeRuler.style, {
+                    position: "relative",
+                    width: "100%",
+                    height: "22px",
+                    fontSize: "11px",
+                    color: "#aaa",
+                    pointerEvents: "none",
+                    userSelect: "none",
+                    boxSizing: "border-box"
+                });
+                trimArea.appendChild(timeRuler);
+
+                const sliderBox = document.createElement("div");
+                Object.assign(sliderBox.style, {
+                    position: "relative",
+                    width: "100%",
+                    height: "24px",
+                    background: "#111",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    userSelect: "none",
+                    boxShadow: "inset 0 1px 3px rgba(0,0,0,0.5)",
+                    boxSizing: "border-box"
+                });
+
+                const fill = document.createElement("div");
+                Object.assign(fill.style, {
+                    position: "absolute",
+                    height: "100%",
+                    background: "rgba(14, 165, 233, 0.35)",
+                    pointerEvents: "none"
+                });
+                sliderBox.appendChild(fill);
+
+                const createHandle = (color) => {
+                    const h = document.createElement("div");
+                    Object.assign(h.style, {
+                        position: "absolute",
+                        top: "0",
+                        width: "8px",
+                        height: "100%",
+                        background: color,
+                        transform: "translateX(-50%)",
+                        pointerEvents: "none",
+                        boxShadow: "0 0 4px rgba(0,0,0,0.8)",
+                        borderRadius: "2px"
+                    });
+                    return h;
+                };
+
+                const startHandle = createHandle("#38bdf8");
+                const endHandle = createHandle("#38bdf8");
+                sliderBox.appendChild(startHandle);
+                sliderBox.appendChild(endHandle);
+
+                // 分段小方块图层：叠加在裁剪时间轴上，按时间位置显示检测到的分段
+                const segBlocksLayer = document.createElement("div");
+                Object.assign(segBlocksLayer.style, {
+                    position: "absolute",
+                    left: "0", top: "0",
+                    width: "100%", height: "100%",
+                    pointerEvents: "none", // 空白区域不拦截时间轴拖动；方块自身可点击
+                    boxSizing: "border-box",
+                    overflow: "hidden",
+                    borderRadius: "4px"
+                });
+                sliderBox.appendChild(segBlocksLayer);
+                trimArea.appendChild(sliderBox);
+
+                container.appendChild(trimArea);
+
+                // 输出模式切换时的时间轴显示：自定义裁剪 = 长条（高亮+手柄），智能分段 = 小方块
+                const applyOutputTimelineVisual = (smart) => {
+                    fill.style.display = smart ? "none" : "block";
+                    startHandle.style.display = smart ? "none" : "block";
+                    endHandle.style.display = smart ? "none" : "block";
+                    segBlocksLayer.style.display = smart ? "block" : "none";
+                };
+                applyOutputTimelineVisual(false); // 默认：自定义裁剪输出，显示长条
+
+                node.syncLayoutToNode = function() {
+                    const nodeWidth = this.size?.[0] || 690;
+                    const targetWidth = Math.max(10, nodeWidth - 30);
+                    if (container) {
+                        container.style.width = `${targetWidth}px`;
+                        container.style.maxWidth = `${targetWidth}px`;
+                        container.style.boxSizing = "border-box";
+                    }
+                };
+
+                // ==== 智能分段：后端检测镜头边界，结果以小方块画到时间轴 ====
+                let segmentsCacheKey = "";
+                let segmentsCacheData = null;
+                // 当前在时间轴上选中的分段（自定义裁剪模式下控制预览定位与播放范围）
+                let selectedSegment = null;
+
+                const fmtSegTime = (sec) => {
+                    sec = Math.max(0, sec || 0);
+                    const m = Math.floor(sec / 60);
+                    const s = Math.floor(sec % 60);
+                    return `${m}:${s.toString().padStart(2, "0")}`;
+                };
+
+                // 在裁剪时间轴上按当前裁切范围绘制分段小方块
+                const renderSegBlocks = () => {
+                    segBlocksLayer.innerHTML = "";
+                    if (!segmentsCacheData || !segmentsCacheData.segments || segmentsCacheData.segments.length === 0) {
+                        return;
+                    }
+                    const activeDur = getActiveDuration();
+                    let s = startTimeWidget ? (parseFloat(startTimeWidget.value) || 0) : 0;
+                    let e = endTimeWidget ? (parseFloat(endTimeWidget.value) || activeDur) : activeDur;
+                    if (e === 0 || e > activeDur) e = activeDur;
+                    if (s > e) s = e;
+
+                    const selIdx = segmentIndexWidget ? (parseInt(segmentIndexWidget.value) || 0) : 0;
+
+                    segmentsCacheData.segments.forEach((seg, i) => {
+                        if (seg.end <= s || seg.start >= e) return; // 完全在裁切范围外，跳过
+                        // 按绝对时间定位（与裁切手柄/fill 同一坐标系：整条时间轴 = 全片时长）
+                        const leftPct = Math.max(0, (seg.start / activeDur) * 100);
+                        const rightPct = Math.min(100, (seg.end / activeDur) * 100);
+                        const widthPct = Math.max(rightPct - leftPct, 1.2); // 最小宽度保证可点击
+
+                        const isSel = (isSmartMode && seg.index === selIdx) ||
+                            (selectedSegment && Math.abs(selectedSegment.start - seg.start) < 0.01);
+
+                        const block = document.createElement("div");
+                        const hue = 195 + (i * 12) % 40; // 每个分段色相略不同，便于区分
+                        Object.assign(block.style, {
+                            position: "absolute",
+                            left: `${leftPct}%`,
+                            width: `${widthPct}%`,
+                            top: "18%", height: "64%",
+                            background: `hsla(${hue}, 90%, 55%, 0.35)`,
+                            border: isSel ? "1px solid #fff" : "1px solid rgba(255,255,255,0.45)",
+                            borderRadius: "2px",
+                            boxSizing: "border-box",
+                            pointerEvents: "auto",
+                            cursor: "pointer",
+                            boxShadow: isSel ? "0 0 6px rgba(56,189,248,0.9)" : "none",
+                            zIndex: "2"
+                        });
+                        block.title = `#${seg.index} ${fmtSegTime(seg.start)}–${fmtSegTime(seg.end)}`;
+                        // 防止点击方块时触发时间轴的拖动
+                        block.onpointerdown = (ev) => ev.stopPropagation();
+                        block.onclick = () => {
+                            selectedSegment = { start: seg.start, end: seg.end, index: seg.index };
+                            if (isSmartMode && segmentIndexWidget) segmentIndexWidget.value = seg.index;
+                            renderSegBlocks();
+                            if (node.syncTimeInputs) node.syncTimeInputs();
+                            node.setDirtyCanvas(true, false);
+                            // 同步预览画面到该分段的起始帧：seg.start 已由后端对齐为「图像」输出首帧的精确 PTS。
+                            // 加 1e-6 秒的帧内微小偏移，避免 seek 恰好落在帧边界上被浏览器吸附到相邻帧。
+                            if (videoPreview && duration > 0) {
+                                videoPreview.currentTime = Math.min(seg.start + 1e-6, Math.max(0, duration - 0.01));
+                            }
+                        };
+                        segBlocksLayer.appendChild(block);
+                    });
+                };
+
+                let _detectFlashTimer = null;
+                const flashDetectBtn = (msg) => {
+                    detectBtn.textContent = msg;
+                    if (_detectFlashTimer) clearTimeout(_detectFlashTimer);
+                    _detectFlashTimer = setTimeout(() => {
+                        detectBtn.textContent = "检测分段";
+                    }, 1600);
+                };
+
+                // 智能分段模式恢复：仅查询后端已保存的分段结果，命中则直接渲染，不触发重新分割
+                node.tryRestoreCachedSegments = async function () {
+                    const videoVal = videoWidget ? videoWidget.value : "";
+                    if (!videoVal) return;
+                    if (segmentsCacheData && segmentsCacheData.segments && segmentsCacheData.segments.length > 0) return;
+                    const fr = frameRateWidget ? (frameRateWidget.value || 24) : 24;
+                    const st = startTimeWidget ? (parseFloat(startTimeWidget.value) || 0) : 0;
+                    const et = endTimeWidget ? (parseFloat(endTimeWidget.value) || 0) : 0;
+                    try {
+                        const url = `/yuan_tool/video_detect_segments?filename=${encodeURIComponent(videoVal)}&fps=${fr}&start_time=${st}&end_time=${et}&cached=1`;
+                        const resp = await api.fetchApi(url);
+                        if (resp.status !== 200) return;
+                        const data = await resp.json();
+                        if (data.segments && data.segments.length > 0) {
+                            segmentsCacheKey = `${videoVal}|${fr}|${st}|${et}`;
+                            segmentsCacheData = data;
+                            renderSegBlocks();
+                            if (node.syncTimeInputs) node.syncTimeInputs();
+                            node.setDirtyCanvas(true, false);
+                        }
+                    } catch (e) {
+                        // 静默失败，用户仍可手动点击“检测分段”
+                    }
+                };
+
+                detectBtn.onclick = async () => {
+                    const videoVal = videoWidget ? videoWidget.value : "";
+                    if (!videoVal) {
+                        flashDetectBtn("请先选择视频");
+                        return;
+                    }
+                    const fr = frameRateWidget ? (frameRateWidget.value || 24) : 24;
+                    const st = startTimeWidget ? (parseFloat(startTimeWidget.value) || 0) : 0;
+                    const et = endTimeWidget ? (parseFloat(endTimeWidget.value) || 0) : 0;
+                    const key = `${videoVal}|${fr}|${st}|${et}`;
+                    if (segmentsCacheKey === key && segmentsCacheData) {
+                        renderSegBlocks();
+                        if (node.syncTimeInputs) node.syncTimeInputs();
+                        return;
+                    }
+                    detectBtn.disabled = true;
+                    detectBtn.textContent = "检测中...";
+                    try {
+                        const url = `/yuan_tool/video_detect_segments?filename=${encodeURIComponent(videoVal)}&fps=${fr}&start_time=${st}&end_time=${et}`;
+                        const resp = await api.fetchApi(url);
+                        if (resp.status !== 200) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+                        const data = await resp.json();
+                        segmentsCacheKey = key;
+                        segmentsCacheData = data;
+                        renderSegBlocks();
+                        if (node.syncTimeInputs) node.syncTimeInputs();
+                    } catch (err) {
+                        flashDetectBtn("检测失败");
+                    } finally {
+                        detectBtn.disabled = false;
+                        detectBtn.textContent = "检测分段";
+                    }
+                };
+
+                // 由“分段索引”数值驱动：把当前索引对应的分段设为选中，并同步预览到该分段起始帧。
+                // （小方块点击已自带此逻辑；此处覆盖“直接改分段索引数值”的路径，与小方块点击行为保持一致）
+                const applySegmentFromIndex = () => {
+                    if (!isSmartMode) return;
+                    if (!segmentsCacheData || !segmentsCacheData.segments) return;
+                    const idx = segmentIndexWidget ? (parseInt(segmentIndexWidget.value) || 0) : 0;
+                    const seg = segmentsCacheData.segments.find((x) => x.index === idx);
+                    if (!seg || seg.start == null) return;
+                    selectedSegment = { start: seg.start, end: seg.end, index: seg.index };
+                    if (node.syncTimeInputs) node.syncTimeInputs();
+                    if (videoPreview && duration > 0) {
+                        // 同步预览画面到该分段的起始帧：seg.start 已由后端对齐为「图像」输出首帧的精确 PTS。
+                        // 加 1e-6 秒的帧内微小偏移，避免 seek 恰好落在帧边界上被浏览器吸附到相邻帧。
+                        videoPreview.currentTime = Math.min(seg.start + 1e-6, Math.max(0, duration - 0.01));
+                    }
+                };
+
+                // 分段索引变化时同步时间轴高亮
+                if (segmentIndexWidget) {
+                    const origSegCb = segmentIndexWidget.callback;
+                    segmentIndexWidget.callback = function () {
+                        if (origSegCb) origSegCb.apply(this, arguments);
+                        if (segmentsCacheData && segmentsCacheData.segments) {
+                            applySegmentFromIndex();
+                            renderSegBlocks();
+                        }
+                    };
+                }
+
+                // 延后到常规 widget 建完后再挂 DOM widget
+                setTimeout(() => {
+                    node.domWidget = node.addDOMWidget("VideoUI", "div", container);
+
+                    // 返回固定最小包围盒，避免 LiteGraph 把节点压得过窄导致 UI 重叠
+                    node.domWidget.computeSize = function (width) {
+                        const nodeWidth = node.size?.[0] || width || 690;
+                        return [Math.max(10, nodeWidth - 30), 250];
+                    };
+                    // V3：DOM 行尺寸约束（返回 DOM 自身所需尺寸，不含节点标题/端口余量）
+                    node.domWidget.computeLayoutSize = () => ({ minWidth: 660, minHeight: 250 });
+
+                    // 创建后按内容抬高默认宽高（起始高度：740）
+                    requestAnimationFrame(() => {
+                        if (node.size[0] < 690) {
+                            node.size[0] = 690;
+                        }
+
+                        if (node.size[1] < 740) {
+                            node.size[1] = 740;
+                        }
+
+                        // 立即触发一次手动 resize，让高度换算即时生效
+                        node.syncLayoutToNode();
+                        if (node.onResize) node.onResize(node.size);
+
+                        // 恢复保存的显示模式高亮（预置相反值后模拟点击）
+                        if (displayModeWidget && displayModeWidget.value === "帧") {
+                            isFramesMode = false; // 预置相反值，下方 click 触发切换
+                            switchBox.onclick();
+                        }
+
+                        // 同步输出模式按钮到初始数据（预置相反值后模拟点击）
+                        if (outputModeWidget && outputModeWidget.value === "智能分段输出") {
+                            isSmartMode = false;
+                            outputSwitchBox.onclick();
+                        }
+
+                        // 初始化 UI 输入框的标签描述（时间/帧）与显示值
+                        updateTimeInputMode();
+
+                        app.graph.setDirtyCanvas(true, true);
+                    });
+                }, 100);
+
+                // ==== V3 适配：Vue 控件不走原生 callback，逐帧轮询 widget 值；
+                // 移除托管参数的空占位端口、同步最小尺寸；均带变化检测，未变化不写入，避免布局抖动 ====
+                const protoODF = node.onDrawForeground;
+                node.onDrawForeground = function (ctx) {
+                    if (protoODF) protoODF.apply(this, arguments);
+                    try {
+                        const mountEl = (node.domWidget && node.domWidget.element)
+                            ? node.domWidget.element.parentElement : null;
+                        const v3El = findComfyNodeEl(mountEl);
+
+                        // 移除 UI 托管参数的空占位端口：共享清理自带签名去重，且 V3 判定
+                        // 不再依赖本节点 DOM 控件是否已挂载（否则工作流切换后端口会残留）
+                        prunePlaceholderPorts(node, MANAGED_PARAM_NAMES);
+
+                        // 最小尺寸（元素引用缓存，常量尺寸只写一次）
+                        if (v3El) {
+                            node.min_size = [690, 740];
+                            if (node._yuanVideoV3El !== v3El) {
+                                enforceV3MinSize(v3El, 690, 740);
+                                node._yuanVideoV3El = v3El;
+                            }
+                        }
+
+                        // widget 值轮询：首次观测仅记录基线不触发动作
+                        // （防止节点刚创建/工作流加载时误触发裁剪重置等副作用）
+                        const poll = (w, key, fn) => {
+                            if (!w) return;
+                            const v = String(w.value);
+                            if (node[key] === v) return;
+                            const first = node[key] === undefined;
+                            node[key] = v;
+                            if (!first) fn(v);
+                        };
+                        poll(videoWidget, "_yuanLastVideo", () => {
+                            if (!node._initializing) node._should_reset_trim = true;
+                            if (node.updatePreview) node.updatePreview(videoWidget.value);
+                        });
+                        poll(frameRateWidget, "_yuanLastFps", () => {
+                            node.syncFramesFromTime();
+                            updateRuler();
+                            updateUI(true);
+                        });
+                        poll(displayModeWidget, "_yuanLastDisp", () => {
+                            if (node.syncToggleVisual) node.syncToggleVisual();
+                        });
+                        poll(outputModeWidget, "_yuanLastOut", () => {
+                            node.toggleWidgetVisibility();
+                            if (node.syncOutputToggleVisual) node.syncOutputToggleVisual();
+                        });
+                        poll(segmentIndexWidget, "_yuanLastSeg", () => {
+                            if (segmentsCacheData && segmentsCacheData.segments) {
+                                applySegmentFromIndex();
+                                renderSegBlocks();
+                            }
+                        });
+                    } catch (_) {}
+                };
+
+                // ==== 播放/裁剪逻辑与同步 ====
+                let duration = 0;
+                let dragging = null;
+                let dragOffset = 0;
+                let dragSelectionWidth = 0;
+                let isUpdatingDuration = false;
+
+                // 裁剪框拖动状态
+                let cropDragging = null;
+                let dragStartX = 0;
+                let dragStartY = 0;
+                let dragStartCropX = 0;
+                let dragStartCropY = 0;
+                let dragStartCropW = 1;
+                let dragStartCropH = 1;
+
+                const updateCropUI = () => {
+                    const vw = videoPreview.videoWidth;
+                    const vh = videoPreview.videoHeight;
+
+                    let cx = cropXWidget ? parseFloat(cropXWidget.value) || 0 : 0;
+                    let cy = cropYWidget ? parseFloat(cropYWidget.value) || 0 : 0;
+                    let cw_val = cropWWidget ? parseFloat(cropWWidget.value) || 1 : 1;
+                    let ch_val = cropHWidget ? parseFloat(cropHWidget.value) || 1 : 1;
+
+                    const actualW = vw ? Math.round(cw_val * vw) : 0;
+                    const actualH = vh ? Math.round(ch_val * vh) : 0;
+
+                    if (!isCropVisible || !vw) {
+                        cropBox.style.display = "none";
+                        cropEditContainer.style.display = "none";
+                        if (cw_val < 0.999 || ch_val < 0.999 || cx > 0.001 || cy > 0.001) {
+                            cropDims.textContent = `裁剪: ${actualW}x${actualH}`;
+                            cropDims.style.display = "inline-block";
+                        } else {
+                            cropDims.style.display = "none";
+                        }
+                        return;
+                    }
+
+                    cropDims.style.display = "none";
+                    cropEditContainer.style.display = "flex";
+                    cropBox.style.display = "block";
+
+                    if (document.activeElement !== wInput) wInput.value = actualW;
+                    if (document.activeElement !== hInput) hInput.value = actualH;
+
+                    const cw = videoPreview.clientWidth;
+                    const ch = videoPreview.clientHeight;
+
+                    const ratio = Math.min(cw / vw, ch / vh);
+                    const renderedW = vw * ratio;
+                    const renderedH = vh * ratio;
+                    const xOffset = (cw - renderedW) / 2;
+                    const yOffset = (ch - renderedH) / 2;
+
+                    cropBox.style.left = `${xOffset + cx * renderedW}px`;
+                    cropBox.style.top = `${yOffset + cy * renderedH}px`;
+                    cropBox.style.width = `${cw_val * renderedW}px`;
+                    cropBox.style.height = `${ch_val * renderedH}px`;
+                };
+
+                const onCropPointerDown = (e, handle) => {
+                    if (!isCropVisible) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    cropDragging = handle;
+                    e.target.setPointerCapture(e.pointerId);
+
+                    dragStartX = e.clientX;
+                    dragStartY = e.clientY;
+                    dragStartCropX = cropXWidget ? parseFloat(cropXWidget.value) || 0 : 0;
+                    dragStartCropY = cropYWidget ? parseFloat(cropYWidget.value) || 0 : 0;
+                    dragStartCropW = cropWWidget ? parseFloat(cropWWidget.value) || 1 : 1;
+                    dragStartCropH = cropHWidget ? parseFloat(cropHWidget.value) || 1 : 1;
+
+                    e.target.addEventListener("pointermove", onCropPointerMove);
+                    e.target.addEventListener("pointerup", onCropPointerUp);
+                };
+
+                const onCropPointerMove = (e) => {
+                    if (!cropDragging) return;
+                    e.preventDefault();
+
+                    const vw = videoPreview.videoWidth;
+                    const vh = videoPreview.videoHeight;
+                    const cw = videoPreview.clientWidth;
+                    const ch = videoPreview.clientHeight;
+
+                    const ratio = Math.min(cw / vw, ch / vh);
+                    const renderedW = vw * ratio;
+                    const renderedH = vh * ratio;
+
+                    const dx = (e.clientX - dragStartX) / renderedW;
+                    const dy = (e.clientY - dragStartY) / renderedH;
+
+                    let new_cw = dragStartCropW;
+                    let new_ch = dragStartCropH;
+                    let new_cx = dragStartCropX;
+                    let new_cy = dragStartCropY;
+
+                    if (cropDragging === "tl") {
+                        new_cw = dragStartCropW - dx;
+                        new_ch = dragStartCropH - dy;
+                    } else if (cropDragging === "tr") {
+                        new_cw = dragStartCropW + dx;
+                        new_ch = dragStartCropH - dy;
+                    } else if (cropDragging === "bl") {
+                        new_cw = dragStartCropW - dx;
+                        new_ch = dragStartCropH + dy;
+                    } else if (cropDragging === "br") {
+                        new_cw = dragStartCropW + dx;
+                        new_ch = dragStartCropH + dy;
+                    } else if (cropDragging === "tm") {
+                        new_ch = dragStartCropH - dy;
+                    } else if (cropDragging === "bm") {
+                        new_ch = dragStartCropH + dy;
+                    } else if (cropDragging === "lm") {
+                        new_cw = dragStartCropW - dx;
+                    } else if (cropDragging === "rm") {
+                        new_cw = dragStartCropW + dx;
+                    }
+
+                    if (currentAspectRatio > 0 && cropDragging !== "center") {
+                        const R = currentAspectRatio * (vh / vw);
+                        if (["tm", "bm"].includes(cropDragging)) {
+                            new_cw = new_ch * R;
+                            new_cx = dragStartCropX + (dragStartCropW - new_cw) / 2;
+                        } else if (["lm", "rm"].includes(cropDragging)) {
+                            new_ch = new_cw / R;
+                            new_cy = dragStartCropY + (dragStartCropH - new_ch) / 2;
+                        } else {
+                            new_ch = new_cw / R;
+                        }
+                    }
+
+                    if (cropDragging === "tl") {
+                        new_cx = dragStartCropX + dragStartCropW - new_cw;
+                        new_cy = dragStartCropY + dragStartCropH - new_ch;
+                    } else if (cropDragging === "tr") {
+                        new_cx = dragStartCropX;
+                        new_cy = dragStartCropY + dragStartCropH - new_ch;
+                    } else if (cropDragging === "bl") {
+                        new_cx = dragStartCropX + dragStartCropW - new_cw;
+                        new_cy = dragStartCropY;
+                    } else if (cropDragging === "br") {
+                        new_cx = dragStartCropX;
+                        new_cy = dragStartCropY;
+                    } else if (cropDragging === "tm") {
+                        new_cy = dragStartCropY + dragStartCropH - new_ch;
+                        if (!(currentAspectRatio > 0)) new_cx = dragStartCropX;
+                    } else if (cropDragging === "bm") {
+                        new_cy = dragStartCropY;
+                        if (!(currentAspectRatio > 0)) new_cx = dragStartCropX;
+                    } else if (cropDragging === "lm") {
+                        new_cx = dragStartCropX + dragStartCropW - new_cw;
+                        if (!(currentAspectRatio > 0)) new_cy = dragStartCropY;
+                    } else if (cropDragging === "rm") {
+                        new_cx = dragStartCropX;
+                        if (!(currentAspectRatio > 0)) new_cy = dragStartCropY;
+                    } else if (cropDragging === "center") {
+                        new_cx = dragStartCropX + dx;
+                        new_cy = dragStartCropY + dy;
+                    }
+
+                    if (new_cw < 0.02) {
+                        new_cw = 0.02;
+                        if (currentAspectRatio > 0) new_ch = new_cw / (currentAspectRatio * (vh / vw));
+                    }
+                    if (new_ch < 0.02) {
+                        new_ch = 0.02;
+                        if (currentAspectRatio > 0) new_cw = new_ch * (currentAspectRatio * (vh / vw));
+                    }
+
+                    if (cropDragging === "center") {
+                        new_cx = Math.max(0, Math.min(new_cx, 1 - new_cw));
+                        new_cy = Math.max(0, Math.min(new_cy, 1 - new_ch));
+                    } else {
+                        if (new_cx < 0) {
+                            if (["tl", "bl", "lm"].includes(cropDragging)) { new_cw += new_cx; new_cx = 0; }
+                        }
+                        if (new_cy < 0) {
+                            if (["tl", "tr", "tm"].includes(cropDragging)) { new_ch += new_cy; new_cy = 0; }
+                        }
+                        if (new_cx + new_cw > 1) {
+                            if (["tr", "br", "rm"].includes(cropDragging)) new_cw = 1 - new_cx;
+                        }
+                        if (new_cy + new_ch > 1) {
+                            if (["bl", "br", "bm"].includes(cropDragging)) new_ch = 1 - new_cy;
+                        }
+
+                        if (currentAspectRatio > 0) {
+                            const R = currentAspectRatio * (vh / vw);
+                            if (new_cw / new_ch > R + 0.001) {
+                                new_cw = new_ch * R;
+                                if (["tl", "bl", "lm"].includes(cropDragging)) new_cx = dragStartCropX + dragStartCropW - new_cw;
+                            } else if (new_cw / new_ch < R - 0.001) {
+                                new_ch = new_cw / R;
+                                if (["tl", "tr", "tm"].includes(cropDragging)) new_cy = dragStartCropY + dragStartCropH - new_ch;
+                            }
+                        }
+                    }
+
+                    if (cropXWidget) cropXWidget.value = parseFloat(new_cx.toFixed(3));
+                    if (cropYWidget) cropYWidget.value = parseFloat(new_cy.toFixed(3));
+                    if (cropWWidget) cropWWidget.value = parseFloat(new_cw.toFixed(3));
+                    if (cropHWidget) cropHWidget.value = parseFloat(new_ch.toFixed(3));
+
+                    updateCropUI();
+                    app.graph.setDirtyCanvas(true, false);
+                };
+
+                const onCropPointerUp = (e) => {
+                    cropDragging = null;
+                    e.target.releasePointerCapture(e.pointerId);
+                    e.target.removeEventListener("pointermove", onCropPointerMove);
+                    e.target.removeEventListener("pointerup", onCropPointerUp);
+                };
+
+                cropBox.onpointerdown = (e) => {
+                    if (e.target === cropBox) onCropPointerDown(e, "center");
+                };
+                tlHandle.onpointerdown = (e) => onCropPointerDown(e, "tl");
+                trHandle.onpointerdown = (e) => onCropPointerDown(e, "tr");
+                blHandle.onpointerdown = (e) => onCropPointerDown(e, "bl");
+                brHandle.onpointerdown = (e) => onCropPointerDown(e, "br");
+                tmHandle.onpointerdown = (e) => onCropPointerDown(e, "tm");
+                bmHandle.onpointerdown = (e) => onCropPointerDown(e, "bm");
+                lmHandle.onpointerdown = (e) => onCropPointerDown(e, "lm");
+                rmHandle.onpointerdown = (e) => onCropPointerDown(e, "rm");
+
+                // 监听容器尺寸变化，保证裁剪框始终吸附在视频上
+                const resizeObserver = new ResizeObserver(() => {
+                    if (isCropVisible) updateCropUI();
+                });
+                resizeObserver.observe(videoWrapper);
+
+                // 节点移除时断开观察器
+                const oldOnRemoved = node.onRemoved;
+                node.onRemoved = function () {
+                    resizeObserver.disconnect();
+                    if (oldOnRemoved) oldOnRemoved.apply(this, arguments);
+                }
+
+                // 未加载视频时也能正常显示时间轴的兜底时长
+                const getActiveDuration = () => {
+                    if (duration > 0) return duration;
+                    let e = endTimeWidget ? parseFloat(endTimeWidget.value) || 0 : 0;
+                    let s = startTimeWidget ? parseFloat(startTimeWidget.value) || 0 : 0;
+                    let maxVal = Math.max(e, s);
+                    return maxVal > 0 ? Math.max(maxVal, 1.0) : 1.0; // 全空时兜底 1.0 秒
+                };
+
+                // 「时长」控件回调拦截（联动起止时间）
+                if (durationWidget) {
+                    const origCallback = durationWidget.callback;
+                    durationWidget.callback = function (v) {
+                        if (isUpdatingDuration) {
+                            if (origCallback) origCallback.apply(this, arguments);
+                            return;
+                        }
+
+                        isUpdatingDuration = true;
+                        const activeDur = getActiveDuration();
+                        let d = parseFloat(v) || 0;
+                        if (d < 0) d = 0;
+                        if (d > activeDur) d = activeDur;
+
+                        let s = startTimeWidget ? parseFloat(startTimeWidget.value) || 0 : 0;
+                        let newStart = s;
+                        let newEnd = s + d;
+
+                        if (newEnd > activeDur) {
+                            newEnd = activeDur;
+                            newStart = activeDur - d;
+                        }
+
+                        if (startTimeWidget) startTimeWidget.value = parseFloat(newStart.toFixed(2));
+                        if (endTimeWidget) endTimeWidget.value = parseFloat(newEnd.toFixed(2));
+                        node.syncFramesFromTime();
+
+                        if (duration === 0) updateRuler();
+                        updateUI(true);
+                        app.graph.setDirtyCanvas(true, false);
+
+                        if (origCallback) origCallback.apply(this, arguments);
+                        isUpdatingDuration = false;
+                    };
+                }
+
+                // 「时长帧数」控件回调拦截（联动起止帧）
+                if (durationFramesWidget) {
+                    const origCallback = durationFramesWidget.callback;
+                    durationFramesWidget.callback = function (v) {
+                        if (isUpdatingDuration || !frameRateWidget) {
+                            if (origCallback) origCallback.apply(this, arguments);
+                            return;
+                        }
+
+                        isUpdatingDuration = true;
+                        const fr = frameRateWidget.value || 24;
+                        const activeDurFrames = Math.round(getActiveDuration() * fr);
+
+                        let d = parseInt(v) || 0;
+                        if (d < 0) d = 0;
+                        if (d > activeDurFrames) d = activeDurFrames;
+
+                        let s = startFrameWidget ? parseInt(startFrameWidget.value) || 0 : 0;
+                        let newStart = s;
+                        let newEnd = s + d;
+
+                        if (newEnd > activeDurFrames) {
+                            newEnd = activeDurFrames;
+                            newStart = activeDurFrames - d;
+                        }
+
+                        if (startFrameWidget) startFrameWidget.value = newStart;
+                        if (endFrameWidget) endFrameWidget.value = newEnd;
+                        node.syncTimeFromFrames();
+
+                        if (duration === 0) updateRuler();
+                        updateUI(true);
+                        app.graph.setDirtyCanvas(true, false);
+
+                        if (origCallback) origCallback.apply(this, arguments);
+                        isUpdatingDuration = false;
+                    };
+                }
+
+                // 播放器标准时间格式：超过 1 小时才显示小时位
+                const formatTime = (secs) => {
+                    const h = Math.floor(secs / 3600);
+                    const m = Math.floor((secs % 3600) / 60);
+                    const s = Math.floor(secs % 60);
+                    const mStr = m.toString().padStart(2, '0');
+                    const sStr = s.toString().padStart(2, '0');
+
+                    if (h > 0) {
+                        return `${h}:${mStr}:${sStr}`;
+                    } else {
+                        return `${m}:${sStr}`;
+                    }
+                };
+
+                const updateRuler = () => {
+                    timeRuler.innerHTML = '';
+                    const activeDur = getActiveDuration();
+                    const numMajorTicks = 5;
+                    const subTicks = 4;
+                    const totalTicks = (numMajorTicks - 1) * subTicks;
+
+                    const isFrames = displayModeWidget && displayModeWidget.value === "帧";
+                    const fr = frameRateWidget ? frameRateWidget.value : 24;
+
+                    for (let i = 0; i <= totalTicks; i++) {
+                        const pct = i / totalTicks;
+                        const t = activeDur * pct;
+                        const isMajor = i % subTicks === 0;
+                        const tickWrapper = document.createElement("div");
+                        Object.assign(tickWrapper.style, {
+                            position: "absolute", left: `${pct * 100}%`, top: "0",
+                            display: "flex", flexDirection: "column", alignItems: "center", transform: "translateX(-50%)"
+                        });
+                        if (i === 0) { tickWrapper.style.transform = "none"; tickWrapper.style.alignItems = "flex-start"; }
+                        if (i === totalTicks) { tickWrapper.style.transform = "translateX(-100%)"; tickWrapper.style.alignItems = "flex-end"; }
+                        const line = document.createElement("div");
+                        Object.assign(line.style, {
+                            width: isMajor ? "2px" : "1px", height: isMajor ? "6px" : "4px",
+                            background: isMajor ? "#aaa" : "#555", marginBottom: "2px", borderRadius: "1px"
+                        });
+                        tickWrapper.appendChild(line);
+
+                        if (isMajor) {
+                            const label = document.createElement("div");
+                            if (isFrames) {
+                                label.textContent = Math.round(t * fr);
+                            } else {
+                                label.textContent = formatTime(t);
+                            }
+                            tickWrapper.appendChild(label);
+                        }
+                        timeRuler.appendChild(tickWrapper);
+                    }
+                };
+
+                function updateUI(syncPlayer = false) {
+                    const activeDur = getActiveDuration();
+                    const fr = frameRateWidget ? (frameRateWidget.value || 24) : 24;
+                    const isFrames = isFramesMode;
+                    // 当前显示模式对应的刻度范围：时间模式用秒，帧模式用帧
+                    const activeScale = isFrames ? Math.round(activeDur * fr) : activeDur;
+
+                    // 时间输入框（裁剪左侧）与 widget 值保持同步
+                    if (node.syncTimeInputs) node.syncTimeInputs();
+
+                    // 只读当前显示模式对应的起止值，不跨组换算（两组各自独立）
+                    let s, e;
+                    if (isFrames) {
+                        s = startFrameWidget ? parseInt(startFrameWidget.value) || 0 : 0;
+                        e = endFrameWidget ? parseInt(endFrameWidget.value) || 0 : 0;
+                    } else {
+                        s = startTimeWidget ? parseFloat(startTimeWidget.value) || 0 : 0;
+                        e = endTimeWidget ? parseFloat(endTimeWidget.value) || 0 : 0;
+                    }
+
+                    let visualEnd = e;
+                    if (visualEnd === 0 || visualEnd > activeScale) visualEnd = activeScale;
+                    if (s > visualEnd) s = visualEnd;
+
+                    let pStart = (s / activeScale) * 100;
+                    let pEnd = (visualEnd / activeScale) * 100;
+
+                    pStart = Math.max(0, Math.min(pStart, 100));
+                    pEnd = Math.max(0, Math.min(pEnd, 100));
+
+                    startHandle.style.left = `${pStart}%`;
+                    endHandle.style.left = `${pEnd}%`;
+
+                    fill.style.left = `${pStart}%`;
+                    fill.style.width = `${pEnd - pStart}%`;
+
+                    // 只同步当前显示模式对应的时长 widget（帧模式 -> 时长帧数，时间模式 -> 时长），
+                    // 由当前组的起止值计算，绝不跨组换算/覆盖另一组的值。
+                    if (duration > 0 && !isUpdatingDuration) {
+                        isUpdatingDuration = true;
+                        if (isFrames) {
+                            const durF = Math.round(visualEnd - s);
+                            if (durationFramesWidget && durationFramesWidget.value !== durF) {
+                                durationFramesWidget.value = durF;
+                            }
+                        } else {
+                            const durT = parseFloat((visualEnd - s).toFixed(2));
+                            if (durationWidget && durationWidget.value !== durT) {
+                                durationWidget.value = durT;
+                            }
+                        }
+                        isUpdatingDuration = false;
+                    }
+
+                    if (syncPlayer && duration > 0) {
+                        videoPreview.currentTime = isFrames ? s / fr : s;
+                    }
+
+                    // 裁切范围变化时，重绘时间轴上的分段小方块
+                    if (segmentsCacheData && segmentsCacheData.segments) {
+                        renderSegBlocks();
+                    }
+                }
+
+                // 创建后先绘制一次空态时间轴与 UI
+                setTimeout(() => {
+                    updateRuler();
+                    updateUI();
+                }, 50);
+
+                videoPreview.onloadedmetadata = () => {
+                    duration = videoPreview.duration;
+                    if (node._should_reset_trim) {
+                        if (startTimeWidget) startTimeWidget.value = 0;
+                        if (endTimeWidget) endTimeWidget.value = duration;
+                        node._should_reset_trim = false;
+                        node.syncFramesFromTime();
+                    } else {
+                        if (endTimeWidget && (endTimeWidget.value === 0 || endTimeWidget.value > duration)) {
+                            endTimeWidget.value = duration;
+                            node.syncFramesFromTime();
+                        }
+                    }
+                    updateRuler();
+                    updateUI();
+                    updateCropUI();
+                };
+
+                // 播放范围控制：选中分段时只播该分段（播完即停），否则按裁切范围循环
+                videoPreview.ontimeupdate = () => {
+                    if (!duration || dragging) return;
+
+                    // 选中了分段小方块：仅在 [start, end] 内播放，播到结束即停止。
+                    // 段尾暂停由 rVFC/interval 快速监控主处理（见 _pauseAtSegEnd），
+                    // timeupdate 事件频率低（约 250ms），这里仅作极端情况兜底。
+                    if (selectedSegment && selectedSegment.end > 0) {
+                        if (videoPreview.currentTime >= selectedSegment.end - 0.001) {
+                            _pauseAtSegEnd();
+                            return;
+                        }
+                        if (videoPreview.currentTime < selectedSegment.start) {
+                            videoPreview.currentTime = selectedSegment.start;
+                        }
+                        return;
+                    }
+
+                    let s = startTimeWidget ? parseFloat(startTimeWidget.value) || 0 : 0;
+                    let e = endTimeWidget ? parseFloat(endTimeWidget.value) || duration : duration;
+                    if (e === 0) e = duration;
+
+                    if (videoPreview.currentTime >= e && e > 0) {
+                        videoPreview.currentTime = s;
+                    } else if (videoPreview.currentTime < s) {
+                        videoPreview.currentTime = s;
+                    }
+                };
+
+                // 若用户在分段范围之外开始播放，则取消分段选择；已播完再播放则从头重播
+                videoPreview.addEventListener('play', () => {
+                    if (!selectedSegment || !duration) return;
+                    const ct = videoPreview.currentTime;
+                    if (ct < selectedSegment.start - 0.05 || ct > selectedSegment.end + 0.05) {
+                        selectedSegment = null;
+                        if (segmentsCacheData && segmentsCacheData.segments) renderSegBlocks();
+                    } else if (ct >= selectedSegment.end - 0.05) {
+                        videoPreview.currentTime = selectedSegment.start;
+                    }
+                });
+
+                // ==== 段尾精准停帧 ====
+                // timeupdate 约 250ms/次：越界后浏览器先渲染出下一分镜首帧才触发事件，
+                // pause 拉回只是事后补救。故用 rVFC（逐帧回调，按精确 PTS 判断）在输出末帧
+                // 呈现瞬间暂停，杜绝闪现；setInterval 8ms 轮询与 ontimeupdate 依次兜底。
+                // end = 输出末帧精确 PTS + 1e-6，暂停停留帧仍是输出末帧；函数幂等不抖动。
+                const _pauseAtSegEnd = () => {
+                    if (!selectedSegment || selectedSegment.end <= 0 || duration <= 0) return;
+                    if (!videoPreview.paused) videoPreview.pause();
+                    // 吸附到段尾边界；仅当播放头明显偏离时才 seek，避免重复 seek 造成画面抖动
+                    const cur = videoPreview.currentTime;
+                    if (Math.abs(cur - selectedSegment.end) > 1e-4) {
+                        videoPreview.currentTime = selectedSegment.end;
+                    }
+                };
+                const _checkSegEndByFrame = (frameTime) => {
+                    if (!selectedSegment || selectedSegment.end <= 0 || duration <= 0 || videoPreview.paused) return false;
+                    // 1ms 容差：覆盖 mediaTime 与后端 PTS 的浮点换算误差；
+                    // 容差小于任何实际视频帧间隔，只会在输出末帧呈现的瞬间触发，不会提前误停
+                    if (frameTime >= selectedSegment.end - 0.001) {
+                        _pauseAtSegEnd();
+                        return true;
+                    }
+                    return false;
+                };
+                const _checkSegEndByTime = () => {
+                    if (!selectedSegment || selectedSegment.end <= 0 || duration <= 0 || videoPreview.paused) return false;
+                    if (videoPreview.currentTime >= selectedSegment.end) {
+                        _pauseAtSegEnd();
+                        return true;
+                    }
+                    return false;
+                };
+                // 移除节点时停掉轮询与 rVFC 续订，否则闭包和 video 元素不会被释放
+                let _segWatchOff = false;
+                const _rvfcSegLoop = (now, meta) => {
+                    if (_segWatchOff || !videoPreview.requestVideoFrameCallback) return;
+                    if (!videoPreview.paused) _checkSegEndByFrame(meta.mediaTime);
+                    // 暂停时 rVFC 不再回调；恢复播放后自动续上，因此始终续订
+                    videoPreview.requestVideoFrameCallback(_rvfcSegLoop);
+                };
+                if (videoPreview.requestVideoFrameCallback) videoPreview.requestVideoFrameCallback(_rvfcSegLoop);
+                const _segEndPollTimer = setInterval(_checkSegEndByTime, 8);
+                const _prevOnRemovedWatch = node.onRemoved;
+                node.onRemoved = function () {
+                    _segWatchOff = true;
+                    clearInterval(_segEndPollTimer);
+                    videoPreview.pause();
+                    if (_prevOnRemovedWatch) _prevOnRemovedWatch.apply(this, arguments);
+                };
+
+                // --- 时间轴拖动逻辑（主状态以秒运行，播放定位原生锁定） ---
+                sliderBox.onpointerdown = (e) => {
+                    selectedSegment = null; // 拖动裁切点时取消分段选择
+                    const activeDur = getActiveDuration();
+                    const rect = sliderBox.getBoundingClientRect();
+                    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+                    const val = (x / rect.width) * activeDur;
+
+                    let s = startTimeWidget ? parseFloat(startTimeWidget.value) || 0 : 0;
+                    let e_val = endTimeWidget ? parseFloat(endTimeWidget.value) || activeDur : activeDur;
+                    if (e_val === 0) e_val = activeDur;
+
+                    const handleTolerance = (10 / rect.width) * activeDur;
+
+                    if (val > s + handleTolerance && val < e_val - handleTolerance) {
+                        dragging = 'center';
+                        dragOffset = val - s;
+                        dragSelectionWidth = e_val - s;
+                    } else if (Math.abs(val - s) < Math.abs(val - e_val)) {
+                        dragging = 'start';
+                        if (startTimeWidget) startTimeWidget.value = parseFloat(Math.min(val, e_val).toFixed(2));
+                        if (duration > 0) videoPreview.currentTime = startTimeWidget.value;
+                    } else {
+                        dragging = 'end';
+                        if (endTimeWidget) endTimeWidget.value = parseFloat(Math.max(val, s).toFixed(2));
+                        if (duration > 0) videoPreview.currentTime = endTimeWidget.value;
+                    }
+
+                    node.syncFramesFromTime();
+                    updateUI();
+                    app.graph.setDirtyCanvas(true, false);
+                    sliderBox.setPointerCapture(e.pointerId);
+                };
+
+                sliderBox.onpointermove = (e) => {
+                    if (!dragging) return;
+                    const activeDur = getActiveDuration();
+                    const rect = sliderBox.getBoundingClientRect();
+                    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+                    const val = (x / rect.width) * activeDur;
+
+                    if (dragging === 'start') {
+                        let e_val = endTimeWidget ? parseFloat(endTimeWidget.value) || activeDur : activeDur;
+                        if (e_val === 0) e_val = activeDur;
+                        if (startTimeWidget) startTimeWidget.value = parseFloat(Math.min(val, e_val).toFixed(2));
+                        if (duration > 0) videoPreview.currentTime = startTimeWidget.value;
+                    } else if (dragging === 'end') {
+                        const s = startTimeWidget ? parseFloat(startTimeWidget.value) || 0 : 0;
+                        if (endTimeWidget) endTimeWidget.value = parseFloat(Math.max(val, s).toFixed(2));
+                        if (duration > 0) videoPreview.currentTime = endTimeWidget.value;
+                    } else if (dragging === 'center') {
+                        let newStart = val - dragOffset;
+                        let newEnd = newStart + dragSelectionWidth;
+
+                        if (newStart < 0) {
+                            newStart = 0;
+                            newEnd = dragSelectionWidth;
+                        } else if (newEnd > activeDur) {
+                            newEnd = activeDur;
+                            newStart = activeDur - dragSelectionWidth;
+                        }
+
+                        if (startTimeWidget) startTimeWidget.value = parseFloat(newStart.toFixed(2));
+                        if (endTimeWidget) endTimeWidget.value = parseFloat(newEnd.toFixed(2));
+                        if (duration > 0) videoPreview.currentTime = startTimeWidget.value;
+                    }
+
+                    node.syncFramesFromTime();
+                    updateUI();
+                    app.graph.setDirtyCanvas(true, false);
+                };
+
+                sliderBox.onpointerup = (e) => {
+                    dragging = null;
+                    sliderBox.releasePointerCapture(e.pointerId);
+                };
+
+                // --- 容器内部区域拖放上传 ---
+                let dragCounter = 0;
+                container.addEventListener("dragenter", (e) => {
+                    e.preventDefault();
+                    dragCounter++;
+                    if (dragCounter === 1) {
+                        container.style.outline = "2px dashed #38bdf8";
+                        container.style.outlineOffset = "-2px";
+                        container.style.background = "rgba(14, 165, 233, 0.1)";
+                    }
+                });
+
+                container.addEventListener("dragover", (e) => {
+                    e.preventDefault();
+                });
+
+                container.addEventListener("dragleave", (e) => {
+                    e.preventDefault();
+                    dragCounter--;
+                    if (dragCounter === 0) {
+                        container.style.outline = "none";
+                        container.style.background = defaultBg;
+                    }
+                });
+
+                container.addEventListener("drop", (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    dragCounter = 0;
+                    container.style.outline = "none";
+                    container.style.background = defaultBg;
+                    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                        const file = e.dataTransfer.files[0];
+                        if (file.type.startsWith('video/') || file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/)) {
+                            uploadFile(file);
+                        }
+                    }
+                });
+
+                if (videoWidget && videoWidget.value) {
+                    node.updatePreview(videoWidget.value);
+                }
+
+                setTimeout(() => { node._initializing = false; }, 500);
+
+                return r;
+            };
+        }
+    },
+});
