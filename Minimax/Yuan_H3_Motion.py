@@ -170,12 +170,7 @@ def _cond_t(text_len, p):
 
 
 def _fixup(layout, text_len, keyframes, refs=None):
-    """把条件行时间坐标重写为通用位置公式；参考块补偿取自目标实际落点。
-
-    只平移每个关键帧段，**保留段内逐 token 的时间偏移**（核心按 1,4,4,4,4 周期
-    给出）。把整段压平到同一个 t，会让多步锚点的所有 token 落在同一时刻，
-    模型看到同一时空点上多份不同内容 = 双重/多重曝光，渲染成角色虚化、轮廓重叠。
-    """
+    """把条件行时间坐标重写为通用位置公式；参考块补偿取自目标实际落点。"""
     offset = _target_origin(layout) - float(text_len)
     if offset and any(kf.get(MC_KEY) is None for kf in keyframes):
         # 无 MC_KEY 的关键帧会与 MC 关键帧相对滑动，直接拒绝
@@ -193,10 +188,7 @@ def _fixup(layout, text_len, keyframes, refs=None):
         p = kf.get(MC_KEY)
         if p is None:
             continue
-        base = _cond_t(text_len, p) + offset
-        rows = layout.position_ids[a:b, 0]
-        # 段内相对偏移（0, 1.667, 8.333, …）减去段首，再加上本段应有的起点
-        layout.position_ids[a:b, 0] = rows - float(rows[0]) + base
+        layout.position_ids[a:b, 0] = _cond_t(text_len, p) + offset
 
 
 def _fixup_audio(layout, text_len, refs):
@@ -889,52 +881,32 @@ def _steps_for_frames(n):
     return k if covered == n else None
 
 
-def _group_window_frames(n):
-    """不大于 n 的最大「整 VRF 组」帧数（17k）；n < 17 时返回 0。
+def _video_tail_from_latent(latent, n):
+    """从生成的 H3 潜空间切出视频尾部 n 个像素帧，返回 (blocks, covered)。
 
-    源尾段总是 17q+5 帧（5q+2 步），相位 0 的 token 边界落在 17j 帧上。
-    只有取 17k 帧、且从 17(q-k) 帧起，锚点块的 token 跨度才会是标准的
-    1,4,4,4,4,…（与 vae.encode 同长度片段的产物逐 token 一致）。若从尾巴直接
-    切 17k 帧（起点在相位 2），第一个 token 是 4 帧动作 token，模型会把它当成
-    单帧静图 → 时间平均 → 角色虚化、轮廓重叠。
-    """
-    n = int(n)
-    return 0 if n < 17 else (n // 17) * 17
-
-
-def _video_window_from_latent(latent, frames):
-    """从 H3 潜空间切出 frames 帧（须为 17k）作为一个整体锚点块。
-
-    返回 (block, covered, steps)。取源尾段的 [17(q-k), 17q) —— 起点落在相位 0，
-    块内 token 跨度 1,4,4,4,4,… 与「视频图像」模式 vae.encode 同样帧数的产物
-    完全一致，可直接当关键帧 latent 用。源的最后 5 帧（17q..17q+4）不进锚窗：
-    锚窗末端因此与裁剪点重合，交付段第一帧正好接过上一片段的动作，接缝不跳帧。
+    窗口可落在周期任意位置，块的相位由调用方按目标 token 网格（_pixel_frames）赋值。
     """
     video = _video_from_latent(latent)
-    total = int(video.shape[2])                 # 5q+2 步 / 17q+5 帧
-    frames = _group_window_frames(frames)
-    if frames < 17:
+    total = int(video.shape[2])
+    steps = _steps_for_frames(n)
+    if steps is None:
         raise ValueError(
-            "h3_motion_context: 锚窗至少需要 17 帧（1 个整 VRF 组），当前可用 %d 帧。"
-            % frames)
-    steps = frames // 17 * 5
-    if _pixel_frames(steps) != frames:
+            "h3_motion_context: a %d frame window is not a whole number of "
+            "latent steps, so it cannot be sliced from a latent. Use 17, 34, "
+            "51 or 68, or unwire context_latent to encode pixels." % n)
+    if steps > total:
+        raise ValueError(
+            "h3_motion_context: asked for %d latent steps, context_latent "
+            "has %d." % (steps, total))
+    start = total - steps
+    covered = _pixel_frames(steps)
+    if covered != n:
         raise RuntimeError(
-            "h3_motion_context: %d 帧不是 17k 个整组覆盖的长度（内部网格不一致）。"
-            % frames)
-    # 源尾段 5q+2 步：扣掉末尾那 2 步（5 帧）、再往前取 steps 步，起点即相位 0
-    start = total - 2 - steps
-    if start < 0:
-        raise ValueError(
-            "h3_motion_context: 锚窗需要 %d 步，上下文潜空间只有 %d 步（%d 帧）。"
-            % (steps, total, _pixel_frames(total)))
-    if start % 5 != 0:
-        raise ValueError(
-            "h3_motion_context: 上下文潜空间共 %d 步（应为 5q+2），锚窗起点落在 VRF "
-            "相位 %d。请用新版「H3 运动裁剪」重新保存尾段后再试。"
-            % (total, start % 5))
-    block = video[:1, :, start:start + steps].clone()
-    return block, frames, steps
+            "h3_motion_context: %d steps cover %d frames, expected %d."
+            % (steps, covered, n))
+    blocks = [video[:1, :, start + k:start + k + 1].clone()
+              for k in range(steps)]
+    return blocks, covered
 
 
 def _audio_tail_from_latent(latent, a_frames):
@@ -1585,15 +1557,13 @@ class Yuan_H3MotionContext:
                 # —— 以下参数仅「潜空间」衔接模式生效，与上面两窗口互不影响 ——
                 "潜空间上下文长度": (["17", "34", "51", "68"], {
                     "default": "34",
-                    "tooltip": "仅「潜空间」模式生效：本片段头部要扣掉的帧数（= "
-                               "交付段起点，同时是「运动裁剪」的裁剪量，必须是 17 "
-                               "的倍数）。锚窗取源尾段里「整 17k 组、起点落在 VRF "
-                               "相位 0」的等长片段，这样关键帧内部的 token 跨度才"
-                               "与 vae.encode 产物一致（1,4,4,4,4…）；从尾巴直接"
-                               "切会让起点落在相位 2，4 帧动作 token 被当成单帧"
-                               "静图 → 角色虚化、轮廓重叠。源的最后 5 帧不进锚窗，"
-                               "由交付段自然续接，因此接缝不跳帧。更长窗口桥接力"
-                               "更强，但会把更多帧锚向上一片段。"}),
+                    "tooltip": "仅「潜空间」模式生效：从前一片段潜空间延续的"
+                               "画面帧数。17 的倍数是整 VRF 组（5 个潜空间步），"
+                               "只有整组长度才能从尾部切片、又被「运动裁剪」"
+                               "整组切回，接缝处像素与时间完全对齐；本片段头部"
+                               "会扣掉同样长度，因此它同时是「重叠帧数」——"
+                               "交付段第一帧正好接在上一片段末帧之后。更长窗口"
+                               "桥接力更强，但从交付片段头部扣除更多长度。"}),
                 "潜空间音频长度": (["0", "17", "34", "51", "68"], {
                     "default": "17",
                     "tooltip": "仅「潜空间」模式生效：从前一片段潜空间尾部"
@@ -1606,9 +1576,10 @@ class Yuan_H3MotionContext:
                                "的声音；未连接时模型自由生成。"}),
                 "衔接余量": (["0", "17", "34"], {
                     "default": "0",
-                    "tooltip": "仅「潜空间」模式生效。裁剪量在锚窗末端之后再多扣 "
-                               "margin 帧（再吸附到 17 的倍数），拼接处会跳过一段"
-                               "时间（17 帧≈0.71s），观感是跳剪、鬼影、发糊。所以"
+                    "tooltip": "仅「潜空间」模式生效。锚定窗覆盖上一片段末 n 帧、"
+                               "并从本片段头部扣掉同样 n 帧，前后正好首尾相接；"
+                               "此值再额外扣掉 margin 帧，拼接处就会跳过一段时间"
+                               "（17 帧≈0.71s），观感是跳剪、鬼影、发糊。所以"
                                "要做到看不出拼接，必须保持 0；非 0 只在允许跳剪"
                                "（如换镜头）时才用。"}),
             },
@@ -1846,13 +1817,11 @@ class Yuan_H3MotionContext:
     def _apply_latent(self, 条件化, 潜空间, 启用上下文, 模式, 存储位置, 片段序号,
                       上下文长度, 音频上下文长度, 衔接余量, audio_vae, VAE,
                       上下文潜空间, 手动上传):
-        """潜空间衔接：从上一片段 AV 潜空间切出整段锚窗，经色调闭环转化后作为锚点。
+        """潜空间衔接：从上一片段 AV 潜空间切片，经色调闭环转化后作为锚点。
 
-        锚窗取上一片段末尾 17k+5 帧（5k+2 步）作为一个整体关键帧：只有这个长度
-        起点才落在 VRF 相位 0，块内 token 跨度（1,4,4,4,4,…,1,4）与内容逐 token
-        对齐，等价于「视频图像」模式的 vae.encode 产物。锚点必须经 decode→encode
-        归一到关键帧条件认的 latent 空间，并在此做色调闭环（往返不动点 + 参考带
-        内的比例回拉）；内部锚点与关键帧/引用共存由布局、载荷两补丁支持。
+        切片对齐整 VRF 组后直接取 latent；锚点必须经 decode→encode 归一到关键帧
+        条件认的 latent 空间，并在此做色调闭环（往返不动点 + 参考带内的比例回拉），
+        与「视频图像」路径同源；内部锚点与关键帧/引用共存由布局、载荷两补丁支持。
         """
         if not 启用上下文:
             # 直通：尾段保存长度固定一个整组（17 帧）
@@ -1905,48 +1874,61 @@ class Yuan_H3MotionContext:
                 "它并非同一模型的 H3 视频潜空间。"
                 % (int(src_video.shape[1]), int(video.shape[1])))
 
-        available = _pixel_frames(int(src_video.shape[2]))      # 17q+5 帧
-        # 锚窗必须是「整 17k 组、起点相位 0」的窗口：只有这种长度，关键帧内部 token
-        # 跨度才与 vae.encode 产物一致（1,4,4,4,4,…）。源尾段是 17q+5 帧，可从
-        # 17(q-k) 帧起取 17k 帧，源的最后 5 帧留给交付段自然续接。
-        usable = _group_window_frames(available - 5)
-        window = min(_group_window_frames(int(上下文长度)), usable)
-        if window < 17:
+        available = _pixel_frames(int(src_video.shape[2]))
+        n = min(int(上下文长度), available)
+        if n < 5:
             raise ValueError(
-                "h3_motion_context: 上下文潜空间仅有 %d 帧，不足最小锚窗 17 帧"
-                "（1 个整 VRF 组）。" % available)
+                "h3_motion_context: 上下文潜空间仅有 %d 帧，不足最小引导窗 5 帧。"
+                % available)
+        # 切片前对齐到整组网格，使切出的帧正好是整 VRF 组覆盖的帧
+        n = next((g for g in VIDEO_RUN_GRID if g <= n), 0)
 
-        # 交付段从第 trim 帧开始。「运动裁剪」在潜空间上裁头必须是整 VRF 组
-        # （17 帧的倍数，否则解码相位错乱）；默认 trim == 锚窗长度——锚窗末端就是
-        # 交付起点，接缝不跳帧。「衔接余量」会再往后扣，按 17 吸附。
+        # 余量非 0 会让交付段起点后移、拼接处跳过 margin 帧（时间轴出现空洞）；
+        # 音频锚窗不得超过画面锚窗，否则同样把裁剪量顶大
         margin = int(衔接余量 or 0)
-        a_win = min(int(音频上下文长度), window)
-        trim_frames = window + int(math.ceil(max(margin, 0) / 17.0)) * 17
+        a_win = min(int(音频上下文长度), n)
+        # 裁剪量取画面窗、音频窗、画面窗+衔接余量 的较大值并吸附整组
+        trim_frames = next((g for g in VIDEO_RUN_GRID
+                            if g <= max(n, a_win, n + margin)), 0)
+        if trim_frames < 5:
+            raise RuntimeError(
+                "h3_motion_context: 无法从 VIDEO_RUN_GRID 选出裁剪长度，"
+                "请检查节点实现是否与 H3 VAE 匹配。")
 
-        if window >= frame_count:
+        if n >= frame_count:
             raise ValueError(
                 "h3_motion_context: 要把 %d 帧锚定进一个只有 %d 帧的片段，"
-                "锚定窗必须远小于片段总长。请减小「潜空间上下文长度」。"
-                % (window, frame_count))
+                "锚定窗必须远小于片段总长。" % (n, frame_count))
         if trim_frames >= frame_count:
             raise ValueError(
-                "h3_motion_context: 裁剪量 %d 帧达到/超过本片段总长 %d 帧。"
-                "请减小「衔接余量」或「潜空间上下文长度」。"
+                "h3_motion_context: 衔接余量使裁剪量 %d 帧达到/超过本片段总长 "
+                "%d 帧。请减小「衔接余量」或「潜空间上下文长度」。"
                 % (trim_frames, frame_count))
+        if _steps_for_frames(n) is None:
+            # 节点提供的窗口都是完整步数，到达这里说明网格变了
+            raise RuntimeError(
+                "h3_motion_context: %d 帧窗口不是整数个潜空间步。"
+                "VIDEO_RUN_GRID 已与 VAE 不匹配；拒绝渲染以避免接缝错位。" % n)
 
-        block, covered, steps = _video_window_from_latent(上下文潜空间, window)
+        blocks, covered = _video_tail_from_latent(上下文潜空间, n)
         span = covered
         # 锚点须是 vae.encode 的产物：「H3 运动裁剪」存盘时已转化（v2），
         # 只有旧文件或端口直连的未转化潜空间才需要额外的往返。
         converted = (isinstance(上下文潜空间, dict)
                      and bool(上下文潜空间.get(CONTEXT_LATENT_CONVERTED)))
+        # 色调闭环：无论是否已转化都要过一遍——锚点必须与尾段画面同色调，
+        # 且要按比例回拉到链首参考，否则 锚点→输出 的增益会逐段放大。
+        # 解码整段后一次做完，再按潜空间步逐块切回，相位不变。
+        # VAE 未连接时（本模式允许）退回原路径：已转化的 latent 直接使用，
         # 锚点来源处理：
         #   · 已转化（v2，由「运动裁剪」存盘时做过往返）→ **直接用**，不再 decode→encode。
+        #     原因（实测）：H3 编码器按 17 帧分块并丢尾 3 步，潜空间模式的窗口
+        #     5/10/15/20 步（17/34/51/68 帧）都编不回原步数，重编码必然少 3 步。
         #   · 未转化（v1 旧文件 / 端口直连）→ 仅在长度可往返时补一次转化，否则按原样用。
-        #     17k+5 帧窗口（2/7/12/17 步）正好可往返，因此端口直连也能拿到规范锚点。
         seg_idx = int(片段序号)
         ref_mean, ref_std, last_mean, last_std = _tone_state_load(
             存储位置, seg_idx - 1)
+        steps = int(torch.cat(blocks, dim=2).shape[2])
         if converted:
             tone_note = ""
         elif VAE is None:
@@ -1956,7 +1938,8 @@ class Yuan_H3MotionContext:
                 steps, _pixel_frames(steps))
         else:
             with torch.no_grad():
-                _pix_src = _decode_video_latent(block, VAE, "「潜空间」模式的锚点")
+                _tail_video = torch.cat(blocks, dim=2)
+                _pix_src = _decode_video_latent(_tail_video, VAE, "「潜空间」模式的锚点")
                 _tone_src = _tone_stats(_pix_src)
                 _ref = _tone_reference(_tone_src, ref_mean, ref_std)
                 _anchor, guide_tone = _encode_guide_color_neutral(
@@ -1967,28 +1950,23 @@ class Yuan_H3MotionContext:
             if int(_anchor.shape[2]) != steps:
                 raise ValueError(
                     "h3_motion_context: 「潜空间」模式的锚点经往返后由 %d 步变成 %d 步，"
-                    "无法对齐；请确认 VAE 端口连接的是 H3 视频 VAE。"
+                    "无法逐块对齐；请确认 VAE 端口连接的是 H3 视频 VAE。"
                     % (steps, int(_anchor.shape[2])))
-            block = _anchor[:, :, :steps].clone()
-            del _pix_src, _anchor
+            blocks = [_anchor[:, :, k:k + 1].clone()
+                      for k in range(int(_anchor.shape[2]))]
+            del _tail_video, _pix_src, _anchor
             _tone_state_save(存储位置, seg_idx, _ref, guide_tone, _tone_src)
             tone_note = "；已补一次往返转化"
-        # 单个整段锚点：锚窗 = 上一片段末尾 window 帧，占本片段第 0 帧起的位置，
-        # 块内 token 跨度由核心按 1,4,4,4,4 周期给出（与内容逐 token 对齐）。
-        if int(block.shape[2]) != steps or steps != _steps_for_frames(covered):
-            raise RuntimeError(
-                "h3_motion_context: 锚点块与锚窗不一致（%d 步 / %d 帧，锚窗 %d 帧）。"
-                % (int(block.shape[2]), _pixel_frames(int(block.shape[2])), covered))
-        if trim_frames < covered:
-            raise RuntimeError(
-                "h3_motion_context: 裁剪量 %d 帧小于锚窗 %d 帧，锚点内容会漏进交付段。"
-                % (trim_frames, covered))
-        _mc_debug("context.latent", frames=covered, steps=steps,
-                  trim=trim_frames, converted=converted, tone=tone_note)
+        # 时间坐标用目标片段自己的 token 网格（0/1/5/9/13 帧位），与「视频图像」一致
+        indices = [_pixel_frames(k) for k in range(len(blocks))]
+        _mc_debug("context.latent", frames=n, steps=len(blocks),
+                  declared=indices, trim=trim_frames, converted=converted,
+                  tone=tone_note)
         # 追加到已有 keyframes（而非整表替换），可与其他关键帧节点混用
         existing_keyframes = list(条件化[0][1].get("minimax_keyframes", []))
         keyframes = existing_keyframes + [
-            {"resolved_frame_index": 0, MC_KEY: 0, "latent": block},
+            {"resolved_frame_index": 0, MC_KEY: p, "latent": blk}
+            for p, blk in zip(indices, blocks)
         ]
         values = {"minimax_keyframes": keyframes,
                   "minimax_frame_count": frame_count}
@@ -2012,9 +1990,8 @@ class Yuan_H3MotionContext:
         if audio_ref is not None or (条件化 and 条件化[0][1].get("minimax_refs")):
             _ensure_payload_patch()
         if audio_ref is not None:
-            # 音频窗口尾端与画面锚窗末端对齐（= 上一片段的末帧），固定窗口整体
-            # 落在被裁头部内：视频锚点覆盖 0..covered-1，音频锚点止于 covered
-            end_frame = float(covered)
+            # 音频窗口尾端与「运动裁剪」的音频裁剪量一致，固定窗口整体落在被裁头部内
+            end_frame = float(trim_frames)
             end_coord = int(round(end_frame * FRAME_RESCALE))
             audio_ref[MC_AUDIO_KEY] = end_coord / FRAME_RESCALE
             # APPEND 而非赋值：Ref2VA 条件化可能已携带图自身的引用块
@@ -2031,13 +2008,11 @@ class Yuan_H3MotionContext:
                     if isinstance(上下文潜空间, dict) else None)
         hint = (("已关联片段 %s 文件" % clip_idx) if clip_idx is not None
                 else "已关联上下文")
-        hint += "；锚窗 %d 帧/%d 步（源末 5 帧留给续接），交付从第 %d 帧起" % (
-            covered, steps, trim)
         if audio_silent:
             hint += "，音频上下文=静音"
         if margin > 0:
-            hint += "；余量 %d 帧会在拼接处跳过（%.2fs）" % (
-                margin, margin / float(FPS))
+            hint += ("；余量 %d 帧会在拼接处跳过（%.2fs）"
+                     % (margin, margin / float(FPS)))
         hint += tone_note
         return {"result": (out, trim_str), "ui": {"h3_hint": hint}}
 
