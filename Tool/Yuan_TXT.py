@@ -134,7 +134,7 @@ class YUAN_TXTJsonExtractor:
                     "min": 0,
                     "step": 1,
                     "tooltip": "分镜模式：选择「编号」分镜（1 起）。档案模式：选择「档案选择」里的第几条（0 起，0=第一条），「档案」端口只输出该条的全名与描述。"
-                               "分镜序列输出：subject_definitions 定义段 + summary（固定前缀「[reference generation] A N秒 continuous, playful vlog-style sequence: 」+ 本镜「情节」原文，名称同样替换为 <Picture N>）+ detailed_description（首部两行风格头「目标视频为<整体风格>风格，角色一致性必须严格把控。画面质感：<画面质感>。」「场景：<场景>。<运镜方式>」，空一行后接首段时间段 + At MM:SS.mmm 后续时间段）+ 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>；正文不生成 [Shot N]，写手手写的编号一律丢弃）；定义段 <Picture N> 行只输出「补充：」之前的内容（中英文冒号与大小写兼容）；索引输出各档案 0 基序号，索引时长取「类型」时长，分镜类型取该分镜「类型」编码（文戏 0 / 武戏 1 / MV 2 / 其他 3）。"
+                               "分镜序列输出：subject_definitions 定义段 + summary（固定前缀「[reference generation] A N秒 continuous, playful vlog-style sequence: 」+ 本镜「情节」原文，名称同样替换为 <Picture N>）+ detailed_description（首部两行风格头「目标视频为<整体风格>风格，角色一致性必须严格把控。画面质感：<画面质感>。」「场景：<场景>，<在场位置>。<运镜方式>」，空一行后接首段时间段 + At MM:SS.mmm 后续时间段）+ 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>；正文不生成 [Shot N]，写手手写的编号一律丢弃）；定义行固定为「<Picture N> is <名称> for the reference,<描述>.」（名称取第一个分隔符前的部分，角色保留「补充：」内容、其余条目截断补充，无描述时省略逗号段；情节衔接整句当名称；不再输出保留分析行）；索引输出各档案 0 基序号，索引时长取「类型」时长，分镜类型取该分镜「类型」编码（文戏 0 / 武戏 1 / MV 2 / 其他 3）。"
                 }),
                 "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
                     "default": "角色档案",
@@ -423,8 +423,8 @@ class YUAN_TXTJsonExtractor:
         - 首段写纯正文（参考样例：`The sequence starts with a close-up…`）；
         - 其余节拍段 `At MM:SS.mmm, 承接语, 正文`。
         写手手写的 `[Shot N]` 一律丢弃，时间码按段内容耗时分配。
-        「整体风格 / 画面质感 / 场景 / 运镜方式」不进正文，由 `_build_style_header` 统一写在
-        detailed_description 的风格头两行里。"""
+        「整体风格 / 画面质感 / 场景 / 在场位置 / 运镜方式」不进正文，由 `_build_style_header` 统一写在
+        detailed_description 的风格头两行里（在场位置/运镜方式先按本函数同一套规矩清洗 `_clean_header_segment`）。"""
         raw = [str(b).strip() for b in beats if b is not None and str(b).strip()]
         if not raw:
             return []
@@ -449,17 +449,29 @@ class YUAN_TXTJsonExtractor:
             out.append("At %s, %s" % (cls._fmt_ts(stamps[i]), body))
         return out
 
+    # 风格头三项（场景/在场位置/运镜方式）沿用「时间段」的替换规矩：丢手写 [Shot N]、
+    # 去首部 At 时间码、压空白、去句尾标点；名称替换由 _replace_names 在调用前完成
     @classmethod
-    def _build_style_header(cls, style, texture, scene, camera, english=False):
-        """detailed_description 首部风格头（两行）：整体风格 + 画面质感 + 场景 + 运镜方式。
+    def _clean_header_segment(cls, text):
+        """风格头字段清洗：与时间段同一套规矩，句尾标点交给 _build_style_header 统一补。"""
+        s = cls.SHOT_MARK_RE.sub("", str(text or "")).strip()
+        s = re.sub(r'^At\s+\d{1,2}:\d{2}(?:\.\d{1,3})?\s*[,，]?\s*', '', s).strip()
+        s = re.sub(r'[ \t]{2,}', " ", s).strip()
+        return s.rstrip("。.；;，,、 \t")
+
+    @classmethod
+    def _build_style_header(cls, style, texture, scene, place, camera, english=False):
+        """detailed_description 首部风格头（两行）：整体风格 + 画面质感 + 场景 + 在场位置 + 运镜方式。
         中文模板：`目标视频为<整体风格>风格，角色一致性必须严格把控。画面质感：<画面质感>。`
-                  `场景：<场景>。<运镜方式>`
+                  `场景：<场景>，<在场位置>。<运镜方式>`
         英文模板：`The target video is <整体风格>. Visual quality: <画面质感>.`
-                  `Stage: <场景>. <运镜方式>`
-        缺哪项就省哪项；整体风格已带「风格」二字时不重复追加。"""
+                  `Stage: <场景>, <在场位置>. <运镜方式>`
+        缺哪项就省哪项（在场位置缺失时退回 `场景：<场景>。<运镜方式>`）；整体风格已带「风格」二字时不重复追加。
+        场景/在场位置/运镜方式由调用方先按时间段规矩清洗、再做完角色/道具/场景名称替换。"""
         style = str(style or "").strip().rstrip("。.")
         texture = str(texture or "").strip().rstrip("。.")
         scene = str(scene or "").strip().rstrip("。.")
+        place = str(place or "").strip().rstrip("。.")
         camera = str(camera or "").strip()
         line1, line2 = [], []
         if english:
@@ -467,8 +479,10 @@ class YUAN_TXTJsonExtractor:
                 line1.append("The target video is %s." % style)
             if texture:
                 line1.append("Visual quality: %s." % texture)
-            if scene:
-                line2.append("Stage: %s." % scene)
+            if scene and place:
+                line2.append("Stage: %s, %s." % (scene, place))
+            elif scene or place:
+                line2.append("Stage: %s." % (scene or place))
             if camera:
                 line2.append(camera if camera.endswith((".", "。")) else camera + ".")
         else:
@@ -477,8 +491,10 @@ class YUAN_TXTJsonExtractor:
                              % (style, "" if style.endswith("风格") else "风格"))
             if texture:
                 line1.append("画面质感：%s。" % texture)
-            if scene:
-                line2.append("场景：%s。" % scene)
+            if scene and place:
+                line2.append("场景：%s，%s。" % (scene, place))
+            elif scene or place:
+                line2.append("场景：%s。" % (scene or place))
             if camera:
                 line2.append(camera if camera.endswith(("。", ".")) else camera + "。")
         sep = " " if english else ""
@@ -521,26 +537,32 @@ class YUAN_TXTJsonExtractor:
         return int(m.group(1)) if m else 0
 
     @classmethod
-    def _build_retention(cls, blocks, english=False):
-        """按出现主体生成保留分析行（官方关系标记 fully_preserved），并入 subject_definitions 段。
-        正文不带镜头编号，出场范围统一写 appears throughout。"""
-        tail = ("appearance, costume and material follow the reference." if english
-                else "外观、配装与材质与参考一致。")
-        subs = sorted({int(x) for b in blocks for x in re.findall(r'<Picture (\d+)>', b)})
-        return ["<Picture %d> (appears throughout): fully_preserved - %s" % (subj, tail)
-                for subj in subs]
+    def _definition_parts(cls, text, keep_supplement):
+        """档案条目 → (名称, 描述)：先处理「补充：」，再从最早出现的分隔符拆成名称 + 描述。
+        角色保留补充里的配装（「补充：」标记去掉），其余条目在「补充：」处截断。"""
+        full = cls._definition_text(text, keep_supplement)
+        name = cls._before_first_comma(full)
+        desc = full[len(name):].lstrip("，,：:；;、 \t").strip().rstrip("。.；;，,、 \t")
+        return name or str(text).strip(), desc
 
     @classmethod
-    def _build_definitions(cls, entries, voice_lines, summary, retention_lines):
-        """官方定义顺序：subject_definitions（定义行 + 声音引用行 + 保留分析行）→ summary。
+    def _build_definitions(cls, entries, voice_lines, summary):
+        """官方定义顺序：subject_definitions（定义行 + 声音引用行）→ summary。
 
-        保留分析行不再单独起 retention_analysis 段，统一并进 subject_definitions。
+        定义行固定为 `<Picture N> is <名称> for the reference,<描述>.`；没有描述时退回
+        `<Picture N> is <名称> for the reference.`。不再输出保留分析行
+        （`<Picture N> (appears throughout): fully_preserved - ...`）。
+        情节衔接条目不拆名称/描述（整句原文当名称），避免把一句话按逗号切碎。
         """
-        lines = ["<Picture %d> is %s in <Picture %d>."
-                 % (i + 1, cls._definition_text(t, kind == "角色"), i + 1)
-                 for i, (kind, t) in enumerate(entries)]
+        lines = []
+        for i, (kind, t) in enumerate(entries):
+            if kind == "衔接":
+                name, desc = cls._definition_text(t, False), ""
+            else:
+                name, desc = cls._definition_parts(t, kind == "角色")
+            lines.append("<Picture %d> is %s for the reference%s."
+                         % (i + 1, name, ("," + desc) if desc else ""))
         lines.extend(voice_lines)
-        lines.extend(retention_lines or [])
         parts = []
         if lines:
             parts.append("subject_definitions:\n" + "\n".join(lines))
@@ -825,6 +847,7 @@ class YUAN_TXTJsonExtractor:
         BGM = ""
         画面质感item = ""
         运镜方式item = ""
+        在场位置item = ""
         matched_title = ""
         matched_type = ""
         情节条目 = None
@@ -843,6 +866,7 @@ class YUAN_TXTJsonExtractor:
                     BGM = self._list_to_lines(item.get("BGM", ""))
                     画面质感item = self._list_to_lines(item.get("画面质感", ""))
                     运镜方式item = self._list_to_lines(item.get("运镜方式", ""))
+                    在场位置item = self._list_to_lines(item.get("在场位置", ""))
                     matched_title = str(item.get("标题", ""))
                     matched_type = str(item.get("类型", ""))
                     found_shot = True
@@ -859,6 +883,7 @@ class YUAN_TXTJsonExtractor:
         # 镜头级风格字段：优先取「分镜情节」条目（阶段一新增在「出现场景」之后），
         # 其次退回「分镜序列」条目；都没有时为空，风格头里就省掉该项
         画面质感 = (str(情节条目.get("画面质感") or "").strip() if 情节条目 is not None else "") or 画面质感item
+        在场位置 = (str(情节条目.get("在场位置") or "").strip() if 情节条目 is not None else "") or 在场位置item
         运镜方式 = (str(情节条目.get("运镜方式") or "").strip() if 情节条目 is not None else "") or 运镜方式item
         分镜序列整合 = "\n".join(
             self._build_shot_blocks(时间段, self._type_duration_seconds(matched_type) or 0.0))
@@ -1016,15 +1041,17 @@ class YUAN_TXTJsonExtractor:
         分镜序列输出 = self._replace_names(分镜序列输出, pairs, 台词开关)
         情节原文 = self._replace_names(情节原文, pairs, 台词开关)
 
-        # 定义段：summary 取本镜「情节」原文（固定片种前缀）；保留分析行按出场主体生成并进 subject_definitions
+        # 定义段：summary 取本镜「情节」原文（固定片种前缀）；不再生成保留分析行
         英文 = "英文" in self._list_to_lines(data.get("生成语言", ""))
         summary = self._build_summary(matched_type, 情节原文) if 情节原文 else ""
-        retention = self._build_retention(
-            [b for b in 分镜序列输出.split("\n") if b.strip()], 英文)
-        definitions = self._build_definitions(条目列表, voice_lines, summary, retention)
+        definitions = self._build_definitions(条目列表, voice_lines, summary)
 
-        # detailed_description：风格头（整体风格 + 画面质感 + 场景 + 运镜方式）两行，空一行后接时间段正文
-        风格头 = self._build_style_header(整体风格, 画面质感, 场景名称, 运镜方式, 英文)
+        # detailed_description：风格头（整体风格 + 画面质感 + 场景 + 在场位置 + 运镜方式）两行，
+        # 空一行后接时间段正文；在场位置/运镜方式沿用「时间段」的替换规矩——先按正文规矩清洗，
+        # 再做角色/道具/场景名称 → <Picture N>（台词保护同样生效）
+        在场位置头 = self._replace_names(self._clean_header_segment(在场位置), pairs, 台词开关)
+        运镜方式头 = self._replace_names(self._clean_header_segment(运镜方式), pairs, 台词开关)
+        风格头 = self._build_style_header(整体风格, 画面质感, 场景名称, 在场位置头, 运镜方式头, 英文)
         段落 = []
         if definitions:
             段落.append(definitions.rstrip("\n"))

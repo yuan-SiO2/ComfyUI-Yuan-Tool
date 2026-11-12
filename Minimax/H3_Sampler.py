@@ -122,13 +122,77 @@ def _euler_step(state, denoised, sigma, sigma_next):
     return state + (state - denoised.to(state)) * step
 
 
-def _resize_keyframes(cond, h, w):
+def _encode_guide_at_grid(vae, lat, h, w):
+    """把引导 latent 换成 (h, w) 网格上的**合法 VAE 编码**（decode→缩放→encode）。
+
+    latent 不能直接线性缩放：编码器在 (h,w) 网格上产出的 latent 分布与
+    `resize(原 latent)` 不同（后者把高分辨率潜空间平滑掉、丢掉高频结构）。低分前缀
+    吃这种"被平滑的锚点"，会把软结构当成既定内容定下来，高分收尾只剩几步改不动
+    —— 观感就是接上一片段那一段整体发虚、越接越糊。
+
+    H3 编码器按 17 帧分块并丢尾 3 步：17k 帧窗口只能编回 5k-3 步，因此这里在帧尾
+    补 5 帧重复帧再编（17k+5 → 5k+2 步），取前 5k 步即窗口自身的 token。
+    步数或形状对不上（如单帧图引导）时返回 None，由调用方退回缩放路径。
+    """
+    if vae is None or lat is None or lat.ndim != 5:
+        return None
+    steps = int(lat.shape[2])
+    try:
+        with torch.no_grad():
+            pix = vae.decode(lat.float())
+    except Exception:
+        return None
+    if pix.ndim != 5 or int(pix.shape[1]) < 2:
+        return None
+    pix = pix[0].float()                      # [T,H,W,3]
+    grid = comfy.utils.common_upscale(pix.movedim(-1, 1), w * 16, h * 16,
+                                      "area", "disabled")
+    for pad in (0, 5):
+        frames = grid
+        if pad:
+            frames = torch.cat([grid, grid[-1:].repeat(pad, 1, 1, 1)], dim=0)
+        try:
+            with torch.no_grad():
+                z = vae.encode(frames.movedim(1, -1).to(pix))
+        except Exception:
+            return None
+        if (z.ndim != 5 or int(z.shape[2]) < steps
+                or int(z.shape[-2]) != h or int(z.shape[-1]) != w):
+            continue
+        return z[:, :, :steps].to(device=lat.device, dtype=lat.dtype)
+    return None
+
+
+def _scale_latent_to_grid(lat, h, w):
+    """逐帧双线性缩放 latent，并把逐通道 mean/std 补回原值（退化路径）。"""
+    if lat.ndim == 5:
+        batch, channels, frames = lat.shape[:3]
+        resized_latent = torch.nn.functional.interpolate(
+            lat.float().permute(0, 2, 1, 3, 4).reshape(
+                batch * frames, channels, lat.shape[-2], lat.shape[-1]),
+            size=(h, w), mode="bilinear", align_corners=False
+        )
+        resized_latent = resized_latent.reshape(
+            batch, frames, channels, h, w).permute(0, 2, 1, 3, 4)
+    else:
+        resized_latent = torch.nn.functional.interpolate(
+            lat.float(), size=(h, w), mode="bilinear", align_corners=False
+        )
+    source_mean = lat.float().mean(dim=(-2, -1), keepdim=True)
+    source_std = lat.float().std(dim=(-2, -1), keepdim=True)
+    resized_mean = resized_latent.mean(dim=(-2, -1), keepdim=True)
+    resized_std = resized_latent.std(dim=(-2, -1), keepdim=True)
+    scale = (source_std / resized_std.clamp_min(1e-4)).clamp(0.5, 2.0)
+    return ((resized_latent - resized_mean) * scale + source_mean).to(lat)
+
+
+def _resize_keyframes(cond, h, w, vae=None):
     """关键帧条件的 latent 与生成网格同尺寸，这里缩放到低分辨率网格。
 
-    逐帧做空间缩放，绝不在时间维上插值；缩放后补一次逐通道均值**与方差**匹配。
-    只补均值会把锚点的对比度削平（bilinear 收缩方差），低分前缀因此拿到一个
-    "均值对、锐度平"的锚点，高分收尾再把它锐回来，观感上就是锚点附近更容易
-    出硬边和高光截断；方差回填让低分锚点保持原来的能量。
+    优先走 VAE 往返（`_encode_guide_at_grid`），让低分前缀拿到与高分阶段同分布的
+    锚点；VAE 不可用 / 往返改变步数时退回逐帧双线性缩放 + 逐通道均值与方差匹配
+    （只补均值会把锚点对比度削平，方差回填让低分锚点保持原能量）。
+    两种路径都逐帧做空间缩放，绝不在时间维上插值。
     """
     out = []
     for tensor, d in cond:
@@ -142,25 +206,15 @@ def _resize_keyframes(cond, h, w):
             kf = dict(kf)
             lat = kf.get("latent")
             if lat is not None and (lat.shape[-2] != h or lat.shape[-1] != w):
-                if lat.ndim == 5:
-                    batch, channels, frames = lat.shape[:3]
-                    resized_latent = torch.nn.functional.interpolate(
-                        lat.float().permute(0, 2, 1, 3, 4).reshape(
-                            batch * frames, channels, lat.shape[-2], lat.shape[-1]),
-                        size=(h, w), mode="bilinear", align_corners=False
-                    )
-                    resized_latent = resized_latent.reshape(batch, frames, channels, h, w).permute(0, 2, 1, 3, 4)
+                guide = _encode_guide_at_grid(vae, lat, h, w)
+                if guide is not None:
+                    kf["latent"] = guide
                 else:
-                    resized_latent = torch.nn.functional.interpolate(
-                        lat.float(), size=(h, w), mode="bilinear", align_corners=False
-                    )
-                source_mean = lat.float().mean(dim=(-2, -1), keepdim=True)
-                source_std = lat.float().std(dim=(-2, -1), keepdim=True)
-                resized_mean = resized_latent.mean(dim=(-2, -1), keepdim=True)
-                resized_std = resized_latent.std(dim=(-2, -1), keepdim=True)
-                scale = (source_std / resized_std.clamp_min(1e-4)).clamp(0.5, 2.0)
-                kf["latent"] = ((resized_latent - resized_mean) * scale
-                                + source_mean).to(lat)
+                    if os.environ.get("YUAN_SELFLIFT_DEBUG", "0") == "1":
+                        print("[H3Progress] 引导 latent 无法在 %dx%d 网格上重编码，"
+                              "退回双线性缩放：shape=%s"
+                              % (h, w, tuple(lat.shape)), flush=True)
+                    kf["latent"] = _scale_latent_to_grid(lat, h, w)
             resized.append(kf)
         d["minimax_keyframes"] = resized
         out.append((tensor, d))
@@ -248,7 +302,7 @@ def progressive_sample(low_res_model, positive, vae, latent_image, sampler, sigm
     callback = latent_preview.prepare_callback(model, total_steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     # 关键帧条件 latent 与生成网格同尺寸，低分辨率阶段需同步缩放（4D/5D 均支持）
-    positive_low = _resize_keyframes(positive, h, w)
+    positive_low = _resize_keyframes(positive, h, w, vae)
 
     transition = {}
     low_evaluations = 0
