@@ -187,8 +187,47 @@ class YUAN_TXTJsonExtractor:
             return ""
 
     @staticmethod
+    def _strip_json_comments(text):
+        """去掉字符串之外的 // 行注释与 /* */ 块注释（AI 生成 JSON 常带集界注释行，如 //**第01集…**///）。"""
+        out = []
+        i, n = 0, len(text)
+        in_str = False
+        esc = False
+        while i < n:
+            ch = text[i]
+            if in_str:
+                out.append(ch)
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                i += 1
+                continue
+            if ch == '"':
+                in_str = True
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "/" and i + 1 < n:
+                nxt = text[i + 1]
+                if nxt == "/":
+                    i += 2
+                    while i < n and text[i] not in "\r\n":
+                        i += 1
+                    continue
+                if nxt == "*":
+                    end = text.find("*/", i + 2)
+                    i = n if end == -1 else end + 2
+                    continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    @staticmethod
     def _parse_json_text(text):
-        """解析 JSON 字符串：先整体解析，失败时 raw_decode 逐段解析多个拼接对象并合并（同名键后者覆盖）。"""
+        """解析 JSON 字符串：整体解析 → 去掉注释后整体解析 → raw_decode 逐段解析多个拼接对象并合并（同名键后者覆盖）。"""
         s = text.strip() if isinstance(text, str) else text
         if not s:
             return {}
@@ -197,6 +236,18 @@ class YUAN_TXTJsonExtractor:
             return obj if isinstance(obj, dict) else {}
         except Exception:
             pass
+        # AI 生成的 JSON 可能夹整行 // 注释（集界标记），去掉注释后重新整体解析
+        cleaned = YUAN_TXTJsonExtractor._strip_json_comments(s)
+        if cleaned != s:
+            try:
+                obj = _json.loads(cleaned)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+            # 兜底逐段解析同样要在去注释后的文本上进行，否则每个 { 都会被注释卡死、
+            # 只剩碎片键（例如多文件拼接时顶层键 角色档案/分镜序列 全部丢失）
+            s = cleaned
         # 多个 JSON 对象拼接：逐段 raw_decode 解析并合并
         decoder = _json.JSONDecoder()
         data = {}
