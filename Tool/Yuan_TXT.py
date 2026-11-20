@@ -134,7 +134,7 @@ class YUAN_TXTJsonExtractor:
                     "min": 0,
                     "step": 1,
                     "tooltip": "分镜模式：选择「编号」分镜（1 起）。档案模式：选择「档案选择」里的第几条（0 起，0=第一条），「档案」端口只输出该条的全名与描述。"
-                               "分镜序列输出：subject_definitions 定义段 + summary（固定前缀「[reference generation] A N秒 continuous, playful vlog-style sequence: 」+ 本镜「情节」原文，名称同样替换为 <Picture N>）+ detailed_description（首部两行风格头「目标视频为<整体风格>风格，角色一致性必须严格把控。画面质感：<画面质感>。」「场景：<场景>，<在场位置>。<运镜方式>」，空一行后接首段时间段 + At MM:SS.mmm 后续时间段）+ 环境音 + BGM（名称→<Picture N>、说话者→<Picture N><Audio M>；正文不生成 [Shot N]，写手手写的编号一律丢弃）；定义行固定为「<Picture N> is <名称> for the reference,<描述>.」（名称取第一个分隔符前的部分，角色保留「补充：」内容、其余条目截断补充，无描述时省略逗号段；情节衔接整句当名称；不再输出保留分析行）；索引输出各档案 0 基序号，索引时长取「类型」时长，分镜类型取该分镜「类型」编码（文戏 0 / 武戏 1 / MV 2 / 其他 3）。"
+                               "分镜序列输出：subject_definitions 定义段 + summary（固定前缀「[reference generation] A N-second continuous, cinematic sequence: 」+ 本镜「情节」原文，名称同样替换为 <Subject N>）+ retention_analysis（逐主体一行「<Subject 1> appears in [Shot 1], [Shot 2], from <Picture 2>.」，只列该主体真正出现的镜头，没出现的镜头不写、一条都没出现就不出行）+ detailed_description（首部两行风格头「目标视频为<整体风格>风格，角色一致性必须严格把控。画面质感：<画面质感>。」「场景：<Picture N>，<在场位置>。<运镜方式>」，空一行后接正文：首段为「[Shot 1] 正文」不带时间段，后续段为「[Shot N] At MM:SS.mmm, 正文」）+ 环境音 + BGM（名称→<Subject N>、说话者→<Subject N> (Sx)；镜头编号由本节点写，写手手写的编号一律丢弃）；定义行固定为「<Subject N> is the woman <名称> from <Picture 2>,<描述>.」（场景只有一张参考图 `<Picture 1>`，本镜提到的其他场景名（如绘卷层）也指向它、不写定义行，其描述写在 detailed_description 的场景行；角色带性别词 女→the woman、男→the man、无→the person，道具与情节衔接不带；引用图号 = Subject 号 + 1（场景开关关闭或无场景时不加）；名称取第一个分隔符前的部分，角色保留「补充：」内容、其余条目截断补充，无描述时省略逗号段；情节衔接整句当名称）；索引输出各档案 0 基序号，索引时长取「类型」时长，分镜类型取该分镜「类型」编码（文戏 0 / 武戏 1 / MV 2 / 其他 3）。"
                 }),
                 "档案选择": (["角色档案", "音色档案", "道具档案", "场景档案"], {
                     "default": "角色档案",
@@ -153,7 +153,7 @@ class YUAN_TXTJsonExtractor:
                 }),
                 "情节衔接文本": (AnyType("*"), {
                     "forceInput": True,
-                    "tooltip": "接外部文本。情节衔接开启时，在分镜序列定义段中场景行之后新增一行（编号顺延，如场景为 <Picture 3> 则新增 <Picture 4>），内容为该文本原文；关闭或未接入时不新增。"
+                    "tooltip": "接外部文本。情节衔接开启时，在分镜序列定义段的主体行之后新增一行（编号顺延，如场景占 <Picture 1>、已有两个角色则新增 <Subject 3> 引用 <Picture 4>），内容为该文本原文；关闭或未接入时不新增。"
                 }),
             },
         }
@@ -470,10 +470,10 @@ class YUAN_TXTJsonExtractor:
 
     @classmethod
     def _build_shot_blocks(cls, beats, duration):
-        """官方分段，时间码由本节点规划（正文不带镜头编号，不生成 `[Shot N]`）：
-        - 首段写纯正文（参考样例：`The sequence starts with a close-up…`）；
-        - 其余节拍段 `At MM:SS.mmm, 承接语, 正文`。
-        写手手写的 `[Shot N]` 一律丢弃，时间码按段内容耗时分配。
+        """官方分段，时间码与镜头编号都由本节点规划（写手手写的 `[Shot N]` 一律丢弃）：
+        - 首段 `[Shot 1] 正文`（首段只带编号、不带时间段）；
+        - 其余节拍段 `[Shot N] At MM:SS.mmm, 承接语, 正文`。
+        时间码按段内容耗时分配。
         「整体风格 / 画面质感 / 场景 / 在场位置 / 运镜方式」不进正文，由 `_build_style_header` 统一写在
         detailed_description 的风格头两行里（在场位置/运镜方式先按本函数同一套规矩清洗 `_clean_header_segment`）。"""
         raw = [str(b).strip() for b in beats if b is not None and str(b).strip()]
@@ -495,9 +495,9 @@ class YUAN_TXTJsonExtractor:
             return []
 
         stamps = cls._distribute_times([cls._beat_seconds(b) for b in bodies], duration)
-        out = [bodies[0]]
+        out = ["[Shot 1] %s" % bodies[0]]
         for i, body in enumerate(bodies[1:], start=1):
-            out.append("At %s, %s" % (cls._fmt_ts(stamps[i]), body))
+            out.append("[Shot %d] At %s, %s" % (i + 1, cls._fmt_ts(stamps[i]), body))
         return out
 
     # 风格头三项（场景/在场位置/运镜方式）沿用「时间段」的替换规矩：丢手写 [Shot N]、
@@ -583,7 +583,7 @@ class YUAN_TXTJsonExtractor:
 
     @staticmethod
     def _subject_no(tag):
-        """<Picture N> → N（兼容旧稿的 <Subject N>，两者同号）。"""
+        """<Subject N> / <Picture N> → N（两者同号；场景标记 <Picture 1> 不参与主体编号）。"""
         m = re.match(r'^<(?:Subject|Picture) (\d+)>$', str(tag or ""))
         return int(m.group(1)) if m else 0
 
@@ -596,29 +596,80 @@ class YUAN_TXTJsonExtractor:
         desc = full[len(name):].lstrip("，,：:；;、 \t").strip().rstrip("。.；;，,、 \t")
         return name or str(text).strip(), desc
 
-    @classmethod
-    def _build_definitions(cls, entries, voice_lines, summary):
-        """官方定义顺序：subject_definitions（定义行 + 声音引用行）→ summary。
+    # 角色性别词：用于 `<Subject N> is the woman <名称> from <Picture M>` 的性别提示
+    GENDER_FEMALE_RE = re.compile(r'女|\bwoman\b|\bfemale\b|\bgirl\b|\bactress\b', re.IGNORECASE)
+    GENDER_MALE_RE = re.compile(r'男|\bman\b|\bmale\b|\bboy\b|\bactor\b', re.IGNORECASE)
 
-        定义行固定为 `<Picture N> is <名称> for the reference,<描述>.`；没有描述时退回
-        `<Picture N> is <名称> for the reference.`。不再输出保留分析行
-        （`<Picture N> (appears throughout): fully_preserved - ...`）。
-        情节衔接条目不拆名称/描述（整句原文当名称），避免把一句话按逗号切碎。
+    @classmethod
+    def _gender_word(cls, text):
+        """角色条目的性别词：档案里先出现的性别标记优先（女 → the woman，男 → the man），都没有则 the person。"""
+        s = str(text or "")
+        fe = cls.GENDER_FEMALE_RE.search(s)
+        ma = cls.GENDER_MALE_RE.search(s)
+        if fe is not None and (ma is None or fe.start() <= ma.start()):
+            return "the woman"
+        if ma is not None:
+            return "the man"
+        return "the person"
+
+    @classmethod
+    def _subject_name(cls, kind, text):
+        """主体条目 → (名称, 描述)：情节衔接整句当名称；其余沿用档案定义规矩
+        （角色保留「补充：」里的配装，道具在其处截断补充）。"""
+        if kind == "衔接":
+            return cls._definition_text(text, False), ""
+        return cls._definition_parts(text, kind == "角色")
+
+    @classmethod
+    def _build_subject_line(cls, kind, text, subject_no, picture_no):
+        """主体定义行：`<Subject N> is the woman <名称> from <Picture M>,<描述>.`
+
+        参考图号 M = N + 1（有场景参考图时角色从 <Picture 2> 起；场景开关关闭或无场景时从 <Picture 1> 起）；
+        角色带性别词（女 → the woman / 男 → the man / 无 → the person），道具与情节衔接不带；
+        场景不写定义行，其描述由 detailed_description 的场景行承担。
+        名称取第一个分隔符前的部分；无描述时省略逗号段。
         """
-        lines = []
-        for i, (kind, t) in enumerate(entries):
-            if kind == "衔接":
-                name, desc = cls._definition_text(t, False), ""
-            else:
-                name, desc = cls._definition_parts(t, kind == "角色")
-            lines.append("<Picture %d> is %s for the reference%s."
-                         % (i + 1, name, ("," + desc) if desc else ""))
-        lines.extend(voice_lines)
+        name, desc = cls._subject_name(kind, text)
+        lead = ("%s " % cls._gender_word(text)) if kind == "角色" else ""
+        return "<Subject %d> is %s%s from <Picture %d>%s." % (
+            subject_no, lead, name or str(text).strip(), picture_no, ("," + desc) if desc else "")
+
+    @classmethod
+    def _build_retention_lines(cls, body_text, subjects):
+        """retention_analysis：逐主体统计它在 detailed_description 正文里出现在哪些 [Shot N]。
+
+        `subjects` 为 [(subject_no, picture_no)]；只列真正出现过的镜头（某段没出现就不写该段），
+        一条都没出现的主体整行省略。行格式：
+        `<Subject 1> appears in [Shot 1], [Shot 2], from <Picture 2>.`
+        """
+        shots = []
+        for idx, line in enumerate([x for x in str(body_text or "").splitlines() if x.strip()], start=1):
+            m = re.match(r'^\s*\[Shot\s+(\d+)\]', line)
+            shots.append((int(m.group(1)) if m else idx, line))
+        out = []
+        for subject_no, picture_no in subjects:
+            tag = "<Subject %d>" % subject_no
+            hits = [shot_no for shot_no, line in shots if tag in line]
+            if hits:
+                out.append("%s appears in %s, from <Picture %d>."
+                           % (tag, ", ".join("[Shot %d]" % h for h in hits), picture_no))
+        return out
+
+    @classmethod
+    def _build_definitions(cls, subject_lines, voice_lines, summary, retention_lines=None):
+        """官方定义顺序：subject_definitions（定义行 + 声音引用行）→ summary → retention_analysis。
+
+        定义行固定为 `<Subject N> is <性别词> <名称> from <Picture M>,<描述>.`；
+        场景只占唯一的 <Picture 1>（本镜提到的其他场景名也指向它，不写定义行，描述写在 detailed_description 的场景行）。
+        """
         parts = []
+        lines = list(subject_lines) + list(voice_lines)
         if lines:
             parts.append("subject_definitions:\n" + "\n".join(lines))
         if summary:
             parts.append("summary:\n" + summary)
+        if retention_lines:
+            parts.append("retention_analysis:\n" + "\n".join(retention_lines))
         return "\n\n".join(parts)
 
     @classmethod
@@ -626,13 +677,13 @@ class YUAN_TXTJsonExtractor:
         """official summary：固定片种前缀 + 本镜「情节」原文（不再合成类型/参考关系描述）。
         时长取「类型」字段里的秒数（如「文戏 10秒」→ 10-second）；无秒数时省略时长部分。"""
         m = re.search(r'(\d+)\s*秒', str(shot_type or ""))
-        head = ("[reference generation] A %s-second continuous, playful vlog-style sequence: " % m.group(1)
-                if m else "[reference generation] A continuous, playful vlog-style sequence: ")
+        head = ("[reference generation] A %s-second continuous, cinematic sequence: " % m.group(1)
+                if m else "[reference generation] A continuous, cinematic sequence: ")
         return head + str(plot or "").strip()
 
     @staticmethod
     def _replace_names(text, pairs, protect):
-        """名称 → <Picture N>：pairs 按最长优先排好；台词保护开启时引号对与 <d> 内不替换。
+        """名称 → <Subject N>（场景名 → <Picture 1>）：pairs 按最长优先排好；台词保护开启时引号对与 <d> 内不替换。
         detailed_description 与 summary（「情节」）共用这一份替换规则。"""
         for name, tag in pairs:
             if protect:
@@ -732,7 +783,7 @@ class YUAN_TXTJsonExtractor:
         boundary = YUAN_TXTJsonExtractor.BELONG_BOUNDARY
         return re.compile(
             r'(?:(?<=</d>)|(?<![^\s' + boundary + r']))'  # 说话者前边界：句末标点/逗号/空白 或 </d> 之后
-            r'(' + re.escape(name) + r')'        # 组1：说话者（名称或 <Picture N>）
+            r'(' + re.escape(name) + r')'        # 组1：说话者（名称或 <Subject N>）
             r'(?:<Audio \d+>)?'                  # 可选：已有的 <Audio M>（重入时跳过，替换时重写）
             r'([^。！？!?；;\n\r：:]*?)'          # 组2：引导句（允许逗号顿号，不得跨句/跨冒号）
             r'[：:]\s*'                          # 冒号+可选空白
@@ -755,18 +806,18 @@ class YUAN_TXTJsonExtractor:
     def _scan_speaking_order(text, pairs, protect_enabled):
         """扫描分镜序列，按说话角色首次说话的出现顺序分配 <Audio M>（最多3个）。
 
-        识别 `名称+引导句+冒号+<d>` 与 `<Picture N>+引导句+冒号+<d>` 两种说话形式；
+        识别 `名称+引导句+冒号+<d>` 与 `<Subject N>+引导句+冒号+<d>` 两种说话形式；
         同一台词多候选说话者时取离冒号最近者（起点相同取名称更长者）；
         标准规则未命中时从冒号往前追溯最近的未保护候选（引号内/<d>内跳过）；
         台词保护开启时被保护位置不算说话；同一角色只按首次出现分配一个编号。
 
         返回 (audio_by_tag, speaking_tags, winners)：
-        - audio_by_tag：{<Picture N>: "<Audio M>"}，超过3个不分配
+        - audio_by_tag：{<Subject N>: "<Audio M>"}，超过3个不分配
         - speaking_tags：按 <Audio 1/2/3> 分配顺序的标记列表，用于音色索引
         - winners：[(台词位置, 替换起点, 替换终点, 标记)]，替换区间覆盖说话者及已有 <Audio M>（重入重写）
         """
         mask = _build_dialogue_protect_mask(text) if protect_enabled else None
-        # 待匹配的「说话者」形式：名称 + <Picture N> 标记（去重）
+        # 待匹配的「说话者」形式：名称 + <Subject N> 标记（去重）
         forms = []
         for name, tag in pairs:
             forms.append((name, tag))
@@ -943,6 +994,9 @@ class YUAN_TXTJsonExtractor:
         # 角色/道具/场景索引：匹配到的档案 0 基序号（角色/道具逗号分隔，场景单个），未匹配为空
         条目列表 = []
         场景名称 = ""
+        场景别名 = ""
+        场景槽 = []
+        场景名列表 = []
         if not found_shot:
             角色道具场景 = ""
             角色索引 = ""
@@ -951,22 +1005,22 @@ class YUAN_TXTJsonExtractor:
             索引时长 = 0.0
             分镜类型 = 3
         else:
-            # 角色、道具：优先取「分镜情节」条目的 出现角色/出现道具 显式列表；未提供时在分镜时间段文本中智能匹配
+            # 角色、道具：先取「分镜情节」条目的 出现角色/出现道具 显式列表，再用正文匹配补齐
+            # （显式列表常漏项，漏掉的条目在正文里仍是原名、换不成 <Subject N>，故两边取并集、显式顺序在前）
             char_names = [self._extract_name(e) for e in (角色档案数据 if isinstance(角色档案数据, list) else [])]
             prop_names = [self._extract_name(e) for e in (道具档案数据 if isinstance(道具档案数据, list) else [])]
             出现角色 = 情节条目.get("出现角色") if 情节条目 is not None else None
             出现道具 = 情节条目.get("出现道具") if 情节条目 is not None else None
-            char_indices = self._archive_indices_by_names(出现角色, char_names)
-            prop_indices = self._archive_indices_by_names(出现道具, prop_names)
-            if char_indices is None or prop_indices is None:
-                # 匹配范围：标题 + 时间段 + 情节文本 + 环境音（只拿时间段会漏掉「情节/标题里提到的道具」）
-                情节文本 = str(情节条目.get("情节") or "") if 情节条目 is not None else ""
-                查找文本 = "\n".join(x for x in (matched_title, 分镜序列文本, 情节文本, 环境音) if x)
-                text_char, text_prop = self._find_appearing_indices(查找文本, char_names, prop_names)
-                if char_indices is None:
-                    char_indices = text_char
-                if prop_indices is None:
-                    prop_indices = text_prop
+            显式角色 = self._archive_indices_by_names(出现角色, char_names) or []
+            显式道具 = self._archive_indices_by_names(出现道具, prop_names) or []
+            # 匹配范围：标题 + 时间段 + 情节文本 + 环境音 + 镜头级风格三项
+            # （只拿时间段会漏掉「情节/标题里提到的道具」，也漏掉「只在画面质感/在场位置里出现的名字」）
+            情节文本 = str(情节条目.get("情节") or "") if 情节条目 is not None else ""
+            查找文本 = "\n".join(x for x in (matched_title, 分镜序列文本, 情节文本, 环境音,
+                                         画面质感, 在场位置, 运镜方式) if x)
+            text_char, text_prop = self._find_appearing_indices(查找文本, char_names, prop_names)
+            char_indices = 显式角色 + [i for i in text_char if i not in 显式角色]
+            prop_indices = 显式道具 + [i for i in text_prop if i not in 显式道具]
             角色描述列表 = []
             if isinstance(角色档案数据, list):
                 for i in char_indices:
@@ -978,7 +1032,7 @@ class YUAN_TXTJsonExtractor:
                     if 0 <= i < len(道具档案数据) and 道具档案数据[i] is not None:
                         道具描述列表.append(str(道具档案数据[i]))
 
-            # 场景：优先取「分镜情节」条目的 出现场景；未提供时根据分镜标题智能匹配
+            # 场景：优先取「分镜情节」条目的 出现场景（匹配不到再按标题智能匹配）
             出现场景 = 情节条目.get("出现场景") if 情节条目 is not None else None
             scene_names = [self._extract_name(e) for e in (场景档案数据 if isinstance(场景档案数据, list) else [])]
             idx = -1
@@ -993,23 +1047,35 @@ class YUAN_TXTJsonExtractor:
             场景描述 = ""
             if idx >= 0 and isinstance(场景档案数据, list) and idx < len(场景档案数据) and 场景档案数据[idx] is not None:
                 场景描述 = str(场景档案数据[idx])
-            # 风格头里的场景名：优先「出现场景」原文，其次匹配到的场景档案名（不受场景开关影响）
-            场景名称 = (str(出现场景).strip() if isinstance(出现场景, str) and 出现场景.strip()
-                        else self._before_first_comma(场景描述))
+            # 场景参考图只有一张：本镜出现的所有场景名（主场景 + 正文/在场位置里提到的其他场景）
+            # 都换成同一个 <Picture 1>，主体编号从 <Picture 2> 起，不会再多出第二张场景图
+            场景槽 = []
+            场景名列表 = []
+            if 场景开关 and isinstance(场景档案数据, list) and scene_names:
+                _文本角色, 文本场景 = self._find_appearing_indices(查找文本, [], scene_names)
+                场景序号 = set(i for i in 文本场景 if 0 <= i < len(场景档案数据))
+                if 0 <= idx < len(场景档案数据):
+                    场景序号.add(idx)
+                场景名列表 = [scene_names[i] for i in sorted(场景序号) if scene_names[i]]
+                场景槽 = [(i, str(场景档案数据[i])) for i in sorted(场景序号)
+                          if 场景档案数据[i] is not None]
+            # 风格头里的场景名：优先匹配到的场景档案名（保证能换成 <Picture 1>），其次「出现场景」原文
+            场景名称 = (scene_names[idx] if 0 <= idx < len(scene_names) and scene_names[idx]
+                        else (str(出现场景).strip() if isinstance(出现场景, str) and 出现场景.strip() else ""))
+            场景别名 = str(出现场景).strip() if isinstance(出现场景, str) and 出现场景.strip() else ""
 
             # 角色/道具/场景索引：对应档案的 0 基序号，未匹配为空；由对应输出开关控制，关时输出空文本
             角色索引 = ",".join(str(i) for i in char_indices) if 角色开关 else ""
             道具索引 = ",".join(str(i) for i in prop_indices) if 道具开关 else ""
             场景索引 = (str(idx) if idx >= 0 else "") if 场景开关 else ""
 
-            # 定义段条目：角色 → 道具 → 场景 →（可选）情节衔接；顺序即 <Picture N> 与参考图端口序
+            # 定义段条目：角色 → 道具 → 场景 →（可选）情节衔接；场景固定占 <Picture 1>，其余按序编 <Subject N>
             条目列表 = []
             if 角色开关:
                 条目列表.extend(("角色", d) for d in 角色描述列表)
             if 道具开关:
                 条目列表.extend(("道具", d) for d in 道具描述列表)
-            if 场景开关 and 场景描述:
-                条目列表.append(("场景", 场景描述))
+            # 场景不进 条目列表：场景槽位（场景槽）单独按档案顺序编号 <Picture N>，主体从其后开始
             衔接行 = 衔接文本 if (情节衔接开关 and 衔接文本) else ""
             if 衔接行:
                 条目列表.append(("衔接", 衔接行))
@@ -1040,14 +1106,39 @@ class YUAN_TXTJsonExtractor:
                     场景判断 = True
 
         # ==== 官方形态组装 ====
-        # subject_definitions（含保留分析行）→ summary → detailed_description → 两个声音字段
-        # 名称替换：名称 → <Picture N>（Subject 与 Picture 同号，顺序即参考图端口序）
+        # subject_definitions（定义行 + 声音引用行）→ summary → retention_analysis
+        # → detailed_description → 两个声音字段
+        # 参考图编号：本镜所有场景名共用一张场景参考图 <Picture 1>，
+        # 其余条目（角色 → 道具 → 情节衔接）顺延编号为 <Subject 1..M>，各自引用 <Picture N+1>
+        主体条目 = list(条目列表)
+        偏移 = 1 if 场景槽 else 0
+        subject_lines = []
+        subjects = []                          # [(subject_no, picture_no)]，retention_analysis 用
         pairs = []
-        for i, (_kind, text) in enumerate(条目列表):
-            name = self._before_first_comma(text)
+        if 场景槽:
+            # 场景名 → <Picture 1>（风格头与正文里都显示同一张场景参考图），不占用 Subject 编号；
+            # 本镜出现的其他场景名（如绘卷层）也指向这一张，不会多出一张场景图
+            场景替换名 = list(场景名列表)
+            for _scene_index, scene_entry in 场景槽:
+                entry_name = self._extract_name(scene_entry)
+                if entry_name and entry_name not in 场景替换名:
+                    场景替换名.append(entry_name)
+            for scene_name in 场景替换名:
+                pairs.append((scene_name, "<Picture 1>"))
+                core = self._name_core(scene_name)
+                if len(core) >= 2 and core != scene_name:
+                    pairs.append((core, "<Picture 1>"))
+            # 「出现场景」原文与档案写法不一致时一并登记（如只写了前半截），照样换成 <Picture 1>
+            if 场景别名 and 场景别名 != 场景名称 and len(场景别名) >= 2:
+                pairs.append((场景别名, "<Picture 1>"))
+        for i, (kind, text) in enumerate(主体条目):
+            subj_no, pic_no = i + 1, i + 1 + 偏移
+            subject_lines.append(self._build_subject_line(kind, text, subj_no, pic_no))
+            subjects.append((subj_no, pic_no))
+            name, _desc = self._subject_name(kind, text)
             if not name:
                 continue
-            tag = "<Picture %d>" % (i + 1)
+            tag = "<Subject %d>" % subj_no
             pairs.append((name, tag))
             # 别名也登记：档案写全名带括号/别名时，正文只写短名同样替换（同一编号）
             core = self._name_core(name)
@@ -1073,7 +1164,7 @@ class YUAN_TXTJsonExtractor:
                 分镜序列输出 = 分镜序列输出[:s1] + "%s (S%s)" % (tag, sid) + 分镜序列输出[s2:]
                 replaced_ranges.append((s1, s2))
 
-            # 声音引用行 + 音色索引：按发声顺序取 <Picture N> 对应的角色索引（0 基）
+            # 声音引用行 + 音色索引：按发声顺序取 <Subject N> 对应的角色索引（0 基）
             indices = self._parse_voice_indices(角色索引)
             values = []
             for tag in speaking_tags:
@@ -1081,8 +1172,8 @@ class YUAN_TXTJsonExtractor:
                 if not sid:
                     continue
                 subj_no = self._subject_no(tag)
-                voice_lines.append("<Audio %s> is the voice-timbre reference for <Picture %d> (S%s)."
-                                   % (sid, subj_no, sid))
+                voice_lines.append("<Audio %s> is the voice-timbre reference for %s (S%s)."
+                                   % (sid, tag, sid))
                 if indices and 1 <= subj_no <= len(indices):
                     values.append(str(indices[subj_no - 1]))
             if values:
@@ -1092,17 +1183,21 @@ class YUAN_TXTJsonExtractor:
         分镜序列输出 = self._replace_names(分镜序列输出, pairs, 台词开关)
         情节原文 = self._replace_names(情节原文, pairs, 台词开关)
 
-        # 定义段：summary 取本镜「情节」原文（固定片种前缀）；不再生成保留分析行
+        # 定义段：summary 取本镜「情节」原文（固定片种前缀）；retention_analysis 统计各主体出现在哪些镜头
         英文 = "英文" in self._list_to_lines(data.get("生成语言", ""))
         summary = self._build_summary(matched_type, 情节原文) if 情节原文 else ""
-        definitions = self._build_definitions(条目列表, voice_lines, summary)
+        retention_lines = self._build_retention_lines(分镜序列输出, subjects)
+        definitions = self._build_definitions(subject_lines, voice_lines, summary, retention_lines)
 
         # detailed_description：风格头（整体风格 + 画面质感 + 场景 + 在场位置 + 运镜方式）两行，
-        # 空一行后接时间段正文；在场位置/运镜方式沿用「时间段」的替换规矩——先按正文规矩清洗，
-        # 再做角色/道具/场景名称 → <Picture N>（台词保护同样生效）
+        # 空一行后接时间段正文；场景/在场位置/运镜方式沿用「时间段」的替换规矩——先按正文规矩清洗，
+        # 再做角色/道具名称 → <Subject N> / 场景名 → <Picture 1>（台词保护同样生效）；
+        # 画面质感同样含角色名（「warm light full on 白泽's jaw」），一并替换
+        画面质感头 = self._replace_names(画面质感, pairs, 台词开关)
+        场景头 = self._replace_names(场景名称, pairs, 台词开关)
         在场位置头 = self._replace_names(self._clean_header_segment(在场位置), pairs, 台词开关)
         运镜方式头 = self._replace_names(self._clean_header_segment(运镜方式), pairs, 台词开关)
-        风格头 = self._build_style_header(整体风格, 画面质感, 场景名称, 在场位置头, 运镜方式头, 英文)
+        风格头 = self._build_style_header(整体风格, 画面质感头, 场景头, 在场位置头, 运镜方式头, 英文)
         段落 = []
         if definitions:
             段落.append(definitions.rstrip("\n"))
@@ -1142,28 +1237,28 @@ class YUAN_TXTJsonSwitch:
                     "label_on": "输出",
                     "label_off": "不输出",
                     "display_name": "角色输出",
-                    "tooltip": "开=角色名称替换为 <Picture N> 并输出「角色索引」；关=不替换、索引为空。"
+                    "tooltip": "开=角色名称替换为 <Subject N> 并输出「角色索引」；关=不替换、索引为空。"
                 }),
                 "音色开关": ("BOOLEAN", {
                     "default": True,
                     "label_on": "输出",
                     "label_off": "不输出",
                     "display_name": "音色输出",
-                    "tooltip": "开=说话者替换为 <Picture N><Audio M>（最多3个，按说话顺序编号）并输出「音色索引」；关=仅普通替换 <Picture N>、音色索引为空。",
+                    "tooltip": "开=说话者替换为 <Subject N> (Sx) 并在定义段写声音引用行（最多3个，按说话顺序编号），同时输出「音色索引」；关=仅普通替换 <Subject N>、音色索引为空。",
                 }),
                 "道具开关": ("BOOLEAN", {
                     "default": True,
                     "label_on": "输出",
                     "label_off": "不输出",
                     "display_name": "道具输出",
-                    "tooltip": "开=道具名称替换为 <Picture N> 并输出「道具索引」；关=不替换、索引为空。"
+                    "tooltip": "开=道具名称替换为 <Subject N> 并输出「道具索引」；关=不替换、索引为空。"
                 }),
                 "场景开关": ("BOOLEAN", {
                     "default": True,
                     "label_on": "输出",
                     "label_off": "不输出",
                     "display_name": "场景输出",
-                    "tooltip": "开=场景名称替换为 <Picture N> 并输出「场景索引」；关=不替换、索引为空。"
+                    "tooltip": "开=场景名（含本镜提到的其他场景名）统一换成 <Picture 1> 并输出「场景索引」；关=不替换、索引为空。"
                 }),
                 "BGM开关": ("BOOLEAN", {
                     "default": True,
@@ -1184,7 +1279,7 @@ class YUAN_TXTJsonSwitch:
                     "label_on": "新增行",
                     "label_off": "不新增",
                     "display_name": "情节衔接",
-                    "tooltip": "开=分镜序列定义段在场景行之后新增一行「<Picture N>：情节衔接文本」（编号顺延），场景描述行原样输出；关=不新增。"
+                    "tooltip": "开=分镜序列定义段在主体行之后新增一行「<Subject N> is <该文本> from <Picture M>」（编号顺延）；关=不新增。"
                 }),
             },
         }

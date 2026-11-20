@@ -3918,8 +3918,19 @@ app.registerExtension({
               }, 30);
             };
             node._timelineScheduleFit = scheduleFit;
+            // 同步版：加载收尾钩子在首帧前调用（定时器版本要等到 30ms/300ms 后，会看到两次跳高）
+            node._yuanSyncLayoutNow = () => {
+              try {
+                const width = node.size?.[0];
+                if (!width || !node.computeSize) return;
+                const size = node.computeSize([width, -1]);
+                if (Array.isArray(size) && Math.abs((node.size[1] || 0) - size[1]) > 0.5) {
+                  node.size[1] = size[1];
+                }
+              } catch (_) {}
+            };
+            node._yuanSyncLayoutNow();
             scheduleFit();
-            setTimeout(scheduleFit, 300);
           })();
 
           // ── V3 (Nodes 2.0) 尺寸适配：使 DOM 渲染尺寸与 V1 设计保持一致 ──

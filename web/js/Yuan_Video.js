@@ -1405,8 +1405,9 @@ app.registerExtension({
                     };
                 }
 
-                // 延后到常规 widget 建完后再挂 DOM widget
-                setTimeout(() => {
+                // 延后到常规 widget 建完后再挂 DOM widget：用微任务（当前任务结束、画布绘制前），
+                // 不用 setTimeout/rAF——那两者都在首帧之后，会让节点先按无 DOM 的高度画一次再撑到 740
+                queueMicrotask(() => {
                     node.domWidget = node.addDOMWidget("VideoUI", "div", container);
 
                     // 返回固定最小包围盒，避免 LiteGraph 把节点压得过窄导致 UI 重叠
@@ -1418,7 +1419,8 @@ app.registerExtension({
                     node.domWidget.computeLayoutSize = () => ({ minWidth: 660, minHeight: 250 });
 
                     // 创建后按内容抬高默认宽高（起始高度：740）
-                    requestAnimationFrame(() => {
+                    // 同步执行（不再 rAF）：rAF 排在首帧之后，会让节点先画成 478 再撑到 740
+                    (() => {
                         if (node.size[0] < 690) {
                             node.size[0] = 690;
                         }

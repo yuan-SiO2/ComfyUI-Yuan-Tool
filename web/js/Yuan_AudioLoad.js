@@ -30,18 +30,24 @@ app.registerExtension({
 
         // 工作流加载：恢复控件显隐与模式视觉（不改节点尺寸）
         chainCallback(nodeType.prototype, "onConfigure", function () {
-            setTimeout(() => {
+            // 用 requestAnimationFrame（下一帧绘制前）而不是 setTimeout：定时器在首帧画完之后才跑，
+            // 会先按未恢复的状态画一遍再改回来，看着就是「长度/布局闪一下」。
+            requestAnimationFrame(() => {
                 try {
                     if (this.syncLayoutToNode) this.syncLayoutToNode();
                 } catch (e) { console.warn("[YuanAudioLoad] onConfigure layout error:", e); }
-            }, 0);
+            });
             // 等 UI 绑定完成后恢复模式按钮高亮与小方格状态
-            setTimeout(() => {
+            requestAnimationFrame(() => {
                 try {
                     if (this.syncModeVisual) this.syncModeVisual();
                 } catch (e) { console.warn("[YuanAudioLoad] onConfigure visual error:", e); }
-            }, 120);
-            // V3：工作流加载后端口由核心重建，延迟移除占位端口
+            });
+            // V3：移除隐藏控件的空占位端口（会改变节点高度，所以在下一帧绘制前做，不要在定时器里做）
+            requestAnimationFrame(() => {
+                if (this._yuanAudioRemovePorts) this._yuanAudioRemovePorts(this);
+            });
+            // 兜底：V3 节点挂载后核心可能重建端口，再补几次（签名去重，端口没变时零开销）
             [200, 800, 2000].forEach((ms) => setTimeout(() => {
                 if (this._yuanAudioRemovePorts) this._yuanAudioRemovePorts(this);
             }, ms));
@@ -92,6 +98,14 @@ app.registerExtension({
                 prunePlaceholderPorts(n, MANAGED_PARAMS);
             }
             node._yuanAudioRemovePorts = removePlaceholderPorts;
+            // 供 graph.configure 收尾钩子同步调用：加载完成后、首帧绘制前把布局定下来
+            node._yuanSyncLayoutNow = () => {
+                try {
+                    removePlaceholderPorts(node);
+                    if (node.syncLayoutToNode) node.syncLayoutToNode();
+                    if (node.syncModeVisual) node.syncModeVisual();
+                } catch (_) {}
+            };
 
             // --- 通用上传处理（拖拽/选择文件，扩展名过滤） ---
             const handleFileUpload = async (file) => {
@@ -477,7 +491,8 @@ app.registerExtension({
             let fitTimer = null;
             function scheduleFit() {
                 if (fitTimer) return;
-                fitTimer = setTimeout(() => {
+                // rAF：在下一帧绘制前把高度改好，不用定时器（定时器在首帧画完才跑 → 长度闪一下）
+                fitTimer = requestAnimationFrame(() => {
                     fitTimer = null;
                     const width = node.size?.[0];
                     if (!width || !node.computeSize) return;
@@ -488,7 +503,7 @@ app.registerExtension({
                     }
                     node.setDirtyCanvas?.(true, true);
                     node.graph?.setDirtyCanvas?.(true, true);
-                }, 30);
+                });
             }
 
             // 仅兜底最小尺寸，不做内容实测；V2 DOM 高度由 onResize/onDrawForeground 同步

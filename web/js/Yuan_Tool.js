@@ -2,6 +2,12 @@ const { app } = window.comfyAPI.app;
 import { uploadChunked, prunePlaceholderPorts } from "./Yuan_Common.js";
 
 // ---------- YuanTool：多帧参考节点（list_mode 动态端口） ----------
+// 多帧参考的两套端口名（与后端 INPUT_TYPES 一致），加载期裁剪端口时用
+const YUANTOOL_SINGLE_PORTS = ["1", "2", "3", "4", "5", "6", "7", "8"];
+const YUANTOOL_LIST_PORTS = ["image_list_1", "image_list_2", "image_list_3", "image_list_4",
+                             "image_list_5", "image_list_6", "image_list_7", "image_list_8"];
+const YUANTOOL_ALL_PORTS = [...YUANTOOL_SINGLE_PORTS, ...YUANTOOL_LIST_PORTS];
+
 function registerYuanTool(nodeType, portMeta) {
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
@@ -72,18 +78,26 @@ function registerYuanTool(nodeType, portMeta) {
             }
         };
 
-        const syncPortsImpl = (mode) => {
-            // 期望端口集合（有序）：列表模式=listNames 递进组，单帧模式=singleNames 递进组
-            const desiredNames = [];
+        // 期望端口集合（有序）：列表模式=listNames 递进组，单帧模式=singleNames 递进组。
+        // 单独抽出来，加载期裁剪端口（onConfigure）也要用同一套结果，才能一次裁到最终状态。
+        const desiredNamesFor = (mode) => {
+            const out = [];
             if (mode) {
                 for (let i = 0; i < listNames.length; i++) {
-                    if (listVisible(i)) desiredNames.push(listNames[i]);
+                    if (listVisible(i)) out.push(listNames[i]);
                 }
             } else {
                 for (let i = 0; i < singleNames.length; i++) {
-                    if (singleVisible(i)) desiredNames.push(singleNames[i]);
+                    if (singleVisible(i)) out.push(singleNames[i]);
                 }
             }
+            return out;
+        };
+        self._desiredNamesFor = desiredNamesFor;
+
+        const syncPortsImpl = (mode) => {
+            self._lastModeValue = !!mode;   // 供 onDrawForeground 比对模式变化
+            const desiredNames = desiredNamesFor(mode);
             const allOptional = [...singleNames, ...listNames];
 
             // 第一步：保存所有端口的连接信息（从 graph 层面，防止被 ComfyUI 内部清除）
@@ -107,13 +121,36 @@ function registerYuanTool(nodeType, portMeta) {
                 }
             }
 
+            // 第一步补：把连线记到节点上（按端口名），供「切走再切回」时接回去
+            if (!self._yuanToolSavedLinks) self._yuanToolSavedLinks = {};
+            for (const s of savedLinks) {
+                self._yuanToolSavedLinks[s.name] = { origin_id: s.origin_id, origin_slot: s.origin_slot };
+            }
             // 第二步：删除不需要的可选端口（含已弃用的老 image_list 名称，兼容旧工作流加载）
+            // · 另一模式的端口（单帧 ↔ 列表）一律收起，连着的也收——否则切模式后两套端口同时显示；
+            //   它的连线按名字保存在 savedLinks 里，切回该模式时第五步会接回去。
+            // · 本模式的端口只在「没有连线」时收起：删了再 connect() 回连会按「第一个空闲 IMAGE 槽」
+            //   落位，就是「接背景后图像列表1 被占用、原线被挤到图像列表2」那个毛病。
+            const otherModeNames = mode ? singleNames : listNames;
             for (let i = self.inputs.length - 1; i >= 0; i--) {
                 const inp = self.inputs[i];
                 const name = inp.name;
                 const isOptionalOld = (allOptional.includes(name) || name === "image_list");
-                if (isOptionalOld && !desiredNames.includes(name)) {
-                    removeInputAndWidget(name);
+                if (!isOptionalOld || desiredNames.includes(name)) {
+                    continue;
+                }
+                const isOtherMode = otherModeNames.includes(name) || name === "image_list";
+                if (!isOtherMode && inp.link != null) {
+                    continue;
+                }
+                removeInputAndWidget(name);
+                // removeInput 只 splice 数组：补正其后各已连线端口的 target_slot，避免线错位
+                for (let j = i; j < self.inputs.length; j++) {
+                    const other = self.inputs[j];
+                    if (other && other.link != null) {
+                        const l = app.graph.links[other.link];
+                        if (l) l.target_slot = j;
+                    }
                 }
             }
 
@@ -124,48 +161,45 @@ function registerYuanTool(nodeType, portMeta) {
                 }
             }
 
-            // 第四步：背景端口置末。removeInput 会删已连线（重连还因字符串 id 静默失败），
-            // 故数组内移动端口并同步修正 link 的 target_slot。
-            const bgIdx = self.inputs.findIndex(inp => inp.name === bgName);
-            if (bgIdx !== -1) {
-                const bgInput = self.inputs[bgIdx];
+            // 第四步：背景端口固定排第一（后端本来就声明在第一位），只在「它前面的端口全是未连线」时
+            // 才把它挪到头部；不再像原来那样无条件挪到末尾——任何重排都会改动其它端口的下标，
+            // 切工作流时表现为「端口顺序全变了 / 线跑到别的端口」。
+            const bgInput = self.inputs.find(inp => inp.name === bgName);
+            if (bgInput) {
                 bgInput.optional = true;
                 bgInput.removable = true;
                 bgInput.shape = 7;
-
-                if (bgIdx !== self.inputs.length - 1) {
+                const bgIdx = self.inputs.indexOf(bgInput);
+                const canMove = bgIdx > 0
+                    && self.inputs.slice(0, bgIdx).every(inp => inp.link == null);
+                if (canMove) {
                     self.inputs.splice(bgIdx, 1);
-                    // 下标前移 1 位，同步修正后续端口的 target_slot
-                    for (let i = bgIdx; i < self.inputs.length; i++) {
-                        const inp = self.inputs[i];
-                        if (inp && inp.link != null) {
-                            const l = app.graph.links[inp.link];
-                            if (l) l.target_slot--;
-                        }
-                    }
-                    self.inputs.push(bgInput);
+                    self.inputs.unshift(bgInput);
                     if (bgInput.link != null) {
                         const l = app.graph.links[bgInput.link];
-                        if (l) l.target_slot = self.inputs.length - 1;
+                        if (l) l.target_slot = 0;
                     }
                 }
             } else {
                 addOptionalImageInput(bgName);
             }
 
-            // 第五步：恢复所有保存的连接
-            for (const saved of savedLinks) {
-                const inp = self.inputs.find(inp => inp.name === saved.name);
-                if (inp && inp.link == null) {
-                    const originNode = app.graph.getNodeById(saved.origin_id);
-                    if (originNode) {
-                        const targetSlot = self.inputs.indexOf(inp);
-                        try {
-                            // 传节点对象而非 self.id：新版节点 id 为字符串，connect 只解析 number，传 id 会静默失败
-                            originNode.connect(saved.origin_slot, self, targetSlot);
-                        } catch (_) {}
-                    }
+            // 第五步：把之前收起的连线按名字接回（端口存在且空着才接；接不上就丢弃这条记录）
+            for (const name of Object.keys(self._yuanToolSavedLinks)) {
+                const inp = self.inputs.find(item => item.name === name);
+                if (!inp || inp.link != null) continue;
+                const saved = self._yuanToolSavedLinks[name];
+                const originNode = app.graph.getNodeById(saved.origin_id);
+                if (!originNode) {
+                    delete self._yuanToolSavedLinks[name];
+                    continue;
                 }
+                const targetSlot = self.inputs.indexOf(inp);
+                try {
+                    // 传节点对象而非 self.id：新版节点 id 为字符串，connect 只解析 number，传 id 会静默失败
+                    originNode.connect(saved.origin_slot, self, targetSlot);
+                    delete self._yuanToolSavedLinks[name];
+                } catch (_) {}
             }
 
             // 保持当前宽度不变，只更新高度
@@ -174,13 +208,30 @@ function registerYuanTool(nodeType, portMeta) {
             app.graph.setDirtyCanvas(true, true);
         };
 
-        // 下一 tick 再同步：生命周期回调中 graph.links 尚未挂到 input.link，立即执行会误判端口、slot 错位致切换工作流断开
+        // 同步时机（实测过三种）：
+        // · setTimeout：首帧画完才跑 → 长度先按全部端口撑高再缩回（闪）
+        // · requestAnimationFrame：排在画布自己的渲染回调之后 → 首帧仍是旧尺寸（照样闪）
+        // · queueMicrotask：当前任务结束就执行，连线已挂好、画布还没绘制 → 首帧即是最终尺寸
         const scheduleSync = (mode) => {
-            clearTimeout(self._syncTimer);
-            self._syncTimer = setTimeout(() => syncPortsReal(mode), 0);
+            self._syncPendingMode = !!mode;
+            if (self._syncQueued) return;
+            self._syncQueued = true;
+            queueMicrotask(() => {
+                self._syncQueued = false;
+                const graph = self.graph || (self.canvas && self.canvas.graph);
+                const stillAlive = !!graph && graph === app.graph && !!app.graph.getNodeById
+                    && app.graph.getNodeById(self.id) === self;
+                if (!stillAlive) return;
+                syncPortsReal(self._syncPendingMode);
+            });
         };
 
         self._syncPorts = scheduleSync;
+        // 立刻同步执行（供 graph.configure 结束后调用：那时连线已恢复、画布还没画）
+        self._syncPortsNow = () => {
+            const w2 = self.widgets && self.widgets.find(x => x.name === "list_mode");
+            syncPortsReal(!!(w2 && w2.value));
+        };
 
         const modeWidget = this.widgets.find(w => w.name === "list_mode");
         if (modeWidget) {
@@ -219,11 +270,23 @@ function registerYuanTool(nodeType, portMeta) {
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (info) {
         const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
-        if (this._syncPorts) {
-            const w = this.widgets.find(w => w.name === "list_mode");
-            if (w) this._syncPorts(!!w.value);
-        }
+        // 注意：加载期不能裁端口。ComfyUI 按端口「下标」恢复连线，这里删掉任何端口都会
+        // 让后面的连线错位（实测：本该接 image_list_1..3，结果接到 1、2、5、6 上）。
+        // 端口裁剪只在延迟同步里做（那时连线已挂好），代价是高度会在首帧后收敛一次。
+        const w = this.widgets && this.widgets.find(x => x.name === "list_mode");
+        if (this._syncPorts) this._syncPorts(!!(w && w.value));
         return r;
+    };
+
+    // 「输入模式」切换后按新模式重排端口：新旧前端的布尔/下拉控件都不一定走原生 callback，
+    // 这里在绘制时比对值来触发（与 Yuan_H3MotionContextTrim 同一做法）。
+    const onDrawForeground = nodeType.prototype.onDrawForeground;
+    nodeType.prototype.onDrawForeground = function (ctx) {
+        const w = this.widgets && this.widgets.find(x => x.name === "list_mode");
+        if (w && this._syncPorts && !!w.value !== !!this._lastModeValue) {
+            this._syncPorts(!!w.value);
+        }
+        if (onDrawForeground) return onDrawForeground.apply(this, arguments);
     };
 }
 
@@ -290,29 +353,34 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
             }
         };
 
+
+        // 期望端口集合（有序）：加载期裁剪端口也用同一套结果，才能一次裁到最终状态
+        const desiredNamesFor = () => {
+            const modeWidget = self.widgets && self.widgets.find(w => w.name === "mode");
+            const isRef = !!(modeWidget && modeWidget.value === MINIMAX_MODE_REF);
+            const isGuide = !!(modeWidget && modeWidget.value === MINIMAX_MODE_GUIDE);
+            const out = [];
+            if (isRef) {
+                out.push(...MINIMAX_REF_BASE_INPUTS);
+                for (const chain of MINIMAX_REF_CHAINS) {
+                    for (let i = 0; i < chain.length; i++) {
+                        if (chainVisible(chain, i)) out.push(chain[i]);
+                    }
+                }
+            } else if (isGuide) {
+                out.push(...MINIMAX_GUIDE_INPUTS);
+            } else {
+                out.push(...MINIMAX_I2V_INPUTS);
+            }
+            return out;
+        };
+        self._desiredNamesFor = desiredNamesFor;
+
         const syncPortsReal = () => {
             if (self._syncing) return;
             self._syncing = true;
             try {
-                const modeWidget = self.widgets.find(w => w.name === "mode");
-                const isRef = !!(modeWidget && modeWidget.value === MINIMAX_MODE_REF);
-                const isGuide = !!(modeWidget && modeWidget.value === MINIMAX_MODE_GUIDE);
-
-                // 计算期望端口集合（有序）
-                const desiredNames = [];
-                if (isRef) {
-                    desiredNames.push(...MINIMAX_REF_BASE_INPUTS);
-                    for (const chain of MINIMAX_REF_CHAINS) {
-                        for (let i = 0; i < chain.length; i++) {
-                            if (chainVisible(chain, i)) desiredNames.push(chain[i]);
-                        }
-                    }
-                } else if (isGuide) {
-                    desiredNames.push(...MINIMAX_GUIDE_INPUTS);
-                } else {
-                    desiredNames.push(...MINIMAX_I2V_INPUTS);
-                }
-
+                const desiredNames = desiredNamesFor();
                 // 第一步：保存所有可选端口的连接信息
                 const savedLinks = [];
                 for (let i = self.inputs.length - 1; i >= 0; i--) {
@@ -381,11 +449,13 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
                     }
                 }
 
-                // 第六步：参考图尺寸 / 锚定帧 widget 显隐（只隐藏不删除，避免 widgets_values 索引错位）
+                const modeWidget2 = self.widgets.find(w => w.name === "mode");
+                const isRef2 = !!(modeWidget2 && modeWidget2.value === MINIMAX_MODE_REF);
+                const isGuide2 = !!(modeWidget2 && modeWidget2.value === MINIMAX_MODE_GUIDE);
                 const sizeWidget = self.widgets.find(w => w.name === "ref_image_size");
-                if (sizeWidget) sizeWidget.hidden = !isRef;
+                if (sizeWidget) sizeWidget.hidden = !isRef2;
                 const guideIdxWidget = self.widgets.find(w => w.name === "guide_frame_idx");
-                if (guideIdxWidget) guideIdxWidget.hidden = !isGuide;
+                if (guideIdxWidget) guideIdxWidget.hidden = !isGuide2;
 
                 // 第七步：保持当前宽度不变，只更新高度
                 const currentWidth = self.size ? self.size[0] : self.computeSize()[0];
@@ -396,13 +466,22 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
             }
         };
 
-        // 下一 tick 再同步：links 可能尚未挂到 input.link，立即执行会误判端口
+        // 同步时机：queueMicrotask —— 连线此时已挂好，且排在画布绘制之前（rAF 会排在渲染回调之后，
+        // 首帧仍按旧端口数画 → 长度闪一下）
         const scheduleSync = () => {
-            clearTimeout(self._syncTimer);
-            self._syncTimer = setTimeout(syncPortsReal, 0);
+            if (self._syncQueued) return;
+            self._syncQueued = true;
+            queueMicrotask(() => {
+                self._syncQueued = false;
+                const graph = self.graph || (self.canvas && self.canvas.graph);
+                if (!graph || graph !== app.graph || !app.graph.getNodeById
+                    || app.graph.getNodeById(self.id) !== self) return;
+                syncPortsReal();
+            });
         };
 
         self._syncPorts = scheduleSync;
+        self._syncPortsNow = () => syncPortsReal();
 
         const modeWidget = self.widgets.find(w => w.name === "mode");
         if (modeWidget) {
@@ -440,6 +519,7 @@ function registerYuanMiniMaxH3Video(nodeType, portMeta) {
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (info) {
         const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+        // 同上：加载期不能裁端口（下标变动会串线），只做延迟同步
         if (this._syncPorts) this._syncPorts();
         return r;
     };
@@ -585,12 +665,20 @@ function registerYuanMiniMaxH3RefEmbeds(nodeType, portMeta) {
         };
 
         // 下一 tick 再同步：links 可能尚未挂到 input.link，立即执行会误判端口
+        // 同步时机：queueMicrotask（连线已挂好、且排在画布绘制之前；rAF 会排在渲染回调之后）
         const scheduleSync = () => {
-            clearTimeout(self._syncTimer);
-            self._syncTimer = setTimeout(syncPortsReal, 0);
+            if (self._syncQueued) return;
+            self._syncQueued = true;
+            queueMicrotask(() => {
+                self._syncQueued = false;
+                const graph = self.graph || (self.canvas && self.canvas.graph);
+                if (!graph || graph !== app.graph || !app.graph.getNodeById
+                    || app.graph.getNodeById(self.id) !== self) return;
+                syncPortsReal();
+            });
         };
-
         self._syncPorts = scheduleSync;
+        self._syncPortsNow = () => syncPortsReal();
         scheduleSync();
 
         // 修正初始已创建端口的 label / tooltip（框架自动生成的端口可能未正确应用 display_name）
@@ -863,10 +951,10 @@ function registerYuanH3MotionContext(nodeType, portMeta) {
             // 连线（其他节点的输入对象随后还会被替换），推迟到加载结束后再校正显隐。
             if (!this._yuanH3DeferSync) {
                 this._yuanH3DeferSync = true;
-                setTimeout(() => {
+                requestAnimationFrame(() => {
                     this._yuanH3DeferSync = false;
                     if (this._syncModeReal) this._syncModeReal();
-                }, 0);
+                });
             }
         }
         yuanRemoveHiddenWidgetPorts(this, ["存储位置", "手动上传"]);
@@ -1175,10 +1263,10 @@ function registerYuanH3MotionContextTrim(nodeType, portMeta) {
         if (this._syncTrimMode) {
             if (!this._yuanH3TrimDeferSync) {
                 this._yuanH3TrimDeferSync = true;
-                setTimeout(() => {
+                requestAnimationFrame(() => {
                     this._yuanH3TrimDeferSync = false;
                     if (this._syncTrimMode) this._syncTrimMode();
-                }, 0);
+                });
             }
         }
         return r;
@@ -1333,3 +1421,42 @@ app.registerExtension({
         }
     },
 });
+
+// ---------- 加载收尾钩子 ----------
+// graph.configure 结束时：连线已按 JSON 恢复，且还在同一个任务里（画布尚未绘制）。
+// 在这里把动态端口裁到位，首帧就是最终尺寸。
+// 不这么做的话，ComfyUI 会在第一次绘制时按「全部声明端口」重算尺寸
+// （实测调用栈：ComfyNode._arrangeWidgets ← drawConnections ← draw），随后才被延迟同步缩回，
+// 表现就是「节点长度闪一下」。
+function installGraphConfigureHook() {
+    const Proto = window.LGraph && window.LGraph.prototype;
+    if (!Proto || typeof Proto.configure !== "function" || Proto._yuanHooked) return false;
+    const orig = Proto.configure;
+    Proto.configure = function () {
+        const r = orig.apply(this, arguments);
+        const nodes = (this._nodes || this.nodes || []).slice();
+        for (const n of nodes) {
+            if (!n) continue;
+            // 逐个 try：单个节点出错不能连累后面的节点
+            if (typeof n._syncPortsNow === "function") {
+                try { n._syncPortsNow(); } catch (e) { console.warn("[Yuan] port sync failed:", n.type, e); }
+            }
+            if (typeof n._yuanSyncLayoutNow === "function") {
+                try { n._yuanSyncLayoutNow(); } catch (e) { console.warn("[Yuan] layout sync failed:", n.type, e); }
+            }
+            if (typeof n._yuanAudioRemovePorts === "function") {
+                try { n._yuanAudioRemovePorts(n); } catch (_) {}
+            }
+            if (typeof n._yuanVideoDropPlaceholders === "function") {
+                try { n._yuanVideoDropPlaceholders(); } catch (_) {}
+            }
+        }
+        return r;
+    };
+    Proto._yuanHooked = true;
+    return true;
+}
+if (!installGraphConfigureHook()) {
+    let tries = 0;
+    const iv = setInterval(() => { if (installGraphConfigureHook() || ++tries > 40) clearInterval(iv); }, 50);
+}

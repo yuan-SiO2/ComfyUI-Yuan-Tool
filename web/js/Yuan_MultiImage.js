@@ -917,6 +917,21 @@ import { getApi, prunePlaceholderPorts, chainCallback, setSlotName, hideWidget }
                 if (app.graph) app.graph.setDirtyCanvas(true, true);
             }
 
+            // 供 graph.configure 收尾钩子同步调用：加载时先把滑轨 UI 渲染出来再定高度，
+            // 否则首帧按「无滑轨」的高度画一次、随后再缩回去（实测 492 → 257）
+            node._yuanSyncLayoutNow = () => {
+                try {
+                    ensureInitialized();
+                    const width = node.size?.[0];
+                    if (width && node.computeSize) {
+                        const s2 = node.computeSize([width, -1]);
+                        if (Array.isArray(s2) && Math.abs((node.size[1] || 0) - s2[1]) > 0.5) {
+                            node.size[1] = s2[1];
+                        }
+                    }
+                } catch (_) {}
+            };
+
             const origOnConfigure = node.onConfigure;
             node.onConfigure = function (info) {
                 const out = origOnConfigure ? origOnConfigure.apply(this, arguments) : undefined;

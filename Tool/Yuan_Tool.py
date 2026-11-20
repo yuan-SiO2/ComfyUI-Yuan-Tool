@@ -220,17 +220,21 @@ class YuanTool:
 
     @staticmethod
     def _expand_frames(subjects, background, frame_multiplier):
-        """按每图帧数展开主体帧，并在末尾追加背景帧；首帧额外 +1 用于 VAE 分组对齐。"""
+        """按每图帧数展开：背景帧排在最前（背景端口永远是输出的第一张），主体帧按顺序接在后面；
+        输出的第一组额外 +1 帧吸收 VAE 的独立首帧（frame 0 不参与 8 帧分组），使后续帧边界对齐 8 帧分组。"""
         frames = []
+        first_group = True
 
-        # 首帧额外 1 帧吸收 VAE 的独立首帧（frame 0 不参与 8 帧分组），使后续帧边界对齐 8 帧分组
-        for index, image in enumerate(subjects):
-            extra = 1 if (index == 0 and frame_multiplier > 1) else 0
-            frames.extend([image] * (frame_multiplier + extra))
-
-        # 仅当提供了背景图时才添加背景帧
+        # 背景：始终是输出的第一组帧
         if background is not None:
-            frames.extend([background] * frame_multiplier)
+            extra = 1 if frame_multiplier > 1 else 0
+            frames.extend([background] * (frame_multiplier + extra))
+            first_group = False
+
+        for image in subjects:
+            extra = 1 if (first_group and frame_multiplier > 1) else 0
+            frames.extend([image] * (frame_multiplier + extra))
+            first_group = False
 
         return frames
 

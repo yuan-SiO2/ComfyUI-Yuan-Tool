@@ -281,6 +281,8 @@ function createPlayer(node, scheduleFit) {
                 const aspect = element.videoWidth / element.videoHeight;
                 if (Math.abs(aspect - state.aspect) > 0.01) {
                     state.aspect = aspect;
+                    // 记进 properties：下次加载时首帧就按真实比例排版，不会「先按 16:9 排好再跳一下」
+                    if (node.properties) node.properties.yuanPreviewAspect = aspect;
                     scheduleFit();
                 }
             }
@@ -828,7 +830,8 @@ function addVideoSaveUI(node) {
         if (fitTimer) {
             return;
         }
-        fitTimer = setTimeout(() => {
+        // rAF：在下一帧绘制前把高度改好，不用定时器（定时器在首帧画完才跑 → 长度闪一下）
+        fitTimer = requestAnimationFrame(() => {
             fitTimer = null;
             const width = node.size?.[0];
             if (!width || !node.computeSize) {
@@ -843,7 +846,7 @@ function addVideoSaveUI(node) {
             }
             node.setDirtyCanvas?.(true, true);
             node.graph?.setDirtyCanvas?.(true, true);
-        }, 30);
+        });
     }
 
     function applyFormatWidgets() {
@@ -937,6 +940,11 @@ function addVideoSaveUI(node) {
         const legacyPreview = restoreLegacyValues(info?.widgets_values);
         advancedOpen = false;
         applyAdvanced();
+        // 先用存档里的真实宽高比排版，避免首帧按默认 16:9 排完再被媒体元数据改一次（高度跳一下）
+        const savedAspect = info?.properties?.yuanPreviewAspect;
+        if (typeof savedAspect === "number" && savedAspect > 0) {
+            player.state.aspect = savedAspect;
+        }
         const saved = info?.properties?.yuanVideoPreview
             || (legacyPreview?.params?.filename ? legacyPreview : null);
         if (saved?.params?.filename) {
@@ -1018,6 +1026,19 @@ function addVideoSaveUI(node) {
         pruneHiddenWidgetPorts(node);
     }
     node._yuanVideoDropPlaceholders = dropHiddenPlaceholderPorts;
+    // 供 graph.configure 收尾钩子同步调用：连线已恢复、画布未绘制时就把占位端口和高度定下来
+    node._yuanSyncLayoutNow = () => {
+        try {
+            dropHiddenPlaceholderPorts();
+            const width = node.size?.[0];
+            if (width && node.computeSize) {
+                const size = node.computeSize([width, -1]);
+                if (Array.isArray(size) && Math.abs((node.size[1] || 0) - size[1]) > 0.5) {
+                    node.size[1] = size[1];
+                }
+            }
+        } catch (_) {}
+    };
     chainCallback(node, "onDrawForeground", dropHiddenPlaceholderPorts);
 
     if ((node.size?.[0] || 0) < 360) {

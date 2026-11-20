@@ -105,6 +105,10 @@ app.registerExtension({
         nodeType.prototype.onConfigure = function () {
             const result = onConfigure ? onConfigure.apply(this, arguments) : undefined;
             normalizeMode(findWidget(this, "mode"));
+            // 供 graph.configure 收尾钩子同步调用（连线已恢复、画布未绘制）
+            this._yuanSyncLayoutNow = () => {
+                if (this.graph) syncMode(this);
+            };
             // 加载期改可见性/尺寸会和 LGraph.configure 抢时序，推迟到本轮结束后。
             if (!this._yuanModeDefer) {
                 this._yuanModeDefer = true;

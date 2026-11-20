@@ -105,6 +105,11 @@ app.registerExtension({
         };
         chainCallback(nodeType.prototype, "onConfigure", function (info) {
             this._yuanConfigured = true;
+            // 供 graph.configure 收尾钩子同步调用：连线已恢复、画布未绘制时把端口/高度一次调整到位
+            this._yuanSyncLayoutNow = () => {
+                if (!this.graph) return;
+                applyMode(this, false);
+            };
             const saved = this._yuanSavedPorts ?? info;
             applyPorts(this, this.widgets?.find((w) => w.name === MODE_WIDGET)?.value === ARCHIVE_MODE, false);
             remapSavedPorts(this, saved, OUTPUT_ALIAS);
