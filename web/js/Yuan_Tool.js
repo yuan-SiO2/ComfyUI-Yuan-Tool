@@ -790,6 +790,8 @@ function yuanHealWidgetType(widget, kind, fallback) {
         if (typeof v !== "string") widget.value = fallback;
     } else if (kind === "int") {
         if (isNaN(parseInt(String(v == null ? "" : v).trim(), 10))) widget.value = fallback;
+    } else if (kind === "float") {
+        if (isNaN(parseFloat(String(v == null ? "" : v).trim()))) widget.value = fallback;
     }
 }
 

@@ -105,16 +105,50 @@ def _validate_schedule(sigmas, transition_step):
 
 
 def _validate_latent_input(latent_image):
-    if latent_image.get("noise_mask") is not None:
-        raise ValueError("H3 渐进式采样器：不支持 noise_mask/局部重绘，请使用不带遮罩的空 latent")
+    """校验尺寸模板；允许携带 noise_mask 与掩码区域的初值（引导+重绘）。"""
+    mask = latent_image.get("noise_mask")
+    if mask is not None and getattr(mask, "is_nested", False):
+        raise ValueError("H3 渐进式采样器：noise_mask 需为单路张量（视频流），音频流按全 1 "
+                         "处理；请连接「H3 运动上下文」的「潜空间」输出")
     streams, _ = _streams(latent_image["samples"])
     if not streams or streams[0].ndim not in (4, 5):
         raise ValueError("H3 渐进式采样器：需要 4D 图像或 5D 视频 latent 尺寸模板")
     for stream in streams:
         if stream.ndim == 0 or any(size == 0 for size in stream.shape) or stream.shape[0] != streams[0].shape[0]:
             raise ValueError("H3 渐进式采样器：各路 latent 流都必须非空，且 batch 大小一致")
-        if torch.count_nonzero(stream) != 0:
-            raise ValueError("H3 渐进式采样器：潜空间必须是全零的尺寸模板；不支持编码后的初始 latent")
+    if mask is None and any(bool(torch.count_nonzero(stream)) for stream in streams):
+        raise ValueError("H3 渐进式采样器：潜空间带内容但没有 noise_mask。本节点只在掩码区域"
+                         "使用初值，其余区域按全零重新生成；请连接「H3 运动上下文」的"
+                         "「潜空间」输出，或改用不带内容的空 latent")
+
+
+def _pin_into_resume(resume_latent, init_samples, denoise_mask):
+    """把掩码区域（mask<1）的初值写回提升后的 latent，返回保留式重绘的基准。
+
+    高分阶段需要同时成立两件事：起始 latent 带初值，且 KSamplerX0Inpaint 的混合
+    目标（latent_image）在保留区就是该初值。这里按掩码硬替换，保留区因此精确等于
+    初值，不再引入二次混合；其余区域保留分辨率提升后的生成结果。
+    """
+    resume_streams, nested = _streams(resume_latent)
+    init_streams, _ = _streams(init_samples)
+    if len(resume_streams) != len(init_streams):
+        raise ValueError("H3 渐进式采样器：初值 latent 与目标 latent 的流数量不一致")
+    pinned = []
+    for resume, init in zip(resume_streams, init_streams):
+        if tuple(resume.shape) != tuple(init.shape):
+            raise ValueError(
+                "H3 渐进式采样器：初值流形状 %s 与目标流 %s 不一致；引导+重绘要求两片段"
+                "分辨率、时长与音频轨长度一致" % (tuple(init.shape), tuple(resume.shape)))
+        if init.ndim != 5:
+            pinned.append(resume)          # 音频等非视频流不参与保留
+            continue
+        # 掩码扩张到 latent 形状，并统一到 resume 的设备：初值张量可能仍在 CPU
+        keep_mask = comfy.utils.reshape_mask(denoise_mask, init.shape)
+        keep_mask = keep_mask.to(device=resume.device)
+        keep = keep_mask < 1.0 - 1e-6
+        init_dev = init.to(device=resume.device, dtype=resume.dtype)
+        pinned.append(torch.where(keep, init_dev, resume))
+    return _pack(pinned, nested)
 
 
 def _euler_step(state, denoised, sigma, sigma_next):
@@ -185,11 +219,15 @@ def _debug_dump(vae, latents):
 
 
 def _basic_guider_sample(model, noise, positive, sampler, sigmas, latent_image,
-                         callback, disable_pbar, seed):
-    """用原生“基本引导器”（Guider_Basic）语义采样：只使用正条件、不做 CFG。"""
+                         callback, disable_pbar, seed, denoise_mask=None):
+    """用原生“基本引导器”（Guider_Basic）语义采样：只使用正条件、不做 CFG。
+
+    denoise_mask 非空时走 ComfyUI 的保留式重绘（KSamplerX0Inpaint）：mask=1
+    完全重绘、mask=0 完全保留 latent_image。
+    """
     guider = Guider_Basic(model)
     guider.set_conds(positive)
-    return guider.sample(noise, latent_image, sampler, sigmas,
+    return guider.sample(noise, latent_image, sampler, sigmas, denoise_mask=denoise_mask,
                          callback=callback, disable_pbar=disable_pbar, seed=seed)
 
 
@@ -268,8 +306,27 @@ def progressive_sample(low_res_model, positive, vae, latent_image, sampler, sigm
         return result
 
     # 最后一次低分辨率评估的 Euler 更新会被丢弃，过渡后重建，从而保持 NFE 数量不变
+    # 低分辨率前缀同样要固定：锚与掩码一起空间降采样到低分网格。若低分阶段自由生成，
+    # 过渡提升后头部细节已经被抹平，高分阶段仅剩的几步补不回来（实测亮度阶跃 ~25%）。
+    _low_anchor = low_latent
+    _low_mask = None
+    _mask_in = latent_image.get("noise_mask")
+    if _mask_in is not None:
+        _anchor_streams, _ = _streams(latent_image["samples"])
+        _pin_v, _pin_rest = _anchor_streams[0], _anchor_streams[1:]
+        _pin_low = torch.nn.functional.interpolate(
+            _pin_v.float(), size=(t, h, w), mode="nearest").to(_pin_v.dtype)
+        _low_anchor = _pack([_pin_low] + [torch.zeros_like(s) for s in _pin_rest], nested)
+        _low_mask = torch.nn.functional.interpolate(
+            _mask_in.float(), size=(t, h, w), mode="nearest")
+        if os.environ.get("YUAN_H3_DBG", "0") == "1":
+            print("[h3dbg] 低分阶段固定保留: anchor=%s mask=%s min=%.4f" % (
+                tuple(_pin_low.shape), tuple(_low_mask.shape),
+                float(_low_mask.min())), flush=True)
+        del _pin_v, _pin_rest, _pin_low
     _basic_guider_sample(model, noise_low, positive_low, sampler, sigmas[:transition_step + 1],
-                         low_latent, callback_low, disable_pbar, seed)
+                         _low_anchor, callback_low, disable_pbar, seed,
+                         denoise_mask=_low_mask)
     if low_evaluations != transition_step:
         raise RuntimeError(f"H3 渐进式采样器：预期 {transition_step} 次低分辨率回调，实际 {low_evaluations} 次；请检查采样器包装器")
     low_streams, nested = _streams(transition.pop("state"))
@@ -311,6 +368,27 @@ def progressive_sample(low_res_model, positive, vae, latent_image, sampler, sigm
     resume_streams = [model_sampling.inverse_noise_scaling(sigma_next, s) for s in next_streams]
     resume_latent = model.model.process_latent_out(_pack(resume_streams, nested))
     resume_noise = _pack([torch.zeros_like(s) for s in resume_streams], nested)
+    # 引导+重绘：只在分辨率提升后的高分阶段 固定 头部。低分前缀若也 pin，头部细节会先
+    # 被空间下采样再提升回来，正是要避免的劣化，因此低分前缀保持自由生成。
+    denoise_mask = latent_image.get("noise_mask")
+    if denoise_mask is not None:
+        resume_latent = _pin_into_resume(resume_latent, latent_image["samples"],
+                                         denoise_mask)
+    if os.environ.get("YUAN_H3_DBG", "0") == "1":
+        _ss, _ = _streams(resume_latent)
+        _ii, _ = _streams(latent_image["samples"])
+        _m12 = (denoise_mask[0, 0, :12, 0, 0].tolist()
+                if denoise_mask is not None and denoise_mask.ndim == 5 else None)
+        print("[h3dbg] mask=%s | sigma0=%.3f last=%.3f hi_steps=%d | resume_v=%.3f "
+              "init_v=%.3f(%s) | pin写入后 头10步最大差=%.6f | mask前12步=%s" % (
+                  None if denoise_mask is None else tuple(denoise_mask.shape),
+                  float(sigmas[transition_step]), float(sigmas[-1]),
+                  int(len(sigmas) - transition_step),
+                  float(_ss[0].float().mean()), float(_ii[0].float().mean()),
+                  str(_ii[0].device),
+                  float((_ss[0][:, :, :10].float().cpu()
+                         - _ii[0][:, :, :10].float().cpu()).abs().max()),
+                  [round(x, 3) for x in _m12] if _m12 else None), flush=True)
     del next_streams, resume_streams
     # 回收过渡阶段的缓存块，降低高分辨率阶段碎片化 OOM 的风险
     comfy.model_management.soft_empty_cache()
@@ -328,7 +406,15 @@ def progressive_sample(low_res_model, positive, vae, latent_image, sampler, sigm
         return result
 
     out = _basic_guider_sample(high_model, resume_noise, positive, sampler, sigmas[transition_step:],
-                               resume_latent, callback_high, disable_pbar, seed)
+                               resume_latent, callback_high, disable_pbar, seed,
+                               denoise_mask=denoise_mask)
+    if os.environ.get("YUAN_H3_DBG", "0") == "1":
+        _os, _ = _streams(out)
+        _ii, _ = _streams(latent_image["samples"])
+        print("[h3dbg] 采样后: out_head==pin头 最大差=%.5f | out_v=%.3f pin_v=%.3f" % (
+            float((_os[0][:, :, :10].float().cpu()
+                   - _ii[0][:, :, :10].float().cpu()).abs().max()),
+            float(_os[0].float().mean()), float(_ii[0].float().mean())), flush=True)
     del resume_latent, resume_noise
     if high_evaluations != total_steps - transition_step:
         raise RuntimeError(f"H3 渐进式采样器：预期 {total_steps - transition_step} 次高分辨率回调，实际 {high_evaluations} 次；请检查采样器包装器")
@@ -355,7 +441,10 @@ class Yuan_H3ProgressiveSampler:
             "vae": ("VAE", {"display_name": "视频VAE",
                 "tooltip": "在分辨率过渡点用于像素重编码锚点的视频 VAE。"}),
             "latent_image": ("LATENT", {"display_name": "潜空间",
-                "tooltip": "全零的目标分辨率 latent（如 Empty MiniMax H3 AV Latent），用于定义尺寸与时长。不支持编码后的初始 latent 与噪声遮罩；关键帧请通过条件化传入。"}),
+                "tooltip": "目标分辨率 latent（如 Empty MiniMax H3 AV Latent），用于定义尺寸与时长。"
+                           "支持「H3 运动上下文」的「潜空间」输出：带 noise_mask 时只在掩码区域"
+                           "使用初值，其余区域自由生成（引导+重绘）；不带掩码时按全零模板处理。"
+                           "关键帧请通过条件化传入。"}),
             "sampler": ("SAMPLER", {"display_name": "采样器",
                 "tooltip": "仅支持标准 Euler；本节点会复用其在过渡步的预测，以保持原有 NFE 次数。"}),
             "sigmas": ("SIGMAS", {"display_name": "噪声调度"}),

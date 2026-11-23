@@ -631,8 +631,12 @@ class YUAN_TXTJsonExtractor:
         """
         name, desc = cls._subject_name(kind, text)
         lead = ("%s " % cls._gender_word(text)) if kind == "角色" else ""
-        return "<Subject %d> is %s%s from <Picture %d>%s." % (
-            subject_no, lead, name or str(text).strip(), picture_no, ("," + desc) if desc else "")
+        # 中文描述用全角逗号与句号、不加空格；英文描述用半角逗号＋空格与半角句号
+        cjk = bool(re.search(r'[\u4e00-\u9fff]', (desc or name or "")[:1]))
+        sep = ("，" if cjk else ", ") if desc else ""
+        end = "。" if cjk else "."
+        return "<Subject %d> is %s%s from <Picture %d>%s%s%s" % (
+            subject_no, lead, name or str(text).strip(), picture_no, sep, desc or "", end)
 
     @classmethod
     def _build_retention_lines(cls, body_text, subjects):
@@ -651,8 +655,9 @@ class YUAN_TXTJsonExtractor:
             tag = "<Subject %d>" % subject_no
             hits = [shot_no for shot_no, line in shots if tag in line]
             if hits:
-                out.append("%s appears in %s, from <Picture %d>."
-                           % (tag, ", ".join("[Shot %d]" % h for h in hits), picture_no))
+                # 官方 retention_analysis 行式：`<Subject 1> (appears in [Shot 1], [Shot 3]): fully_preserved - ...`
+                out.append("%s (appears in %s): fully_preserved - the appearance and layout defined for %s are kept."
+                           % (tag, ", ".join("[Shot %d]" % h for h in hits), tag))
         return out
 
     @classmethod
@@ -677,8 +682,14 @@ class YUAN_TXTJsonExtractor:
         """official summary：固定片种前缀 + 本镜「情节」原文（不再合成类型/参考关系描述）。
         时长取「类型」字段里的秒数（如「文戏 10秒」→ 10-second）；无秒数时省略时长部分。"""
         m = re.search(r'(\d+)\s*秒', str(shot_type or ""))
-        head = ("[reference generation] A %s-second continuous, cinematic sequence: " % m.group(1)
-                if m else "[reference generation] A continuous, cinematic sequence: ")
+        if m:
+            n = int(m.group(1))
+            # 冠词按读音：8/11/18/80-89 用 An，其余 A
+            an = n == 8 or n == 11 or n == 18 or 80 <= n <= 89
+            head = ("[reference generation] %s %s-second continuous, cinematic sequence: "
+                    % ("An" if an else "A", m.group(1)))
+        else:
+            head = "[reference generation] A continuous, cinematic sequence: "
         return head + str(plot or "").strip()
 
     @staticmethod
@@ -803,13 +814,14 @@ class YUAN_TXTJsonExtractor:
         return values
 
     @staticmethod
-    def _scan_speaking_order(text, pairs, protect_enabled):
+    def _scan_speaking_order(text, pairs, protect_enabled, allowed=None):
         """扫描分镜序列，按说话角色首次说话的出现顺序分配 <Audio M>（最多3个）。
 
         识别 `名称+引导句+冒号+<d>` 与 `<Subject N>+引导句+冒号+<d>` 两种说话形式；
         同一台词多候选说话者时取离冒号最近者（起点相同取名称更长者）；
         标准规则未命中时从冒号往前追溯最近的未保护候选（引号内/<d>内跳过）；
         台词保护开启时被保护位置不算说话；同一角色只按首次出现分配一个编号。
+        allowed：允许配音的标记集合（音色档案里有的角色）；None 或不设集合时按发声顺序全部编号。
 
         返回 (audio_by_tag, speaking_tags, winners)：
         - audio_by_tag：{<Subject N>: "<Audio M>"}，超过3个不分配
@@ -867,6 +879,8 @@ class YUAN_TXTJsonExtractor:
         speaking_tags = []
         next_num = 1
         for _end, _s1, _e1, _s2, tag in winners:
+            if allowed is not None and tag not in allowed:
+                continue  # 音色档案里没有这个角色 → 不给 <Audio M>（否则音色索引会指到别人的参考音）
             if tag not in audio_by_tag:
                 if next_num <= 3:
                     audio_by_tag[tag] = f"<Audio {next_num}>"
@@ -1149,11 +1163,31 @@ class YUAN_TXTJsonExtractor:
         分镜序列输出 = 分镜序列整合 or ""
         音色索引 = ""
         voice_lines = []
+        audio_by_tag, speaking_tags = {}, []   # 音色开关关闭时也保证有值（retention_analysis 要用）
+        voice_index_by_tag = {}
 
         # 说话者：追加 (Sx)（S 号 = <Audio M> 号 = 本镜首次发声顺序）；<Audio M> 只写进定义段，
         # 不再插在句子主语中间；归属算法沿用 _scan_speaking_order（台词保护、离冒号最近者胜）
         if 音色开关 and pairs:
-            audio_by_tag, speaking_tags, winners = self._scan_speaking_order(分镜序列输出, pairs, 台词开关)
+            # 允许配音的角色：只认音色档案里有的名称（全名或主干）；档案为空时按发声顺序全部编号（旧行为）
+            # voice_index_by_tag：标记 → 该角色在「音色档案」里的 0 基位置（音色索引直接用这个）
+            voice_allowed = None
+            voice_index_by_tag = {}
+            if 音色档案数据:
+                voice_names = set()
+                for idx, entry in enumerate(音色档案数据):
+                    full = str(entry or "").strip()
+                    if not full:
+                        continue
+                    nm = self._before_first_comma(full) or full
+                    voice_names.add(nm)
+                    voice_names.add(self._name_core(nm))
+                    for name, tag in pairs:
+                        if name in (nm, self._name_core(nm)):
+                            voice_index_by_tag.setdefault(tag, idx)
+                voice_allowed = {tag for name, tag in pairs if name in voice_names}
+            audio_by_tag, speaking_tags, winners = self._scan_speaking_order(
+                分镜序列输出, pairs, 台词开关, voice_allowed)
             replaced_ranges = []
             for _end, s1, _e1, s2, tag in sorted(winners, key=lambda x: -x[0]):
                 sid = re.sub(r'\D', '', audio_by_tag.get(tag, ""))
@@ -1164,7 +1198,8 @@ class YUAN_TXTJsonExtractor:
                 分镜序列输出 = 分镜序列输出[:s1] + "%s (S%s)" % (tag, sid) + 分镜序列输出[s2:]
                 replaced_ranges.append((s1, s2))
 
-            # 声音引用行 + 音色索引：按发声顺序取 <Subject N> 对应的角色索引（0 基）
+            # 声音引用行 + 音色索引：按发声顺序；音色索引优先取该角色在「音色档案」里的 0 基位置，
+            # 音色档案为空/对不上时退回角色索引（旧行为），避免指到别人的参考音
             indices = self._parse_voice_indices(角色索引)
             values = []
             for tag in speaking_tags:
@@ -1174,7 +1209,9 @@ class YUAN_TXTJsonExtractor:
                 subj_no = self._subject_no(tag)
                 voice_lines.append("<Audio %s> is the voice-timbre reference for %s (S%s)."
                                    % (sid, tag, sid))
-                if indices and 1 <= subj_no <= len(indices):
+                if tag in voice_index_by_tag:
+                    values.append(str(voice_index_by_tag[tag]))
+                elif indices and 1 <= subj_no <= len(indices):
                     values.append(str(indices[subj_no - 1]))
             if values:
                 音色索引 = ",".join(values)
@@ -1187,6 +1224,15 @@ class YUAN_TXTJsonExtractor:
         英文 = "英文" in self._list_to_lines(data.get("生成语言", ""))
         summary = self._build_summary(matched_type, 情节原文) if 情节原文 else ""
         retention_lines = self._build_retention_lines(分镜序列输出, subjects)
+        # 官方 retention_analysis 还要逐条列音频：`<Audio 1>: reference - ...`
+        seen_audio = []
+        for tag in (speaking_tags or []):
+            sid = re.sub(r'\D', '', audio_by_tag.get(tag, ""))
+            if sid and sid not in seen_audio:
+                seen_audio.append(sid)
+                retention_lines.append(
+                    "<Audio %s>: reference - the target speaker follows <Audio %s>'s voice timbre "
+                    "and delivery without copying the signal." % (sid, sid))
         definitions = self._build_definitions(subject_lines, voice_lines, summary, retention_lines)
 
         # detailed_description：风格头（整体风格 + 画面质感 + 场景 + 在场位置 + 运镜方式）两行，
@@ -1244,7 +1290,7 @@ class YUAN_TXTJsonSwitch:
                     "label_on": "输出",
                     "label_off": "不输出",
                     "display_name": "音色输出",
-                    "tooltip": "开=说话者替换为 <Subject N> (Sx) 并在定义段写声音引用行（最多3个，按说话顺序编号），同时输出「音色索引」；关=仅普通替换 <Subject N>、音色索引为空。",
+                    "tooltip": "开=说话者替换为 <Subject N> (Sx) 并在定义段写声音引用行（最多3个，按说话顺序编号），同时输出「音色索引」；关=仅普通替换 <Subject N>、音色索引为空。只给音色档案里有的角色分 <Audio M>（档案缺哪条，该角色就不带 S 号、不出声音行），音色档案为空时按发声顺序全部编号。",
                 }),
                 "道具开关": ("BOOLEAN", {
                     "default": True,

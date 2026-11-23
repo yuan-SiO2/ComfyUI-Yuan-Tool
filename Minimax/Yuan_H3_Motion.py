@@ -1620,8 +1620,8 @@ class Yuan_H3MotionContext:
             },
         }
 
-    RETURN_TYPES = ("CONDITIONING", "STRING")
-    RETURN_NAMES = ("条件化", "裁剪帧数")
+    RETURN_TYPES = ("CONDITIONING", "STRING", "LATENT")
+    RETURN_NAMES = ("条件化", "裁剪帧数", "潜空间")
     FUNCTION = "apply"
     CATEGORY = "Yuan Tool/MiniMax"
     DESCRIPTION = ("把上一片段尾部的画面与音频固定为本片段开头的引导，"
@@ -1648,8 +1648,8 @@ class Yuan_H3MotionContext:
         a_req = int(音频上下文长度 or 0)
         idle_tail = max(g_req, a_req)
         if not 启用上下文:
-            return {"result": (条件化, "0:%d" % idle_tail), "ui": {
-                "h3_hint": "上下文已关闭，直通"}}
+            return {"result": (条件化, "0:%d" % idle_tail, 潜空间), "ui": {
+                "h3_hint": "已关闭"}}
         # 上下文来源由「模式」决定：上传（只用上传文件）/ 端口（只用连线）/ 自动索引
         if 模式 == "上传":
             if not (手动上传 or "").strip():
@@ -1678,11 +1678,11 @@ class Yuan_H3MotionContext:
                 reason = media.get(CONTEXT_EMPTY_REASON, "first_clip")
                 if reason == "file_not_found":
                     detail = media.get(CONTEXT_EMPTY_REASON_DETAIL, "?")
-                    return {"result": (条件化, "0:%d" % idle_tail), "ui": {
-                        "h3_hint": "未找到片段 %s 文件" % detail}}
-                return {"result": (条件化, "0:%d" % idle_tail), "ui": {
-                    "h3_hint": "片段\"0\"，直通"}}
-            hint = "已关联片段 %s 文件" % media.get(
+                    return {"result": (条件化, "0:%d" % idle_tail, 潜空间), "ui": {
+                        "h3_hint": "未找到 %s" % detail}}
+                return {"result": (条件化, "0:%d" % idle_tail, 潜空间), "ui": {
+                    "h3_hint": "首段直通"}}
+            hint = "片段 %s" % media.get(
                 CONTEXT_CLIP_INDEX_KEY, "?")
 
         # 仅读取本片段形状：按通道数识别视频流，兼容 NestedTensor 与普通元组；
@@ -1792,7 +1792,7 @@ class Yuan_H3MotionContext:
 
         # 落盘：链首参考（首段即本段源色调）+ 本段实测锚点色调，供下一段回拉
         _tone_state_save(存储位置, seg_idx, ref, guide_tone, tone_src)
-        hint += "；色调回拉 %.0f%%" % (100.0 * TONE_PULL)
+        pass
 
         # 裁剪量：覆盖画面引导窗与音频窗的较大值——音频窗比画面窗长时只裁
         # 画面窗会让固定音频泄漏进交付部分
@@ -1810,8 +1810,8 @@ class Yuan_H3MotionContext:
         out = node_helpers.conditioning_set_values(
             条件化, {"minimax_keyframes": keyframes})
         if a > 0:
-            hint += "（含音频）"
-        return {"result": (out, "1:%d" % cut), "ui": {
+            pass
+        return {"result": (out, "1:%d" % cut, 潜空间), "ui": {
             "h3_hint": hint}}
 
     def _apply_latent(self, 条件化, 潜空间, 启用上下文, 模式, 存储位置, 片段序号,
@@ -1825,8 +1825,8 @@ class Yuan_H3MotionContext:
         """
         if not 启用上下文:
             # 直通：尾段保存长度固定一个整组（17 帧）
-            return {"result": (条件化, "0:17"), "ui": {
-                "h3_hint": "上下文已关闭，直通"}}
+            return {"result": (条件化, "0:17", 潜空间), "ui": {
+                "h3_hint": "已关闭"}}
         # 上下文来源由「模式」决定：上传（只用上传文件）/ 端口（只用连线）/ 自动索引
         if 模式 == "上传":
             if not (手动上传 or "").strip():
@@ -1848,10 +1848,10 @@ class Yuan_H3MotionContext:
             reason = 上下文潜空间.get(CONTEXT_EMPTY_REASON, "first_clip")
             if reason == "file_not_found":
                 detail = 上下文潜空间.get(CONTEXT_EMPTY_REASON_DETAIL, "?")
-                return {"result": (条件化, "0:17"), "ui": {
-                    "h3_hint": "未找到片段 %s 文件" % detail}}
-            return {"result": (条件化, "0:17"), "ui": {
-                "h3_hint": "片段\"0\"，直通"}}
+                return {"result": (条件化, "0:17", 潜空间), "ui": {
+                    "h3_hint": "未找到 %s" % detail}}
+            return {"result": (条件化, "0:17", 潜空间), "ui": {
+                "h3_hint": "首段直通"}}
 
         video = _video_from_latent(潜空间)
         latent_t = int(video.shape[2])
@@ -1865,7 +1865,7 @@ class Yuan_H3MotionContext:
                 or int(src_video.shape[3]) * 16 != height):
             # 分辨率不一致时无法在同一 latent 网格上拼接前段画面/声音，
             # 跳过上下文，本次作为独立片段直通（效果等同重启链条）
-            return {"result": (条件化, "0:17"), "ui": {
+            return {"result": (条件化, "0:17", 潜空间), "ui": {
                 "h3_hint": "分辨率不一致，已跳过"}}
         _ensure_layout_patch()
         if int(src_video.shape[1]) != int(video.shape[1]):
@@ -1932,10 +1932,9 @@ class Yuan_H3MotionContext:
         if converted:
             tone_note = ""
         elif VAE is None:
-            tone_note = "；来源未转化且未连接 VAE，按原样使用"
+            tone_note = ""
         elif not _roundtrip_is_step_stable(VAE, steps):
-            tone_note = "；来源未转化，且 %d 步/%d 帧无法往返（编码器丢尾 3 步），按原样使用" % (
-                steps, _pixel_frames(steps))
+            tone_note = ""
         else:
             with torch.no_grad():
                 _tail_video = torch.cat(blocks, dim=2)
@@ -1956,7 +1955,7 @@ class Yuan_H3MotionContext:
                       for k in range(int(_anchor.shape[2]))]
             del _tail_video, _pix_src, _anchor
             _tone_state_save(存储位置, seg_idx, _ref, guide_tone, _tone_src)
-            tone_note = "；已补一次往返转化"
+            tone_note = ""
         # 时间坐标用目标片段自己的 token 网格（0/1/5/9/13 帧位），与「视频图像」一致
         indices = [_pixel_frames(k) for k in range(len(blocks))]
         _mc_debug("context.latent", frames=n, steps=len(blocks),
@@ -2006,15 +2005,14 @@ class Yuan_H3MotionContext:
         trim_str = ("1:%d" % trim) if trim > 0 else "0:17"
         clip_idx = (上下文潜空间.get(CONTEXT_CLIP_INDEX_KEY)
                     if isinstance(上下文潜空间, dict) else None)
-        hint = (("已关联片段 %s 文件" % clip_idx) if clip_idx is not None
+        hint = (("片段 %s" % clip_idx) if clip_idx is not None
                 else "已关联上下文")
         if audio_silent:
             hint += "，音频上下文=静音"
         if margin > 0:
-            hint += ("；余量 %d 帧会在拼接处跳过（%.2fs）"
-                     % (margin, margin / float(FPS)))
-        hint += tone_note
-        return {"result": (out, trim_str), "ui": {"h3_hint": hint}}
+            pass
+        pass
+        return {"result": (out, trim_str, 潜空间), "ui": {"h3_hint": hint}}
 
     @classmethod
     def IS_CHANGED(cls, 模式="自动索引", 存储位置="H3-Mubu", 片段序号=1,
